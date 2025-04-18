@@ -45,6 +45,34 @@ of a minimal program.  This program performs the following tasks,
 * Plot acquisition.
 * Close
 
+## P1150 Common API
+
+    
+    ping(self) -> (bool, dict):
+    ez_connect(self) -> (bool, dict):
+    status(self) -> (bool, dict):
+
+    calibrate(self, force: bool=False, blocking: bool=True) -> (bool, dict):
+    cal_status(self) -> (bool, dict):
+
+    set_trigger(self, src: str=P1150API.TRIG_SRC_NONE, pos: str=P1150API.TRIG_POS_LEFT, slope: str=P1150API.TRIG_SLOPE_RISE, level: int=1) -> (bool, dict):
+    set_timebase(self, span: str) -> (bool, dict):
+    acquisition_start(self, mode: str) -> (bool, dict):
+    acquisition_complete(self) -> (bool, dict):
+    acquisition_stop(self) -> (bool, dict):
+    acquisition_get_data(self) -> (bool, dict):
+
+    set_ovc(self, value_ma: int) -> (bool, dict):
+    vout_metrics(self) -> (bool, dict):
+    set_vout(self, value_mv: int) -> (bool, dict):
+    probe(self, connect: bool=True, hard_connect: bool=False) -> (bool, dict):
+
+    clear_error(self) -> (bool, dict):
+    temperature_update(self) -> (bool, dict):
+    set_cal_sweep(self, sweep: bool) -> (bool, dict):
+
+    
+
 
 ## Background Information
 
@@ -86,3 +114,8 @@ Using the `P1150.py` driver you could make your own GUI.
 The biggest hurdle in making a GUI is handling all the data in the plot.  Most plotting
 frameworks are limited to a few 100k points.  Whereas with P1150 you will want to plot
 millions.
+
+
+> Portions  ©2025 Sistemi Corp - licensed under MIT
+> 
+> Portions  ©2025 Unit Circle Inc - licensed under Apache 2.0
