@@ -127,6 +127,8 @@ if __name__ == '__main__':
         p1150.close()
         exit(1)
 
+    time.sleep(0.02)  # wait for load to settle
+
     success, response = p1150.acquisition_start(P1150.P1150API.ACQUIRE_MODE_SINGLE)
     if not success:
         logger.error(f"acquisition_start: {response}")
