@@ -731,7 +731,9 @@ class P1150(UCLogger):
     def status(self) -> (bool, dict):
         """ Get Status
 
-        :return:
+        :return: success <True|False>,
+                 result {'f': 'cmd_status', 's': True, 't_degc': 36, 'acquiring': False,
+                         'vout': 500, 'cal_done': False, 'probe': False, 'ovc_ma': 3210, 'err': 0, 'err_act': 0}
         """
         with self._lock:
             payload = {"f": "cmd_status"}
@@ -740,7 +742,8 @@ class P1150(UCLogger):
     def vout_metrics(self) -> (bool, dict):
         """ Get VOUT hardware capabilities
 
-        :return:
+        :return: success <True|False>,
+                 result {'f': 'cmd_vout_metrics', 's': True, 'max': 17000, 'min': 500, 'step': 10}
         """
         with self._lock:
             payload = {"f": "cmd_vout_metrics"}
@@ -750,7 +753,10 @@ class P1150(UCLogger):
         """ Get Calibration Status
         - Client is meant to poll this function once calibration has been started
 
-        :return:
+        :return: success <True|False>,
+                 result {'f': 'cmd_cal_status', 's': True, 'cal_done': False,
+                         'progress': 77, 'vout_set': 13200, 'vout': 13097,
+                         'dacc': 2910, 'err': 0, 'err_act': 0}
         """
         with self._lock:
             payload = {"f": "cmd_cal_status"}
@@ -851,33 +857,6 @@ class P1150(UCLogger):
             self.logger.info(f"pos {pos}, slope {slope}, src {src}, level {level}")
             return True, None
 
-    def set_cal_load(self, loads: list=[P1150API.DEMO_CAL_LOAD_NONE]) -> (bool, dict):
-        """ Set Calibration Load
-
-        - more than one load can be specified where the resultant loads are in parallel
-
-        :param loads: [P1150API.DEMO_CAL_LOAD_*, ...]
-        :return: success <True/False>, result <json/None>
-        """
-        load_bit_mask = 0x0
-        if P1150API.DEMO_CAL_LOAD_NONE in loads:
-            pass
-        else:
-            if P1150API.DEMO_CAL_LOAD_10 in loads:   load_bit_mask |= 0x1
-            if P1150API.DEMO_CAL_LOAD_20 in loads:   load_bit_mask |= 0x2
-            if P1150API.DEMO_CAL_LOAD_40 in loads:   load_bit_mask |= 0x4
-            if P1150API.DEMO_CAL_LOAD_100 in loads:  load_bit_mask |= 0x100
-            if P1150API.DEMO_CAL_LOAD_200 in loads:  load_bit_mask |= 0x8
-            if P1150API.DEMO_CAL_LOAD_400 in loads:  load_bit_mask |= 0x200
-            if P1150API.DEMO_CAL_LOAD_2K in loads:   load_bit_mask |= 0x10
-            if P1150API.DEMO_CAL_LOAD_20K in loads:  load_bit_mask |= 0x20
-            if P1150API.DEMO_CAL_LOAD_200K in loads: load_bit_mask |= 0x40
-            if P1150API.DEMO_CAL_LOAD_2M in loads:   load_bit_mask |= 0x80
-
-        with self._lock:
-            payload = {"f": "cmd_iload", "set": load_bit_mask}
-            return self.uclog_response(payload)
-
     def set_cal_sweep(self, sweep: bool) -> (bool, dict):
         """ Set Calibration Load Sweep
 
@@ -909,7 +888,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_adc", "en": True}
             return self.uclog_response(payload)
 
-    def acquisition_stop(self):
+    def acquisition_stop(self) -> (bool, dict):
         """ Stop/Abort Acquisition
 
         :return: success <True/False>, result <json/None>
