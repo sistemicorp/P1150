@@ -22,6 +22,10 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+A minimal example program to do a single shot measurement from P1150 using the
+internal calibration loads in a sweep pattern.  This example does not engage
+the probe.
+
 """
 import time
 from threading import Event
@@ -42,6 +46,7 @@ logger.setLevel(logging.INFO)
 # scanning for P1150 is not shown in this example, please see p1150_scan.py.
 P1150_PORT = "COM5"
 DEFAULT_ACQ_TIMEOUT = 10.0
+P1150_VOUT_MV = 4000
 
 # global dict for data
 G = {"acq_complete_event": Event(),  # indicates when acq is complete
@@ -114,7 +119,7 @@ if __name__ == '__main__':
     # P1150 is now ready to be controlled
     # in this example P1150 will measure its internal Cal resistors sweep
 
-    success, response = p1150.set_vout(4000)
+    success, response = p1150.set_vout(P1150_VOUT_MV)
     if not success:
         logger.error(f"{response}")
         p1150.close()
