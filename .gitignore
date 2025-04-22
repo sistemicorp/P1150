@@ -7,3 +7,5 @@ __pycache__/
 
 cobs/build/
 cobs/cobs.egg-info/
+
+p1150_out.csv
