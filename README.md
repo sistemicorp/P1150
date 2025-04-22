@@ -8,7 +8,8 @@ The P1150 Driver here is the same one used for the P1150 GUI available at www.si
 ## Installing
 
 
-Please follow these steps.
+P1150 is developed and tested with Python 3.12.  
+
 
 ### Requirements
 
