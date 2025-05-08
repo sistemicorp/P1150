@@ -4,6 +4,9 @@ A Python class for controlling the P1150 hardware.
 
 The P1150 Driver here is the same one used for the P1150 GUI available at www.sistemi.ca/p1150.
 
+You should be familiar with the GUI and your DUT current profile before attempting to automate
+measurements.
+
 
 ## Installing
 
@@ -34,19 +37,41 @@ python -m pip install ./cobs
 ## Run "hello, p1150"
 
 In keeping with tradition, a "Hello, World" program, `p1150_hello.py`, is given as an example
-of a minimal program.  This program performs the following tasks,
+of a minimal program.  
 
-* Sends a "ping" to the P1150 to determine if the bootloader or the application is running.
-* If the bootloader is running, it will load the application.
-* Determine if the P1150 has been previously calibrated.
-  * if not, start calibration, and wait for it to complete.
+*BEFORE* you run `p1150_hello.py`, and with all the examples, you need to set the 
+COM port inside the code. The easiest way to find the COM port is to run `p1150_scan.py`.
+
+
+    >python p1150_scan.py
+    P1150      : COM15, serial number FE823374
+
+
+`p1150_hello.py` performs the following tasks,
+
+* Connects to the P1150, calibrates if this is the first time connecting.
 * Set VOUT.
 * Turn on internal Cal loads in sweep mode.
 * Take a single shot acquisition.
 * Plot acquisition.
 * Close
 
+
 ## P1150 Common API
+
+All of the P1150 API calls have this form,
+
+```python
+    success, response = p1150.set_vout(P1150_VOUT_MV)
+    if not success:
+        logger.error(f"{response}")
+        p1150.close()
+```
+* `success` (bool) indicates where the function call succeeded or not.
+* `response` (dict) contains information.
+
+Appropriate error handling when `success` is False should be implemented. 
+
 
     
     ping(self) -> (bool, dict):
@@ -115,6 +140,33 @@ Using the `P1150.py` driver you could make your own GUI.
 The biggest hurdle in making a GUI is handling all the data in the plot.  Most plotting
 frameworks are limited to a few 100k points.  Whereas with P1150 you will want to plot
 millions.
+
+
+# Example Scripts
+
+## p1150_hello.py
+
+A minimum script that enables P1150 Demo mode sweep of internal Calibration resistors and takes a single shot
+acquisition and plots the result.
+
+
+## p1150_hello_probe.py
+
+Extends the `p1150_hello.py` script by connecting the Probe to a target that is assumed to be connected.  This
+script does not use the Demo mode sweep.
+
+
+## p1150_csv.py
+
+Creates a csv file of measurements for a period of time set in the code.  This example only creates the csv
+file, and does not plot it.  Use Excel or other tool to plot the results.
+
+
+## test_keithley2401.py
+
+This script uses an external Keithley 2401 Source Meter controlled with PyVisa to measure the P1150 Error. To
+use this script be sure to install `requirements_keithley2401.txt`.
+
 
 
 > Portions  ©2025 Sistemi Corp - licensed under MIT
