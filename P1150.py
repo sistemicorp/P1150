@@ -637,7 +637,7 @@ class P1150(UCLogger):
             self._adc["d1"].extend(item["d1"])
             self._adc["isnk"].extend(item['isnk'])
 
-            if len(self._adc["i"]) < self.NUM_SAMPLES:
+            if len(self._adc["i"]) <= self.NUM_SAMPLES:
                 return
 
         # OSCILLOSCOPE MODE
