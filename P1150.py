@@ -989,8 +989,9 @@ class P1150(UCLogger):
             if (len(rsp) == 2) and (rsp[1] is not None) and (len(rsp[1]) == 1):
 
                 if 'serial' in rsp[1][0]:
-                    serial = str(struct.unpack('<III', rsp[1][0]['serial']))
-                    ser = hashlib.shake_128(serial.encode()).hexdigest(4).upper()
+                    serial = struct.unpack('<III', rsp[1][0]['serial'])
+                    rsp[1][0]['serial'] = f'{serial[2]:08X}-{serial[1]:08X}-{serial[0]:08X}'
+                    ser = hashlib.shake_128(rsp[1][0]['serial'].encode()).hexdigest(4).upper()
                     rsp[1][0]['serial_hash'] = f'{ser}'
 
                 if "hwver" in rsp[1][0]:
