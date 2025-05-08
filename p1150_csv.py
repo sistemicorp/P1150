@@ -44,11 +44,11 @@ logger.addHandler(consoleHandler)
 logger.setLevel(logging.INFO)
 
 # scanning for P1150 is not shown in this example, please see p1150_scan.py.
-P1150_PORT = "COM7"
+P1150_PORT = "COM7"  # use p1150_scan.py to determine this
+ACQUISITION_TIME_S = 4.0   # Set this to the desired length of acquisition
 DEFAULT_ACQ_TIMEOUT = 10.0
 P1150_VOUT_MV = 4000
 WAIT_BEFORE_SAMPLE_S = 1.0
-ACQUISITION_TIME_S = 4.0
 P1150_SAMPLE_RATE = 125000
 CSV_FILENAME = "p1150_out.csv"
 
@@ -63,6 +63,8 @@ def _cb_p1150_acqcomplete(data: dict) -> None:
     """ A callback for P1150 acquisition data
     - acquisition_start is waiting for G["acq_complete_event"]
     - this function needs to copy the data and return ASAP
+    - currents 'i', 'isnk' are in mA
+    - Aux A0 in milliVolts
 
     :param data: acq data {'t': [...], 'i': [...], 'a0': [...], 'd0': [...], 'd1': [...], 'isnk': [...]}
     """
@@ -84,6 +86,9 @@ def _cb_p1150_async(data: dict) -> None:
 
 # Must use __main__ due to multiprocessing within P1150 driver
 if __name__ == '__main__':
+
+    if input(f"Did you remember to set the COM port?? Using {P1150_PORT} right now...").lower() in ["no", "n"]:
+        exit(1)
 
     logger.info(f"attempting connect on {P1150_PORT}...")
     connect_attempts = 2
