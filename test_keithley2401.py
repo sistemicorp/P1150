@@ -48,7 +48,7 @@ logger.setLevel(logging.INFO)
 
 # Set ports
 LEITHLEY2401_COM_NUM = "4"
-P1150_PORT = "COM16"  # use p1150_scan.py to determine this
+P1150_PORT = "COM3"  # use p1150_scan.py to determine this
 P1150_ERROR_TOLERANCE_AMPS = 0.000001  # 1uA
 
 PLOT_COLOR_MAP = {
@@ -165,28 +165,6 @@ def p1150_acquire_single(timeout: float=DEFAULT_ACQ_TIMEOUT, holdoff: float=DEFA
 
     logger.info("done")
     return True
-
-
-def calc_percent_error(set: float, measured: float) -> float:
-    """ Calc percent error
-    :param set: Amps
-    :param measured: Amps
-    :return: Percent Error
-    """
-    # P1150 has +/- 1uA accuracy, therefore allow for 1uA of error
-    if abs(abs(measured) - abs(set)) <= P1150_ERROR_TOLERANCE_AMPS:
-        _percent_error = 0.0
-
-    elif measured > set:
-        _percent_error = ((measured - min(P1150_ERROR_TOLERANCE_AMPS, measured - set)) - set) / set * 100.0
-
-    elif measured < set:
-        _percent_error = ((measured + min(P1150_ERROR_TOLERANCE_AMPS, set - measured)) - set) / set * 100.0
-
-    else:  # this should never happen
-        raise ValueError
-
-    return _percent_error
 
 
 def all_close():
@@ -313,7 +291,6 @@ if __name__ == '__main__':
         time.sleep(0.1)  # OUTPUT settle, also "cool off" wrap around (1Amp -> 10uA)
 
         for (isrc, irange) in zip(TEST_CURRENTS_MA_LIST, TEST_CURRENTS_RANGE_MA_LIST):
-
             logger.info(f"vout {vout}, current {isrc}, range {irange}")
 
             if last_range != irange:
@@ -328,7 +305,7 @@ if __name__ == '__main__':
             if not success: break
 
             _avg = sum(G["data"]["i"]) / len(G["data"]["i"]) / 1000.0  # avg and convert to Amps
-            _percent_error = calc_percent_error(abs(isrc), _avg)
+            _percent_error = round((_avg - abs(isrc)) / abs(isrc) * 100.0, 3)  # note isrc is -ve
             logger.info(f"RESULT: {vout} set {isrc:0.7f}, avg {_avg:0.7f}, error {_percent_error:0.3f}")
             results[vout][abs(isrc)] = _avg
 
@@ -342,16 +319,26 @@ if __name__ == '__main__':
 
     all_close()
 
-    results_err = {}
+    results_err = {"tolp1uA": {}, "tolm1uA": {}}
     for vout, i_values in results.items():
         results_err[vout] = {}
         for isrc, imeas in i_values.items():
-            results_err[vout][isrc] = calc_percent_error(isrc, imeas)
+            results_err[vout][isrc] = round((imeas - abs(isrc)) / abs(isrc) * 100.0, 3)
+
+            # tolp/m 1uA don't need to be calculated every time but they are... lazy
+            results_err["tolp1uA"][isrc] = round(((isrc + 0.000001) - isrc) / isrc * 100.0, 3)
+            results_err["tolm1uA"][isrc] = round(((isrc - 0.000001) - isrc) / isrc * 100.0, 3)
 
         values = [results_err[vout][i] for i in results_err[vout].keys()]
         currents = [float(i) for i in results_err[vout].keys()]
         _color = PLOT_COLOR_MAP.get(int(vout), '#ab830a')
         plt.plot(currents, values, label=f"{vout}", marker='o', color=_color)
+
+    # 1uA tolerance
+    values = [results_err["tolp1uA"][i] for i in results_err["tolp1uA"].keys()]
+    plt.plot(currents, values, label=f"tolp1uA", marker='', color='#000000')
+    values = [results_err["tolm1uA"][i] for i in results_err["tolm1uA"].keys()]
+    plt.plot(currents, values, label=f"tolm1uA", marker='', color='#000000')
 
     plt.ylim(-2, 2)
 
