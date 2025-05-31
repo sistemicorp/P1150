@@ -44,7 +44,7 @@ logger.addHandler(consoleHandler)
 logger.setLevel(logging.INFO)
 
 # scanning for P1150 is not shown in this example, please see p1150_scan.py.
-P1150_PORT = "COM14"  # use p1150_scan.py to determine this
+P1150_PORT = "COM12"  # use p1150_scan.py to determine this
 DEFAULT_ACQ_TIMEOUT = 10.0
 P1150_VOUT_MV = 4000
 

@@ -23,17 +23,6 @@ Install Python requirements,
 python -m pip install -r requirements.txt
 ```
 
-
-### COBS
-
-
-COBS (Consistent Overhead Byte Stuffing) and is used for the protocol between PC and 
-P1150.  COBS is built from c code, as follows,
-
-```commandline
-python -m pip install ./cobs
-```
-
 ## Run "hello, p1150"
 
 In keeping with tradition, a "Hello, World" program, `p1150_hello.py`, is given as an example

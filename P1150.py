@@ -25,7 +25,6 @@ SOFTWARE.
 This file should NOT BE ALTERED.
 """
 import os
-import time
 import struct
 from dataclasses import dataclass
 from time import sleep
@@ -34,9 +33,9 @@ import uclog
 import traceback
 import cbor2
 import serial
-import serial.tools.list_ports
-import hashlib
 from collections import deque
+import hashlib
+import time
 from timeit import default_timer as timer
 
 
@@ -162,6 +161,9 @@ class P1150API:
     ERROR_SRC_CURRENT = (1 << 12)
     ERROR_SNK_CURRENT = (1 << 13)
 
+    ERROR_ACT_DISCONNECT = (1 << 0)
+    ERROR_ACT_RESET = (1 << 1)
+    ERROR_ACT_LOCKOUT = (1 << 2)
     ERROR_ACT_SENDLOG = (1 << 3)
 
 
@@ -201,17 +203,17 @@ class UCLogger(object):
 
             app = kw.get('app', "a43")
             if app == "a43":
-                elf_file = os.path.join(base_dir, "assets", "a43_app.elf")
+                elf_file = os.path.join(base_dir, "assets", "a43_app.logdata")
 
             elif app == "a57":
-                elf_file = os.path.join(base_dir, "assets", "a57_app.elf")
+                elf_file = os.path.join(base_dir, "assets", "a57_app.logdata")
 
             else:
                 raise ValueError("app must be a43, a57")
 
             self.logger.info(f"{app}: {elf_file}")
 
-            bl_elf_file = os.path.join(base_dir, "assets", "a51_bl.elf")
+            bl_elf_file = os.path.join(base_dir, "assets", "a51_bl.logdata")
             self.logger.info(bl_elf_file)
 
             _e = uclog.decoders([elf_file, bl_elf_file])
@@ -274,24 +276,35 @@ class UCLogger(object):
             self.logger.error(e)
             self.logger.error(item)
 
-    def _uclog_async(self, _item: str) -> None:
-        """ Response handler to Port 1 destined for the client application
+    def _uclog_async(self, _item):
+        """ Response handler to Port 1 destined for the GUI (not this Klass)
         - these are asynchronous messages from the target
         - these are generally in the form of { f: asc_*, s: true, ... }
 
+        - this gets pushed onto the thread queue of GUI client
         """
+        #self.logger.info(_item)
         item = cbor2.loads(_item)
+        #self.logger.info(item)
 
         with self._lock_responses:
+            # calls core_klass.py:Core._asc_handler(item)
             if self._cb_uclog_async:
                 self._cb_uclog_async(item)
 
-    def _uclog_adc(self, _item: str) -> None:
+    def _uclog_adc(self, _item):
         """ ADC stream handler
         - ucLog port 3
         """
+        #self.logger.debug(_item)
+
+        #if len(_item) != 660 or 662:
+        #    self.logger.error(f"invalid adc frame length {len(_item)}")
+        #    return
+
         if self._cb_uclog_adc is None: return
 
+        #print(len(_item))
         try:
             item = cbor2.loads(_item)
             # Convert the list of bytes back to int32
@@ -329,7 +342,7 @@ class UCLogger(object):
         elif ra > 4096:
             self.logger.info(f">>>>>>>>>>>>> {ra}")
 
-        self._cb_uclog_adc(item)
+        self._cb_uclog_adc(item)  # this calls P1125:adc_stream_in
 
     def _uclog_cmdres(self, _item):
         """ Command Response handler on Port 0 default handler
@@ -340,6 +353,7 @@ class UCLogger(object):
         - these are generally in the form of { f: cmd_*, s: true, ... }
         - responses MUSt have fields "f" (function/method) and "s" (success flag)
         """
+        # self.logger.debug(_item)
         item = cbor2.loads(_item)
         if "f" not in item:
             self.logger.error(item)
@@ -412,7 +426,7 @@ class UCLogger(object):
                     #self.logger.info(f'RESP: {resp}')
                     return success, resp
 
-    def uclog_close(self) -> None:
+    def uclog_close(self):
         with self._lock_responses:
             if self._ucLogServer:
                 self._ucLogServer.shutdown()
@@ -462,6 +476,8 @@ class P1150(UCLogger):
         P1150API.TBASE_SPAN_5S: 5.0,
         P1150API.TBASE_SPAN_10S: 10.0,
     }
+
+    EVENT_SHUTDOWN = "EVENT_SHUTDOWN"
 
     def __init__(self, cb_acquisition_get_data=None, **kw):
         """ Init
@@ -516,13 +532,13 @@ class P1150(UCLogger):
 
         # _adc_buf is a temporary holding buffer, used when ADC data is incoming
         # and the previous triggered data hasn't yet been picked up by the GUI
-        # 100ms, 12500 samples long
-        self._adc_buf = {"t": deque(maxlen=self.NUM_SAMPLES),
-                         "i": deque(maxlen=self.NUM_SAMPLES),
-                         "a0": deque(maxlen=self.NUM_SAMPLES),
-                         "d0": deque(maxlen=self.NUM_SAMPLES),
-                         "d1": deque(maxlen=self.NUM_SAMPLES),
-                         "isnk": deque(maxlen=self.NUM_SAMPLES)}
+        # 12500 size represents 100ms of data
+        self._adc_buf = {"t": deque(maxlen=12500),
+                         "i": deque(maxlen=12500),
+                         "a0": deque(maxlen=12500),
+                         "d0": deque(maxlen=12500),
+                         "d1": deque(maxlen=12500),
+                         "isnk": deque(maxlen=12500)}
 
     def adc_stream_in(self, item):
         if not self._acquire: return
@@ -549,6 +565,15 @@ class P1150(UCLogger):
                                   [(((i & 0x2) >> 1) * self.D1_VHIGH + self.D1_VLOW) for i in item['d01']])
 
         def _append_and_trigger(item: dict, trig_src: str, level: int, slope: str):
+            """ Append data and tigger
+            - self._adc is a fixed length dequeue, the length of the queue
+              is set for one full timebase
+
+            :param item: dict of list of samples
+            :param trig_src:
+            :param level:
+            :param slope:
+            """
             if slope == P1150API.TRIG_SLOPE_EITHER:
                 # if slope is either then for each batch of 50 samples,
                 # detect if signal will be falling or rising relative to trigger level
@@ -559,11 +584,14 @@ class P1150(UCLogger):
 
             # for each batch (50) of incoming data, detect signal crossing trigger level
             for i in range(len(item['i'])):
+                # append new sample to the buffer
                 self._adc["i"].append(item['i'][i])
                 self._adc["a0"].append(item['a0'][i])
                 self._adc["d0"].append(item["d0"][i])
                 self._adc["d1"].append(item["d1"][i])
                 self._adc["isnk"].append(item['isnk'][i])
+
+                # check if trigger happened
                 if slope == P1150API.TRIG_SLOPE_RISE:
                     if not self._trigger_idx_precond:
                         if self._adc[trig_src][self._trigger_idx] < level:
@@ -583,6 +611,10 @@ class P1150(UCLogger):
                         if self._adc[trig_src][self._trigger_idx] < level:
                             self._acquire_triggered.set()
                             break
+
+        #if self._hwver in ["A0430800",]:
+        #    # compensate A0 offset, see https://github.com/sistemicorp/a48-P1150DPGApp/issues/33
+        # This was fixed mostly by a43 efd7651e41365ced2f35e45803e3d0961c017211
 
         if self._acquire_datardy.is_set():
             #self.logger.warning("incoming data with self._acquire_datardy set")
@@ -638,13 +670,17 @@ class P1150(UCLogger):
             self._adc["isnk"].extend(item['isnk'])
 
             if len(self._adc["i"]) <= self.NUM_SAMPLES:
+                #if len(self._adc["i"]) % 1000 == 0:
+                #    delta = timer() - start
+                #    self.logger.info(f" filling {delta:0.6f}, {len(self._adc['i'])}")
                 return
+
+        # At this point there is a full buffer of data representing the TIMEBASE setting
 
         # OSCILLOSCOPE MODE
         if self._acquire_mode in [P1150API.ACQUIRE_MODE_RUN, P1150API.ACQUIRE_MODE_SINGLE]:
             if self._trigger_src == P1150API.TRIG_SRC_NONE:
-                if len(self._adc["i"]) >= self.NUM_SAMPLES:
-                    self._acquire_triggered.set()
+                self._acquire_triggered.set()
 
             else:
                 # trigger detection on each incoming batch of 50 samples
@@ -873,12 +909,12 @@ class P1150(UCLogger):
         :param mode: <P1150API.ACQUIRE_MODE_*>
         :return: success <True/False>, result <json/None>
         """
-
-        if self._acquire:
-            payload = {"f": "cmd_adc", "en": True}
-            return self.uclog_response(payload)
-
         with self._lock:
+            if self._acquire:
+                # when a43 is acquiring this command has no affect
+                payload = {"f": "cmd_adc", "en": True}
+                return self.uclog_response(payload)
+
             self.NUM_SAMPLES = int(self.ADC_SAMPLE_RATE * self._timebase_span)
             self._set_trigger_idx()
             self._acquire_mode = mode

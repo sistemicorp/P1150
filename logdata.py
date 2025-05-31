@@ -22,7 +22,6 @@ from operator import itemgetter
 import time
 import cbor2
 
-from elftools.elf.elffile import ELFFile
 
 # Variables that need to be insync with target config of logging framework
 LOG_TYPE_BASIC     = 0x00
@@ -444,6 +443,7 @@ def parse_prefix(prefix):
     return prefix
 
 def load_logdata(fname):
+  from elftools.elf.elffile import ELFFile
   p = re.compile(b'([^\x00]*)\x00+')
   s = None
   with open(fname, 'rb') as f:
@@ -536,6 +536,7 @@ def load_from_cbor(data):
   return enums, tdenums, variables, functions, saddr, fmts
 
 def load_cbor_from_elf(filename):
+  from elftools.elf.elffile import ELFFile
   with open(filename, 'rb') as f:
     elf = ELFFile(f)
     s = elf.get_section_by_name('.logdata_cbor')
@@ -549,7 +550,7 @@ class LogData(object):
   def __init__(self, filename, verbose = False):
     if verbose:
       print(f"Loading {filename}")
-    if filename.endswith('.cbor'):
+    if filename.endswith('.cbor') or filename.endswith('.logdata'):
       with open(filename, 'rb') as f:
         data = f.read()
       self.enums, self.tdenums, self.variables, \
@@ -602,10 +603,7 @@ class LogData(object):
       (vals, error) = extract_vals(frame, parser, self)
       #print(f'vals: {vals} error: {error}')
       if vals is not None:
-        if kind == LOG_TYPE_MEM and line == '<zephyr>':
-          text = f'{vals[1].decode()}'
-          line = ''
-        elif kind == LOG_TYPE_MEM:
+        if kind == LOG_TYPE_MEM:
           text = f'{clean} {vals[0]:08x}: {hex2str(vals[1])}'
         else:
           text = clean % vals
