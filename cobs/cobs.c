@@ -78,7 +78,7 @@ cobs_enc_fn(PyObject *self, PyObject *args) {
     }
     out = PyMem_Malloc(cobs_enc_size(n));
     if (out == NULL) {
-      return NULL;
+      return PyErr_NoMemory();
     }
     n = cobs_enc((uint8_t*) out, (uint8_t*) in, n);
 
@@ -99,14 +99,23 @@ cobs_dec_fn(PyObject *self, PyObject *args) {
     }
     out = PyMem_Malloc(n);
     if (out == NULL) {
-      return NULL;
+      return PyErr_NoMemory();
     }
     n = cobs_dec((uint8_t*) out, (uint8_t*) in, n);
     if (n >= 0) {
       r = PyBytes_FromStringAndSize(out, n);
     }
     else {
-      r = CobsError;
+      if (n == -1) {
+        PyErr_SetString(CobsError, "Input contains 0x00");
+      }
+      else if (n == -2) {
+        PyErr_SetString(CobsError, "Insufficient input");
+      }
+      else {
+        PyErr_SetString(CobsError, "Unspecified");
+      }
+      return NULL;
     }
     PyMem_Free(out);
     return r;
@@ -136,9 +145,8 @@ PyInit_cobs(void)
     if (m == NULL)
         return NULL;
 
-    CobsError = PyErr_NewException("cobs.error", NULL, NULL);
-    Py_XINCREF(CobsError);
-    if (PyModule_AddObject(m, "error", CobsError) < 0) {
+    CobsError = PyErr_NewException("cobs.Error", NULL, NULL);
+    if (PyModule_AddObject(m, "Error", CobsError) < 0) {
         Py_XDECREF(CobsError);
         Py_CLEAR(CobsError);
         Py_DECREF(m);
