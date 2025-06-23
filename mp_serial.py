@@ -65,6 +65,9 @@ class MySerialManager(Process):
         os.makedirs(app_data_path)
 
     app_data_log_path = os.path.join(app_data_path, "log")
+    if not os.path.exists(app_data_log_path):
+        os.makedirs(app_data_log_path)
+
     logfile = os.path.join(app_data_log_path, "a48mp.log")
 
     FORMAT = "%(asctime)s: %(filename)22s %(funcName)25s %(levelname)-5.5s :%(lineno)4s: %(message)s"
@@ -139,7 +142,10 @@ class MySerialManager(Process):
           frame, indata = indata.split(b'\x00', 1)
           try:
             if len(frame) > 0:
-              self.q_out.put_nowait(cobs.dec(frame))
+              try:
+                self.q_out.put_nowait(cobs.dec(frame))
+              except cobs.Error:
+                self.logger.error(f"COBS Decode Error: {frame.hex()}")
 
           except Exception as e:
             self.logger.error(e)
