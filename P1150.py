@@ -33,6 +33,7 @@ import uclog
 import traceback
 import cbor2
 import serial
+import serial.tools.list_ports
 from collections import deque
 import hashlib
 import time
