@@ -173,7 +173,7 @@ if __name__ == '__main__':
     # plot the results
     plt.xlabel("Time (s)")
     plt.ylabel("Current (mAmps)")
-    plt.title(f"P1150:{p1150_details["serial_hash"]} Current vs Time")
+    plt.title(f"P1150:{p1150_details['serial_hash']} Current vs Time")
     plt.yscale('log')
 
     plt.plot(G["data"]["t"], G["data"]["i"])
