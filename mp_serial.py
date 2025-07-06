@@ -14,7 +14,6 @@ import timeit
 import sys
 import cobs
 import os
-logger = logging.getLogger()
 
 
 class MySerialManager(Process):
@@ -40,8 +39,6 @@ class MySerialManager(Process):
     self._cmd_thread = None
     self._serial_port = None
 
-    logger.info("starting")
-
   def is_running(self):
     return self._running.is_set()
 
@@ -49,22 +46,23 @@ class MySerialManager(Process):
 
     self.logger = get_logger()
 
+    # NOTE: to support multiple connected devices create log path from serial port
     if sys.platform.startswith("linux"):  # could be "linux", "linux2", "linux3", ...
-        app_data_path = os.path.join(os.path.expanduser("~"), ".local/share/p1150")
+      _serial_port = f"{os.path.split(serial_port)[-1]}"
+      app_data_log_path = os.path.join(os.path.expanduser("~"), f".local/share/p1150/log/{_serial_port}")
 
     elif sys.platform == "darwin":
-        app_data_path = os.path.join(os.path.expanduser("~"), "Library/Application Support/p1150")
+      _serial_port = f"{os.path.split(serial_port)[-1]}"
+      app_data_log_path = os.path.join(os.path.expanduser("~"), f"Library/Application Support/p1150/log/{_serial_port}")
 
     elif sys.platform == "win32":
-        app_data_path = os.path.join(os.path.expanduser("~"), "AppData/Roaming/p1150")
+      _serial_port = f"_{serial_port}".lower()
+      app_data_log_path = os.path.join(os.path.expanduser("~"), f"AppData/Roaming/p1150/log/{_serial_port}")
 
     else:
-        app_data_path = "./log"
+        # should never happen?
+        app_data_log_path = f"./log/unknown_os"
 
-    if not os.path.exists(app_data_path):
-        os.makedirs(app_data_path)
-
-    app_data_log_path = os.path.join(app_data_path, "log")
     if not os.path.exists(app_data_log_path):
         os.makedirs(app_data_log_path)
 
