@@ -11,7 +11,9 @@ measurements.
 ## Installing
 
 
-P1150 is developed and tested with Python 3.12.  
+P1150 is developed and tested with Python 3.12.
+
+NOTE: https://stackoverflow.com/questions/77364550/attributeerror-module-pkgutil-has-no-attribute-impimporter-did-you-mean
 
 
 ### Requirements
