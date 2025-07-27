@@ -442,24 +442,6 @@ def parse_prefix(prefix):
   else:
     return prefix
 
-def load_logdata(fname):
-  from elftools.elf.elffile import ELFFile
-  p = re.compile(b'([^\x00]*)\x00+')
-  s = None
-  with open(fname, 'rb') as f:
-    elf = ELFFile(f)
-    sdata = elf.get_section_by_name('.logdata').data()
-    if len(sdata) == 0: return None, {}
-
-    s = elf.get_section_by_name('.symtab')
-    saddr = s.get_symbol_by_name('_slogstr')
-    if saddr == None: return None, {}
-    saddr = saddr[0].entry.st_value
-
-    strings = p.finditer(sdata)
-    fmt    = {m.start()+saddr: parse_prefix(m.group(1).decode('utf-8')) for m in strings}
-
-  return (saddr, fmt)
 
 def hex2str(b, sep = ' '):
   return sep.join(['%02x' % v for v in b])
@@ -535,16 +517,6 @@ def load_from_cbor(data):
       fmts[fmt] = level, fname, line
   return enums, tdenums, variables, functions, saddr, fmts
 
-def load_cbor_from_elf(filename):
-  from elftools.elf.elffile import ELFFile
-  with open(filename, 'rb') as f:
-    elf = ELFFile(f)
-    s = elf.get_section_by_name('.logdata_cbor')
-    if s:
-      data = s.data()
-      if len(data) > 0:
-        return data
-    return None
 
 class LogData(object):
   def __init__(self, filename, verbose = False):
@@ -555,15 +527,7 @@ class LogData(object):
         data = f.read()
       self.enums, self.tdenums, self.variables, \
           self.functions, self.saddr, self.fmts = load_from_cbor(data)
-    else:
-      data = load_cbor_from_elf(filename)
-      if data:
-        self.enums, self.tdenums, self.variables, \
-            self.functions, self.saddr, self.fmts = load_from_cbor(data)
-      else:
-        self.enums, self.tdenums, self.variables, self.functions = \
-            extract(*parse(filename))
-        self.saddr, self.fmts = load_logdata(filename)
+
     self.filename = filename
     self.ts = os.stat(filename).st_mtime
     self.count = 0
@@ -574,21 +538,8 @@ class LogData(object):
   def target(self):
     return (self.saddr >> TARGET_DIGIT_SHIFT) & 0xf;
 
-  def _check_for_reload(self):
-    ts = os.stat(self.filename).st_mtime
-    if ts != self.ts:
-      old_target = self.target()
-      self.enums, self.tdenums, self.variables, self.functions = \
-          extract(*parse(self.filename))
-      self.saddr, self.fmts = load_logdata(self.filename)
-      self.ts = ts
-
-      if self.target() != old_target:
-        print("Target changed from %d to %d" % (old_target, self.target()))
-      print("Reloaded:", self.filename)
 
   def decode(self, item):
-    self._check_for_reload()
     target, addr, frame = item
     kind = addr & 3
     addr = addr & ~3

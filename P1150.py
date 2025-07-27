@@ -2,7 +2,7 @@
 """
 MIT License
 
-Copyright (c) 2025 Sistemi Corp
+Copyright (c) 2024-2025 sistemicorp
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -27,7 +27,6 @@ This file should NOT BE ALTERED.
 import os
 import struct
 from dataclasses import dataclass
-from time import sleep
 from threading import Lock, Event
 import uclog
 import traceback
@@ -36,7 +35,7 @@ import serial
 import serial.tools.list_ports
 from collections import deque
 import hashlib
-import time
+from time import sleep
 from timeit import default_timer as timer
 
 
@@ -195,6 +194,9 @@ class UCLogger(object):
         self._cmd_responses = {}
         self._result_event = Event()
         self._adc_frame_count = None
+        self._low_pass_filter = False
+        self._low_pass_filter_i_cache = [0.0, 0.0]
+        self._low_pass_filter_isnk_cache = [0.0, 0.0]
 
         try:
             _t = self._port
@@ -309,11 +311,11 @@ class UCLogger(object):
         try:
             item = cbor2.loads(_item)
             # Convert the list of bytes back to int32
-            item["i"] = struct.unpack('<' + 'I' * (len(item["i"]) // 4), item["i"])
+            item["i"] = struct.unpack('<' + 'f' * (len(item["i"]) // 4), item["i"])
             item["i"] = [i / 1000000.0 for i in item["i"]]  # convert to mAmps (float)
 
             # Convert the list of bytes back to int32
-            item["isnk"] = struct.unpack('<' + 'I' * (len(item["isnk"]) // 4), item["isnk"])
+            item["isnk"] = struct.unpack('<' + 'f' * (len(item["isnk"]) // 4), item["isnk"])
             item["isnk"] = [i / 1000000.0 for i in item["isnk"]]  # convert to mAmps (float)
 
             # Convert the list of bytes back to int16
@@ -333,6 +335,24 @@ class UCLogger(object):
             self.logger.error(f"last good frame {self._adc_frame_count}")
             self.logger.error(_item)
             return
+
+        if self._low_pass_filter:
+            # insert cached 2 samples from the tail of the last streamed packet
+            item["i"] = self._low_pass_filter_i_cache + item["i"]
+            item["isnk"] = self._low_pass_filter_isnk_cache + item["isnk"]
+
+            # wma_list = [sum(data[i + j] * weights[j] for j in range(window_size)) / sum(weights)
+            #            for i in range(len(data) - window_size + 1)]
+            w = (0.11, 0.78, 0.11)  # must add up to 1.0
+            item["i"] = [(sum(item["i"][i + j] * w[j] for j in range(3))) for i in range(48)]
+            # cache the last two values for next streamed packet
+            self._low_pass_filter_i_cache = item["i"][-2:]
+            # final result without the last two (which are cached)
+            item["i"] = item["i"][:-2]
+
+            item["isnk"] = [(sum(item["isnk"][i + j] * w[j] for j in range(3))) for i in range(48)]
+            self._low_pass_filter_isnk_cache = item["isnk"][-2:]
+            item["isnk"] = item["isnk"][:-2]
 
         self._adc_frame_count = item['c']
         #if self._adc_frame_count % 5000 == 0:
@@ -613,10 +633,6 @@ class P1150(UCLogger):
                             self._acquire_triggered.set()
                             break
 
-        #if self._hwver in ["A0430800",]:
-        #    # compensate A0 offset, see https://github.com/sistemicorp/a48-P1150DPGApp/issues/33
-        # This was fixed mostly by a43 efd7651e41365ced2f35e45803e3d0961c017211
-
         if self._acquire_datardy.is_set():
             #self.logger.warning("incoming data with self._acquire_datardy set")
             # new incoming data when previous data still not consumed, buffer new data into _adc_buf
@@ -658,6 +674,7 @@ class P1150(UCLogger):
             self._adc_buf['d1'].clear()
             self._adc_buf['isnk'].clear()
 
+        # debug log to check health of streaming
         if self._buffered_adc_frame_count and self._buffered_adc_frame_count != item['c']:
             self.logger.warning(f"adc frame count {item['c']}")
         self._buffered_adc_frame_count = item['c'] + 1
@@ -677,6 +694,7 @@ class P1150(UCLogger):
                 return
 
         # At this point there is a full buffer of data representing the TIMEBASE setting
+        #self.logger.info(f"self._adc len {len(self._adc['i'])}")
 
         # OSCILLOSCOPE MODE
         if self._acquire_mode in [P1150API.ACQUIRE_MODE_RUN, P1150API.ACQUIRE_MODE_SINGLE]:
@@ -698,6 +716,8 @@ class P1150(UCLogger):
                 else:
                     t_start = -3 * self._timebase_span / 4
 
+                # TODO: move this to gui_osc.py, so there there is one less array ("t") to send up,
+                #       note that logger and mamhr do not use "t"
                 # TODO: the list(s) could be pre-calculated and the correct one used, reducing runtime processing
                 self._adc["t"] = [t_start + i / self.ADC_SAMPLE_RATE for i in range(self.NUM_SAMPLES)]
                 #self.logger.info(f"triggered, frame count {self._adc_frame_count}, length {len(self._adc['i'])} / {self.NUM_SAMPLES}")
@@ -1011,6 +1031,16 @@ class P1150(UCLogger):
             payload = {"f": "cmd_error_clear"}
             return self.uclog_response(payload)
 
+    def led_blink(self) -> (bool, dict):
+        """ blink P1150 LED
+        - can be used to identify P1150 in case of multiple P1150s
+
+        :return: success <True/False>, result <json/None>
+        """
+        with self._lock:
+            payload = {"f": "cmd_led_blink"}
+            return self.uclog_response(payload)
+
     def ping(self) -> (bool, dict):
         """ Bootloader Ping
 
@@ -1034,6 +1064,10 @@ class P1150(UCLogger):
                 if "hwver" in rsp[1][0]:
                     self._hwver = f'{rsp[1][0]["hwver"]:08X}'
                     self.logger.info(self._hwver)
+
+                    if self._hwver in ["A0431100"]:
+                        # compensate for a4311 INA/OPA filter peaking
+                        self._low_pass_filter = True
 
             return rsp
 
@@ -1127,27 +1161,27 @@ class P1150(UCLogger):
 
             # the P1150 is rebooting and will re-enumerate with USB
             self.close()
-            time.sleep(0.200)  # allow time for device to disconnect/reboot
+            sleep(0.200)  # allow time for device to disconnect/reboot
 
             # wait for host OS to see the COM port return
-            start = time.time()
+            start = timer()
             ports_connected = [p.device for p in serial.tools.list_ports.comports()]
             found = False
-            while time.time() - start < self.TIME_RECONNECT_AFTER_FWLOAD_S:
+            while timer() - start < self.TIME_RECONNECT_AFTER_FWLOAD_S:
                 ports_connected = [p.device for p in serial.tools.list_ports.comports()]
                 if self._port in ports_connected:
                     self.logger.info(f"port {self._port} re-found")
                     found = True
                     break
                 self.logger.info(f"port {self._port} waiting...")
-                time.sleep(0.05)
+                sleep(0.05)
 
             if not found:
                 self.logger.error(f"P1150 {self._port} not FOUND in {ports_connected} - timeout")
                 return False, {"ERROR": f"P1150 not found on port {self._port} after FW update"}
 
             # wait for reconnect, although the port is found, sometimes more delay is required
-            time.sleep(1)
+            sleep(1)
             # client must retry to re-connect to application FW (a43)
             return True, _response
 
@@ -1170,7 +1204,7 @@ class P1150(UCLogger):
             self.logger.info(f"calibrate {result}")
 
             while True:
-                time.sleep(0.5)
+                sleep(0.5)
 
                 success, result = self.cal_status()
                 if not success:
