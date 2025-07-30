@@ -337,22 +337,18 @@ class UCLogger(object):
             return
 
         if self._low_pass_filter:
-            # insert cached 2 samples from the tail of the last streamed packet
-            item["i"] = self._low_pass_filter_i_cache + item["i"]
-            item["isnk"] = self._low_pass_filter_isnk_cache + item["isnk"]
+            def lpf(x, z=[0.0, 0.0]):
+                if len(z) != 2:
+                    raise ValueError('history length must be 2')
+                t = z + x
+                w = (0.11, 0.78, 0.11)  # must add up to 1.0
+                r = [(sum(t[i + j] * w[j] for j in range(3))) for i in range(len(x))]
+                return r, x[-2:]
 
-            # wma_list = [sum(data[i + j] * weights[j] for j in range(window_size)) / sum(weights)
-            #            for i in range(len(data) - window_size + 1)]
-            w = (0.11, 0.78, 0.11)  # must add up to 1.0
-            item["i"] = [(sum(item["i"][i + j] * w[j] for j in range(3))) for i in range(48)]
-            # cache the last two values for next streamed packet
-            self._low_pass_filter_i_cache = item["i"][-2:]
-            # final result without the last two (which are cached)
-            item["i"] = item["i"][:-2]
-
-            item["isnk"] = [(sum(item["isnk"][i + j] * w[j] for j in range(3))) for i in range(48)]
-            self._low_pass_filter_isnk_cache = item["isnk"][-2:]
-            item["isnk"] = item["isnk"][:-2]
+            item["i"], self._low_pass_filter_i_cache = \
+                lpf(item["i"], self._low_pass_filter_i_cache)
+            item["isnk"], self._low_pass_filter_isnk_cache = \
+                lpf(item["isnk"], self._low_pass_filter_isnk_cache)
 
         self._adc_frame_count = item['c']
         #if self._adc_frame_count % 5000 == 0:
