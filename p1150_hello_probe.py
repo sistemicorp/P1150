@@ -43,8 +43,8 @@ logger.addHandler(consoleHandler)
 logger.setLevel(logging.INFO)
 
 # scanning for P1150 is not shown in this example, please see p1150_scan.py.
-P1150_PORT = "COM7"  # use p1150_scan.py to determine this
-DEFAULT_ACQ_TIMEOUT = 10.0
+P1150_PORT = "COM3"  # use p1150_scan.py to determine this
+DEFAULT_ACQ_TIMEOUT_S = 10.0
 P1150_VOUT_MV = 4000
 WAIT_BEFORE_SAMPLE_S = 1.0
 
@@ -157,8 +157,8 @@ if __name__ == '__main__':
         time.sleep(0.02)
         logger.info("waiting for acquisition event...")
 
-        if timer() - start > DEFAULT_ACQ_TIMEOUT:
-            logger.error(f"timeout: {DEFAULT_ACQ_TIMEOUT}")
+        if timer() - start > DEFAULT_ACQ_TIMEOUT_S:
+            logger.error(f"timeout: {DEFAULT_ACQ_TIMEOUT_S} seconds")
             break
 
     # Always stop aqc when finished so that streaming stops

@@ -1,0 +1,6 @@
+mp_serial_ext.c
+setup.py
+mp_serial_ext.egg-info/PKG-INFO
+mp_serial_ext.egg-info/SOURCES.txt
+mp_serial_ext.egg-info/dependency_links.txt
+mp_serial_ext.egg-info/top_level.txt

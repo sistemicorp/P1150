@@ -6,7 +6,7 @@ size_t cobs_enc_size(size_t n) {
   return (n + 253)/254 + n;
 }
 
-size_t cobs_enc(uint8_t* out, uint8_t* in, size_t n) {
+size_t cobs_enc(uint8_t* out, const uint8_t* in, size_t n) {
   size_t nout = 0;
   bool last_max = false;
   out[0] = 1;
@@ -36,19 +36,22 @@ size_t cobs_enc(uint8_t* out, uint8_t* in, size_t n) {
 }
 
 
-long int cobs_dec(uint8_t* out, uint8_t* in, size_t n) {
+long int cobs_dec(uint8_t* out, const uint8_t* in, size_t n) {
   bool out0 = false;
   uint8_t code = 0;
   size_t nout = 0;
-  if (memchr(in, 0x00, n) != NULL) return -1; // Input must not contain 0x00
+  // Removed upfront memchr() to avoid extra O(n) pass; validate inline instead.
   while (n > 0) {
     if (code == 0) {
       if (out0) { *out++ = 0x00; nout++; }
-      code = *in++;  n--; // Code can't be 0x00 - memchr test above
-      out0 = code != 255;
+      if (n == 0) break; // safety
+      code = *in++;  n--;
+      if (code == 0) return -1; // Input must not contain 0x00
+      out0 = (code != 255);
       code--;
     }
     else {
+      if (*in == 0x00) return -1; // Input must not contain 0x00
       *out++ = *in++;
       nout++; n--;
       code--;
@@ -80,7 +83,7 @@ cobs_enc_fn(PyObject *self, PyObject *args) {
     if (out == NULL) {
       return PyErr_NoMemory();
     }
-    n = cobs_enc((uint8_t*) out, (uint8_t*) in, n);
+    n = cobs_enc((uint8_t*) out, (const uint8_t*) in, n);
 
     PyObject *r = PyBytes_FromStringAndSize(out, n);
     PyMem_Free(out);
@@ -101,7 +104,7 @@ cobs_dec_fn(PyObject *self, PyObject *args) {
     if (out == NULL) {
       return PyErr_NoMemory();
     }
-    n = cobs_dec((uint8_t*) out, (uint8_t*) in, n);
+    n = cobs_dec((uint8_t*) out, (const uint8_t*) in, n);
     if (n >= 0) {
       r = PyBytes_FromStringAndSize(out, n);
     }

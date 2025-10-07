@@ -66,12 +66,14 @@ class P1150API:
     TRIG_SRC_NONE = "TRIG_SRC_NONE"
     TRIG_SRC_CUR  = "TRIG_SRC_CUR"
     TRIG_SRC_D0   = "TRIG_SRC_D0"
+    TRIG_SRC_D0S  = "TRIG_SRC_D0S"
     TRIG_SRC_D1   = "TRIG_SRC_D1"
     TRIG_SRC_A0A  = "TRIG_SRC_A0A"
     TRIG_SRC_LIST = [
         TRIG_SRC_NONE,
         TRIG_SRC_CUR,
         TRIG_SRC_D0,
+        TRIG_SRC_D0S,
         TRIG_SRC_D1,
         TRIG_SRC_A0A,
     ]
@@ -122,24 +124,12 @@ class P1150API:
     DEMO_CAL_LOAD_200K = "DEMO_CAL_LOAD_200K_"
     DEMO_CAL_LOAD_20K  = "DEMO_CAL_LOAD_20K_"
     DEMO_CAL_LOAD_2K   = "DEMO_CAL_LOAD_2K_"
-    DEMO_CAL_LOAD_400  = "DEMO_CAL_LOAD_400_"
-    DEMO_CAL_LOAD_200  = "DEMO_CAL_LOAD_200_"
-    DEMO_CAL_LOAD_100  = "DEMO_CAL_LOAD_100_"
-    DEMO_CAL_LOAD_40   = "DEMO_CAL_LOAD_40_"
-    DEMO_CAL_LOAD_20   = "DEMO_CAL_LOAD_20_"
-    DEMO_CAL_LOAD_10   = "DEMO_CAL_LOAD_10_"
     DEMO_CAL_LOAD_LIST = [
         DEMO_CAL_LOAD_NONE,
         DEMO_CAL_LOAD_2M,
         DEMO_CAL_LOAD_200K,
         DEMO_CAL_LOAD_20K,
         DEMO_CAL_LOAD_2K,
-        DEMO_CAL_LOAD_400,
-        DEMO_CAL_LOAD_200,
-        DEMO_CAL_LOAD_100,
-        DEMO_CAL_LOAD_40,
-        DEMO_CAL_LOAD_20,
-        DEMO_CAL_LOAD_10,
     ]
 
     AUX_D01_DISABLE = 0
@@ -200,8 +190,6 @@ class UCLogger(object):
 
         try:
             _t = self._port
-            _h = uclog.hostport(None)
-
             base_dir = os.path.dirname(__file__)
 
             app = kw.get('app', "a43")
@@ -220,7 +208,7 @@ class UCLogger(object):
             self.logger.info(bl_elf_file)
 
             _e = uclog.decoders([elf_file, bl_elf_file])
-            self.logger.info(f"Using target: {_t}, host {_h}, elf {_e}")
+            self.logger.info(f"Using target: {_t}, elf {_e}")
 
             self._ucLogServer = uclog.LogClientServer(_t,
                                                       _e,
@@ -310,19 +298,26 @@ class UCLogger(object):
         #print(len(_item))
         try:
             item = cbor2.loads(_item)
+
             # Convert the list of bytes back to int32
-            item["i"] = struct.unpack('<' + 'f' * (len(item["i"]) // 4), item["i"])
+            item["i"] = struct.unpack('<ffffffffffffffffffffffffffffffffffffffffffffffffff', item["i"])
             item["i"] = [i / 1000000.0 for i in item["i"]]  # convert to mAmps (float)
 
             # Convert the list of bytes back to int32
-            item["isnk"] = struct.unpack('<' + 'f' * (len(item["isnk"]) // 4), item["isnk"])
+            item["isnk"] = struct.unpack('<ffffffffffffffffffffffffffffffffffffffffffffffffff', item["isnk"])
             item["isnk"] = [i / 1000000.0 for i in item["isnk"]]  # convert to mAmps (float)
 
             # Convert the list of bytes back to int16
-            item["a0"] = struct.unpack('<' + 'H' * (len(item["a0"]) // 2), item["a0"])
+            item["a0"] = struct.unpack('<HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH', item["a0"])
+            item["a0"] = [float(i) for i in item["a0"]]
 
             # Convert the list of bytes back to int8
-            item["d01"] = struct.unpack('<' + 'B' * (len(item["d01"]) // 1), item["d01"])
+            item["d01"] = struct.unpack('<BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', item["d01"])
+            # note these are converted to float in _event_adc_stream_in
+
+            # Convert the list of bytes back to char
+            item["d0s"] = struct.unpack('<cccccccccccccccccccccccccccccccccccccccccccccccccc', item["d0s"])
+            item["d0s"] = [i.decode('utf-8') for i in item["d0s"]]  # change to str
 
             # check frame counter, to detect missing packets
             if self._adc_frame_count is None:
@@ -337,9 +332,10 @@ class UCLogger(object):
             return
 
         if self._low_pass_filter:
-            def lpf(x, z=[0.0, 0.0]):
-                if len(z) != 2:
-                    raise ValueError('history length must be 2')
+            def lpf(x: list, z: list) -> tuple[list, list]:
+                if z[0] == 0.0:
+                    z[0], z[1] = x[0], x[1]
+
                 t = z + x
                 w = (0.11, 0.78, 0.11)  # must add up to 1.0
                 r = [(sum(t[i + j] * w[j] for j in range(3))) for i in range(len(x))]
@@ -391,7 +387,7 @@ class UCLogger(object):
                 self._cmd_responses[f].append(item)
                 self.logger.warning(f"unexpected response {self._cmd_responses[f]}")
 
-    def uclog_response(self, payload: dict) -> (bool, list):
+    def uclog_response(self, payload: dict) -> tuple[bool, list[dict] | None]:
         """ helper to send cbor commands and wait for response
         - all commands sent on ucLog port 0 must respond and NOT BLOCK on STM32
         - companion helper _uclog_cmdres gets the response and sets _result_event
@@ -464,10 +460,10 @@ class P1150(UCLogger):
 
     """
     # Fake Voltages for D0/1 signals to be plotted, these are safe to change
-    D0_VLOW = 20
-    D1_VLOW = 40
-    D0_VHIGH = 1000
-    D1_VHIGH = 1100
+    D0_VLOW = 20.0
+    D1_VLOW = 40.0
+    D0_VHIGH = 1000.0
+    D1_VHIGH = 1100.0
 
     # Do not change any of these next constants
     TIME_RECONNECT_AFTER_FWLOAD_S = 5.0
@@ -530,12 +526,14 @@ class P1150(UCLogger):
         self._trigger_idx_precond = False
         self._mahr_stop_time_s = 60
         self._timebase_span = self.TBASE_MAP[P1150API.TBASE_SPAN_100MS]
-        self.NUM_SAMPLES = int(self._timebase_span * self.ADC_SAMPLE_RATE)
+        self._osc_t = []
+        self.NUM_SAMPLES = 0
 
         self._trig_src_map = {
             P1150API.TRIG_SRC_CUR: "i",
             P1150API.TRIG_SRC_A0A: "a0",
             P1150API.TRIG_SRC_D0:  "d0",
+            P1150API.TRIG_SRC_D0S: "d0s",
             P1150API.TRIG_SRC_D1:  "d1"
         }
 
@@ -554,11 +552,14 @@ class P1150(UCLogger):
                          "i": deque(maxlen=12500),
                          "a0": deque(maxlen=12500),
                          "d0": deque(maxlen=12500),
+                         "d0s": deque(maxlen=12500),
                          "d1": deque(maxlen=12500),
                          "isnk": deque(maxlen=12500)}
 
-    def adc_stream_in(self, item):
-        if not self._acquire: return
+    def adc_stream_in(self, item) -> None:
+        if not self._acquire:
+            return
+
         with self._lock_stream:
             self._event_adc_stream_in(item)
 
@@ -577,57 +578,97 @@ class P1150(UCLogger):
         """
         #start = timer()
 
-        # extract d0/1 from the byte of d01
-        item["d0"], item["d1"] = ([((i & 0x1) * self.D0_VHIGH + self.D0_VLOW) for i in item['d01']],
-                                  [(((i & 0x2) >> 1) * self.D1_VHIGH + self.D1_VLOW) for i in item['d01']])
+        # extract d0/1 from the byte of d01 using batch operations and local bindings
+        # takes ~10usec to run
+        d01 = item['d01']
+        d0_vh, d0_vl = self.D0_VHIGH, self.D0_VLOW
+        d1_vh, d1_vl = self.D1_VHIGH, self.D1_VLOW
+        item["d0"] = [((b & 0x1) * d0_vh + d0_vl) for b in d01]
+        item["d1"] = [(((b >> 1) & 0x1) * d1_vh + d1_vl) for b in d01]
 
-        def _append_and_trigger(item: dict, trig_src: str, level: int, slope: str):
-            """ Append data and tigger
-            - self._adc is a fixed length dequeue, the length of the queue
+        def _append_and_trigger(item: dict, trig_src: str, level:  float | int | str, slope: str) -> None:
+            """ Append data and trigger
+            - self._adc is a fixed length deque, the length of the queue
               is set for one full timebase
+
+            - takes 50-100usec to run
 
             :param item: dict of list of samples
             :param trig_src:
             :param level:
             :param slope:
             """
+            #start = timer()
+            # takes <100usec
+
+            adc = self._adc
+            adc_i = adc["i"]
+            adc_a0 = adc["a0"]
+            adc_d0 = adc["d0"]
+            adc_d0s = adc["d0s"]
+            adc_d1 = adc["d1"]
+            adc_isnk = adc["isnk"]
+
+            # read somewhere that assigning on one line is faster than multiple lines
+            li, la0, ld0, ld0s, ld1, lisnk = item['i'], item['a0'], item['d0'], item['d0s'], item['d1'], item['isnk']
+            idx, level_num, precond, adc_src, triggered_event = self._trigger_idx, level, self._trigger_idx_precond, adc[trig_src], self._acquire_triggered
+
             if slope == P1150API.TRIG_SLOPE_EITHER:
                 # if slope is either then for each batch of 50 samples,
                 # detect if signal will be falling or rising relative to trigger level
-                if self._adc[trig_src][self._trigger_idx] < self._trigger_level:
+                if adc_src[idx] < self._trigger_level:
                     slope = P1150API.TRIG_SLOPE_RISE
                 else:
                     slope = P1150API.TRIG_SLOPE_FALL
 
             # for each batch (50) of incoming data, detect signal crossing trigger level
-            for i in range(len(item['i'])):
+            n = len(li)
+            for i in range(n):
                 # append new sample to the buffer
-                self._adc["i"].append(item['i'][i])
-                self._adc["a0"].append(item['a0'][i])
-                self._adc["d0"].append(item["d0"][i])
-                self._adc["d1"].append(item["d1"][i])
-                self._adc["isnk"].append(item['isnk'][i])
+                adc_i.append(li[i])
+                adc_a0.append(la0[i])
+                adc_d0.append(ld0[i])
+                adc_d0s.append(ld0s[i])
+                adc_d1.append(ld1[i])
+                adc_isnk.append(lisnk[i])
 
                 # check if trigger happened
-                if slope == P1150API.TRIG_SLOPE_RISE:
-                    if not self._trigger_idx_precond:
-                        if self._adc[trig_src][self._trigger_idx] < level:
-                            self._trigger_idx_precond = True
+                if isinstance(level_num, (int, float)):
+                    if slope == P1150API.TRIG_SLOPE_RISE:
+                        if not precond:
+                            if adc_src[idx] < level_num:
+                                precond = True
+                        else:
+                            if adc_src[idx] > level_num:
+                                triggered_event.set()
+                                break
+                    else:  # slope == P1150API.TRIG_SLOPE_FALL:
+                        if not precond:
+                            if adc_src[idx] > level_num:
+                                precond = True
+                        else:
+                            if adc_src[idx] < level_num:
+                                triggered_event.set()
+                                break
+                elif isinstance(level_num, str):
+                    if adc_src[idx] == level_num:
+                        triggered_event.set()
+                        break
+                else:
+                    self.logger.error(f"unexpected trigger level {level} type {type(level)}")
 
-                    else:
-                        if self._adc[trig_src][self._trigger_idx] > level:
-                            self._acquire_triggered.set()
-                            break
+            # write back any changes to precondition flag
+            self._trigger_idx_precond = precond
 
-                else:  # slope == P1150API.TRIG_SLOPE_FALL:
-                    if not self._trigger_idx_precond:
-                        if self._adc[trig_src][self._trigger_idx] > level:
-                            self._trigger_idx_precond = True
+            adc_i.extend(li[i:])
+            adc_a0.extend(la0[i:])
+            adc_d0.extend(ld0[i:])
+            adc_d0s.extend(ld0s[i:])
+            adc_d1.extend(ld1[i:])
+            adc_isnk.extend(lisnk[i:])
 
-                    else:
-                        if self._adc[trig_src][self._trigger_idx] < level:
-                            self._acquire_triggered.set()
-                            break
+            #delta = timer() - start
+            #self.logger.info(f"lpf {delta:0.6f}")
 
         if self._acquire_datardy.is_set():
             #self.logger.warning("incoming data with self._acquire_datardy set")
@@ -636,6 +677,7 @@ class P1150(UCLogger):
             self._adc_buf["i"].extend(item['i'])
             self._adc_buf["a0"].extend(item['a0'])
             self._adc_buf["d0"].extend(item["d0"])
+            self._adc_buf["d0s"].extend(item["d0s"])
             self._adc_buf["d1"].extend(item["d1"])
             self._adc_buf["isnk"].extend(item['isnk'])
 
@@ -658,6 +700,7 @@ class P1150(UCLogger):
             self._adc["i"].extend(self._adc_buf['i'])
             self._adc["a0"].extend(self._adc_buf['a0'])
             self._adc["d0"].extend(self._adc_buf['d0'])
+            self._adc["d0s"].extend(self._adc_buf['d0s'])
             self._adc["d1"].extend(self._adc_buf['d1'])
             self._adc["isnk"].extend(self._adc_buf['isnk'])
 
@@ -667,6 +710,7 @@ class P1150(UCLogger):
             self._adc_buf['i'].clear()
             self._adc_buf['a0'].clear()
             self._adc_buf['d0'].clear()
+            self._adc_buf['d0s'].clear()
             self._adc_buf['d1'].clear()
             self._adc_buf['isnk'].clear()
 
@@ -680,6 +724,7 @@ class P1150(UCLogger):
             self._adc["i"].extend(item['i'])
             self._adc["a0"].extend(item['a0'])
             self._adc["d0"].extend(item["d0"])
+            self._adc["d0s"].extend(item["d0s"])
             self._adc["d1"].extend(item["d1"])
             self._adc["isnk"].extend(item['isnk'])
 
@@ -690,9 +735,9 @@ class P1150(UCLogger):
                 return
 
         # At this point there is a full buffer of data representing the TIMEBASE setting
-        #self.logger.info(f"self._adc len {len(self._adc['i'])}")
+        #self.logger.info(f"self._adc len {len(self._adc['i'])}, mode {self._acquire_mode}, _acquire_triggered {self._acquire_triggered.is_set()}")
 
-        # OSCILLOSCOPE MODE
+        # OSCILLOSCOPE MODE, also used by MAMPHR Mode (ACQUIRE_MODE_RUN)
         if self._acquire_mode in [P1150API.ACQUIRE_MODE_RUN, P1150API.ACQUIRE_MODE_SINGLE]:
             if self._trigger_src == P1150API.TRIG_SRC_NONE:
                 self._acquire_triggered.set()
@@ -712,13 +757,12 @@ class P1150(UCLogger):
                 else:
                     t_start = -3 * self._timebase_span / 4
 
-                # TODO: move this to gui_osc.py, so there there is one less array ("t") to send up,
-                #       note that logger and mamhr do not use "t"
-                # TODO: the list(s) could be pre-calculated and the correct one used, reducing runtime processing
-                self._adc["t"] = [t_start + i / self.ADC_SAMPLE_RATE for i in range(self.NUM_SAMPLES)]
-                #self.logger.info(f"triggered, frame count {self._adc_frame_count}, length {len(self._adc['i'])} / {self.NUM_SAMPLES}")
+                if len(self._osc_t) != self.NUM_SAMPLES:  # create self._osc_t only once
+                    self._osc_t = [t_start + i / self.ADC_SAMPLE_RATE for i in range(self.NUM_SAMPLES)]
 
-        # LOGGER MODE (also used by MAMPHR mode)
+                self._adc["t"] = self._osc_t
+
+        # LOGGER MODE
         elif self._acquire_mode == P1150API.ACQUIRE_MODE_LOGGER:
             if not self._acquire_triggered.is_set() and len(self._adc["i"]) >= self.NUM_SAMPLES :
                 self.logger.info(f"triggered, frame count {self._adc_frame_count}, length {len(self._adc['i'])} / {self.NUM_SAMPLES}")
@@ -735,6 +779,7 @@ class P1150(UCLogger):
                      "i": [*self._adc["i"]],
                      "a0": [*self._adc["a0"]],
                      "d0": [*self._adc["d0"]],
+                     "d0s": [*self._adc["d0s"]],
                      "d1": [*self._adc["d1"]],
                      "isnk": [*self._adc["isnk"]]}
 
@@ -744,7 +789,7 @@ class P1150(UCLogger):
         #delta = timer() - start
         #self.logger.info(f"transfered {delta:0.6f}")
 
-    def _event_clear_datardy(self):
+    def _event_clear_datardy(self) -> None:
         # takes ~11 usec
         self.NUM_SAMPLES = int(self.ADC_SAMPLE_RATE * self._timebase_span)
 
@@ -752,13 +797,14 @@ class P1150(UCLogger):
                      "i": deque(maxlen=self.NUM_SAMPLES),
                      "a0": deque(maxlen=self.NUM_SAMPLES),
                      "d0": deque(maxlen=self.NUM_SAMPLES),
+                     "d0s": deque(maxlen=self.NUM_SAMPLES),
                      "d1": deque(maxlen=self.NUM_SAMPLES),
                      "isnk": deque(maxlen=self.NUM_SAMPLES)}
         self._acquire_triggered.clear()
         self._acquire_datardy.clear()
         #self.logger.info(f"self._adc cleared")
 
-    def _set_trigger_idx(self):
+    def _set_trigger_idx(self) -> None:
         if self._trigger_pos == P1150API.TRIG_POS_CENTER:
             self._trigger_idx = int(self.NUM_SAMPLES / 2)
         elif self._trigger_pos == P1150API.TRIG_POS_LEFT:
@@ -770,7 +816,7 @@ class P1150(UCLogger):
         with self._lock:
             self.uclog_close()
 
-    def temperature_update(self) -> (bool, dict):
+    def temperature_update(self) -> tuple[bool, list[dict] | None]:
         """ Trigger a temperature update
         - use when start connection to target to get the current temperature
 
@@ -781,7 +827,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_temp102_trigger"}
             return self.uclog_response(payload)
 
-    def status(self) -> (bool, dict):
+    def status(self) -> tuple[bool, list[dict] | None]:
         """ Get Status
 
         :return: success <True|False>,
@@ -792,7 +838,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_status"}
             return self.uclog_response(payload)
 
-    def vout_metrics(self) -> (bool, dict):
+    def vout_metrics(self) -> tuple[bool, list[dict] | None]:
         """ Get VOUT hardware capabilities
 
         :return: success <True|False>,
@@ -802,7 +848,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_vout_metrics"}
             return self.uclog_response(payload)
 
-    def cal_status(self) -> (bool, dict):
+    def cal_status(self) -> tuple[bool, list[dict] | None]:
         """ Get Calibration Status
         - Client is meant to poll this function once calibration has been started
 
@@ -815,7 +861,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_cal_status"}
             return self.uclog_response(payload)
 
-    def calibrate(self, force: bool=False, blocking: bool=True) -> (bool, dict):
+    def calibrate(self, force: bool=False, blocking: bool=True) -> tuple[bool, list[dict] | None]:
         """ Calibrate (this can take ~20 seconds)
 
         :param force: <True|False>, if True, starts a calibration
@@ -826,14 +872,16 @@ class P1150(UCLogger):
             # determine if calibration has been done
             payload = {"f": "cmd_cal_status"}
             success, result = self.uclog_response(payload)
-            if not success: return False, result
+            if not success:
+                return False, result
 
             cal_complete = result[0]["cal_done"]
             if not cal_complete or force:
                 self.logger.info("Calibrating... this will take a minute...")
                 payload = {"f": "cmd_cal", "force": force}
                 success, result = self.uclog_response(payload)
-                if not success: return False, result
+                if not success:
+                    return False, result
 
                 if blocking:
                     # poll to determine if calibration has completed
@@ -850,7 +898,7 @@ class P1150(UCLogger):
 
             return True, result
 
-    def set_vout(self, value_mv: int) -> (bool, dict):
+    def set_vout(self, value_mv: int) -> tuple[bool, list[dict] | None]:
         """ Set VOUT
 
         :param value_mv: <int>
@@ -860,7 +908,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_vout", "mv": value_mv}  # in mV
             return self.uclog_response(payload)
 
-    def set_ovc(self, value_ma: int) -> (bool, dict):
+    def set_ovc(self, value_ma: int) -> tuple[bool, list[dict] | None]:
         """ Set Over Current in mA
 
         :param value_ma: <int>
@@ -870,7 +918,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_ovrcur", "ma": value_ma}  # in ma
             return self.uclog_response(payload)
 
-    def set_timebase(self, span: str) -> (bool, dict):
+    def set_timebase(self, span: str) -> tuple[bool, list[dict] | None]:
         """ Set Timebase
 
         :param span: <one of TBASE_SPAN_LIST>
@@ -887,13 +935,13 @@ class P1150(UCLogger):
                     src: str=P1150API.TRIG_SRC_NONE,
                     pos: str=P1150API.TRIG_POS_LEFT,
                     slope: str=P1150API.TRIG_SLOPE_RISE,
-                    level: int=1) -> (bool, dict):
+                    level: str | int=1) -> tuple[bool, list[dict] | None]:
         """ Set Trigger
 
         :param src: <P1150API.TRIG_SRC_*>
         :param pos: <P1150API.TRIG_POS_*>
         :param slope: <P1150API.TRIG_SLOPE_*>
-        :param level: <int in mV or uA>
+        :param level: <int in mV or uA> || character for D0s
         :return: success <True/False>, result <json/None>
         """
         with self._lock_stream:
@@ -910,7 +958,34 @@ class P1150(UCLogger):
             self.logger.info(f"pos {pos}, slope {slope}, src {src}, level {level}")
             return True, None
 
-    def set_cal_sweep(self, sweep: bool) -> (bool, dict):
+    def set_cal_load(self, loads: list=[P1150API.DEMO_CAL_LOAD_NONE]) -> tuple[bool, list[dict] | None]:
+        """ Set Calibration Load
+
+        - more than one load can be specified where the resultant loads are in parallel
+
+        :param loads: [P1150API.DEMO_CAL_LOAD_*, ...]
+        :return: success <True/False>, result <json/None>
+        """
+        load_bit_mask = 0x0
+        if P1150API.DEMO_CAL_LOAD_NONE in loads:
+            pass
+        else:
+            if P1150API.DEMO_CAL_LOAD_10 in loads:   load_bit_mask |= 0x1
+            if P1150API.DEMO_CAL_LOAD_20 in loads:   load_bit_mask |= 0x2
+            if P1150API.DEMO_CAL_LOAD_40 in loads:   load_bit_mask |= 0x4
+            if P1150API.DEMO_CAL_LOAD_100 in loads:  load_bit_mask |= 0x100
+            if P1150API.DEMO_CAL_LOAD_200 in loads:  load_bit_mask |= 0x8
+            if P1150API.DEMO_CAL_LOAD_400 in loads:  load_bit_mask |= 0x200
+            if P1150API.DEMO_CAL_LOAD_2K in loads:   load_bit_mask |= 0x10
+            if P1150API.DEMO_CAL_LOAD_20K in loads:  load_bit_mask |= 0x20
+            if P1150API.DEMO_CAL_LOAD_200K in loads: load_bit_mask |= 0x40
+            if P1150API.DEMO_CAL_LOAD_2M in loads:   load_bit_mask |= 0x80
+
+        with self._lock:
+            payload = {"f": "cmd_iload", "set": load_bit_mask}
+            return self.uclog_response(payload)
+
+    def set_cal_sweep(self, sweep: bool) -> tuple[bool, list[dict] | None]:
         """ Set Calibration Load Sweep
 
         :param sweep: <True/False>
@@ -920,7 +995,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_iload_sweep", "en": sweep}
             return self.uclog_response(payload)
 
-    def acquisition_start(self, mode: str) -> (bool, dict):
+    def acquisition_start(self, mode: str) -> tuple[bool, list[dict] | None]:
         """ Start Acquisition (Single mode)
 
         :param mode: <P1150API.ACQUIRE_MODE_*>
@@ -941,7 +1016,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_adc", "en": True}
             return self.uclog_response(payload)
 
-    def acquisition_stop(self) -> (bool, dict):
+    def acquisition_stop(self) -> tuple[bool, list[dict] | None]:
         """ Stop/Abort Acquisition
 
         :return: success <True/False>, result <json/None>
@@ -963,16 +1038,16 @@ class P1150(UCLogger):
             payload = {"f": "cmd_adc", "en": False}
             return self.uclog_response(payload)
 
-    def acquisition_complete(self) -> (bool, dict):
+    def acquisition_complete(self) -> tuple[bool, list[dict]]:
         """ Poll Acquisistion Complete
 
         :param retries: number of polling retries
         :return: success <True/False>, {"triggered": <bool>}}
         """
         with self._lock:
-            return True, {"triggered": self._acquire_datardy.is_set()}
+            return True, [{"triggered": self._acquire_datardy.is_set()}]
 
-    def acquisition_get_data(self) -> (bool, dict):
+    def acquisition_get_data(self) -> tuple[bool, dict]:
         """ Get Acquisition Data
 
         NOTE: The returned data must be of deepcopy type,as the
@@ -985,7 +1060,7 @@ class P1150(UCLogger):
 
         if not self._acquire_datardy.is_set():
             self.logger.error("No data to get")
-            return False, "No data to get"
+            return False, {"ERROR": "No data to get"}
 
         # NOTE: performance this is taking ~1ms, tried alternatives,
         #       copy(), list(), which were slower
@@ -1002,7 +1077,7 @@ class P1150(UCLogger):
         #self.logger.info(f"{delta}")
         return True, d
 
-    def probe(self, connect: bool=True, hard_connect: bool=False) -> (bool, dict):
+    def probe(self, connect: bool=True, hard_connect: bool=False) -> tuple[bool, list[dict] | None]:
         """ Set Probe Connect
 
         If the probe is not connected, connecting will fail.  The P1125 can detect
@@ -1018,7 +1093,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_probe", "v": connect, "hard": hard_connect}
             return self.uclog_response(payload)
 
-    def clear_error(self) -> (bool, dict):
+    def clear_error(self) -> tuple[bool, list[dict] | None]:
         """ Clear Error
 
         :return: success <True/False>, result <json/None>
@@ -1027,7 +1102,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_error_clear"}
             return self.uclog_response(payload)
 
-    def led_blink(self) -> (bool, dict):
+    def led_blink(self) -> tuple[bool, list[dict] | None]:
         """ blink P1150 LED
         - can be used to identify P1150 in case of multiple P1150s
 
@@ -1037,7 +1112,7 @@ class P1150(UCLogger):
             payload = {"f": "cmd_led_blink"}
             return self.uclog_response(payload)
 
-    def ping(self) -> (bool, dict):
+    def ping(self) -> tuple[bool, list[dict] | None]:
         """ Bootloader Ping
 
         resp: {'f': 'cmd_ping', 's': <True/False>, 'app': <"a51"||"a43">
@@ -1048,26 +1123,31 @@ class P1150(UCLogger):
         """
         with self._lock:
             payload = {"f": "cmd_ping"}
-            rsp = self.uclog_response(payload)
-            if (len(rsp) == 2) and (rsp[1] is not None) and (len(rsp[1]) == 1):
+            success, rsp = self.uclog_response(payload)
+            self.logger.info(f"ping resp: {rsp}")
+            if rsp is not None:
+                rsp = rsp[-1]
+                if 'serial' in rsp:
+                    serial = struct.unpack('<III', rsp['serial'])
+                    rsp['serial'] = f'{serial[2]:08X}-{serial[1]:08X}-{serial[0]:08X}'
+                    ser = hashlib.shake_128(rsp['serial'].encode()).hexdigest(4).upper()
+                    rsp['serial_hash'] = f'{ser}'
 
-                if 'serial' in rsp[1][0]:
-                    serial = struct.unpack('<III', rsp[1][0]['serial'])
-                    rsp[1][0]['serial'] = f'{serial[2]:08X}-{serial[1]:08X}-{serial[0]:08X}'
-                    ser = hashlib.shake_128(rsp[1][0]['serial'].encode()).hexdigest(4).upper()
-                    rsp[1][0]['serial_hash'] = f'{ser}'
-
-                if "hwver" in rsp[1][0]:
-                    self._hwver = f'{rsp[1][0]["hwver"]:08X}'
+                if "hwver" in rsp:
+                    self._hwver = f'{rsp["hwver"]:08X}'
                     self.logger.info(self._hwver)
 
                     if self._hwver in ["A0431100"]:
                         # compensate for a4311 INA/OPA filter peaking
                         self._low_pass_filter = True
 
-            return rsp
+                return success, [rsp]
 
-    def bootloader_init(self) -> (bool, dict):
+            else:
+                self.logger.error("ping failed to process response")
+                return False, None
+
+    def bootloader_init(self) -> tuple[bool, list[dict] | None]:
         """ Bootloader Init
 
         {'f': 'bl_init', 's': <True/False>}
@@ -1077,7 +1157,7 @@ class P1150(UCLogger):
             payload = {"f": "bl_init"}
             return self.uclog_response(payload)
 
-    def bootloader_block(self, data: bytes) -> (bool, dict):
+    def bootloader_block(self, data: bytes) -> tuple[bool, list[dict] | None]:
         """ Bootloader Send Block to Load
 
         {'rsp': 'bl_block', 's': <True/False>}
@@ -1087,7 +1167,7 @@ class P1150(UCLogger):
             payload = {"f": "bl_block", "data": data}
             return self.uclog_response(payload)
 
-    def bootloader_done(self) -> (bool, dict):
+    def bootloader_done(self) -> tuple[bool, list[dict] | None]:
         """ Bootloader Done
 
         {'rsp': 'bl_done', 's': <True/False>}
@@ -1097,7 +1177,7 @@ class P1150(UCLogger):
             payload = {"f": "bl_done"}
             return self.uclog_response(payload)
 
-    def cmd(self, cmd: dict) -> (bool, dict):
+    def cmd(self, cmd: dict) -> tuple[bool, list[dict] | None]:
         """ Send raw command to target
 
         :param cmd: {'f': 'cmd_*", 'arg': 'value', ...}
@@ -1106,7 +1186,7 @@ class P1150(UCLogger):
         with self._lock:
             return self.uclog_response(cmd)
 
-    def ez_connect(self) -> (bool, dict):
+    def ez_connect(self) -> tuple[bool, dict | None]:
         """ Connect to P1150, upload AFI if necessary, Calibrate if necessary
         - hides all the details of connecting to P1150
         - if success False, client should close()
@@ -1212,4 +1292,5 @@ class P1150(UCLogger):
                     break
 
         # all done
+        _response.update(response_status)
         return True, _response
