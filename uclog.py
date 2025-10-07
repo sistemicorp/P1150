@@ -22,10 +22,7 @@ import logging
 import cbor2
 import cobs
 
-try:
-  from logdata import LogData, TARGET_DIGIT_SHIFT, LOG_TYPE_PORT
-except ModuleNotFoundError:
-  pass
+from logdata import LogData, TARGET_DIGIT_SHIFT, LOG_TYPE_PORT
 
 logging.getLogger()
 
@@ -33,28 +30,6 @@ logging.getLogger()
 # This is driven by `ulimit -n`.  Default on macOS is 256 which prevents
 # using 64.  Pratically the an application is not likely to use more than 8.
 LOG_PORT_MAX = 8
-LOG_DEFAULT_HOST = 'localhost'
-LOG_DEFAULT_BASE = 9000
-
-
-class CobsDecode(object):
-  def __init__(self):
-    self.indata = b''
-    self.on_data = None
-    self.delta_max = 0.0
-
-  def __call__(self, data):
-    self.indata = self.indata + data
-    #if len(self.indata) > 1500 + 20:
-    #  self.indata = self.indata[:1500+20]
-    while b'\x00' in self.indata:
-      frame, self.indata = self.indata.split(b'\x00',1)
-      try:
-        dec = cobs.dec(frame)
-      except Exception:
-        continue
-      if self.on_data and len(frame) > 0:
-        self.on_data(dec)
 
 class CobsEncode(object):
   def __init__(self):
@@ -143,25 +118,12 @@ class Serial(threading.Thread):
     self.alive = True
     self.q_out = Queue()
     self.q_in = Queue()
-    self.q_cmd = Queue()
 
-    self.msm = MySerialManager(self.dev, self.q_in, self.q_out, self.q_cmd)
+    logging.info("MySerialManager creating instance")
+    self.msm = MySerialManager(self.dev, self.q_in, self.q_out)
+    logging.info("MySerialManager starting threads")
     self.msm.start()
-    #time.sleep(.5)
-    logging.info("before isrunning")
-    start = time.time()
-    while True:
-      if not self.msm.is_alive():
-        break
-      if self.msm.is_running():
-        break
-      if time.time() - start > 1.2:
-        logging.error("timout waiting for msm to start")
-        # TODO: add timeout, which means error occurred... handle this!
-        break
-      time.sleep(0.02)
-
-    logging.info(f"after isrunning alive: {self.msm.is_alive()} run: {self.msm.is_running()}")
+    logging.info(f"MySerialManager is_running: {self.msm.is_running()}")
 
     self.lock = threading.Lock()
     self.last_send = time.time() - 1
@@ -173,21 +135,18 @@ class Serial(threading.Thread):
     if self.alive:
       self.alive = False
 
-      if self.msm:
-        self.q_cmd.put("SHUTDOWN")
-        self.msm.join(timeout=1)
+      if self.msm and self.msm.is_running():
+        self.msm.shutdown()
         self.msm = None
-        logging.info("shutting down msm - joined")
-
+        logging.info("shutting down MySerialManager - joined")
       else:
-        logging.info("shutting down msm - already done")
+        logging.info("shutting down MySerialManager - already done")
 
       self.join(timeout=1)
       logging.info("shutting down self - joined")
 
     self.q_out.close()
     self.q_in.close()
-    self.q_cmd.close()
 
     logging.info("shutdown")
 
@@ -200,47 +159,31 @@ class Serial(threading.Thread):
       sl = len(data) % 4
       if sl: data += (bytes([0] * (4 - sl)))
 
-      #logging.info(f"sending data: {len(data)} bytes")
-      self.q_in.put(data)
+      self.q_in.put_nowait(data)
 
   def send_pulse(self):
     if time.time() >= self.last_send + .5:
-      #print("sending pulse")
-      #self.cnt = (self.cnt + 1) % 256
-      #self(bytes((self.cnt,)))
-      # NOTE: needs to be multiple of 4 bytes for STM32 USB DMA
       self(b'\x00\x00\x00\x00')
 
   def run(self):
-      #start = timeit.default_timer()
-      while self.alive and self.msm.is_alive():
-
+      while self.alive and self.msm.is_running():
         try:
-          frame = self.q_out.get(timeout=0.1)
-
-          #self.send_pulse()
-
-          #logging.info(f"got from mp serial {frame}")
+          frame = self.q_out.get(timeout=0.01)
           if self.on_data:
             self.on_data(frame)
-
         except queue.Empty:
           pass
-
         except Exception as e:
           logging.error(f"exception {e}", exc_info=1)
 
-      # msm should already be shutdown if we get here,
-      # but do this just in case
-      if self.msm:
-        logging.info("shutting down msm - send SHUTDOWN")
-        self.q_cmd.put("SHUTDOWN")
-        time.sleep(0.15)  # allow time for graceful shutdown
-        if self.msm is not None:
-          self.msm.terminate()
+      # Ensure native shutdown if still present
+      if self.msm and self.msm.is_running():
+        logging.info("shutting down MySerialManager")
+        self.msm.shutdown()
         self.msm = None
 
-      logging.info("run loop stopped")
+      logging.info("Serial run loop stopped")
+
 
 
 # Utitlity to chain a list of processes together
@@ -248,22 +191,6 @@ def chain(items):
   for src, dst in zip(items[:-1], items[1:]):
     src.on_data = dst
   return items[0]
-
-
-def hostport(h):
-  if h is None:
-    return LOG_DEFAULT_HOST, LOG_DEFAULT_BASE
-  elif ':' in h:
-    host, base = h.split(':', 2)
-    if host == '':
-      host = LOG_DEFAULT_HOST
-    if base == '':
-      base = LOG_DEFAULT_BASE
-    else:
-      base = int(base)
-    return host, base
-
-  return LOG_DEFAULT_HOST, LOG_DEFAULT_BASE
 
 
 class Target(threading.Thread):
