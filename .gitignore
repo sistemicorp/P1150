@@ -8,4 +8,10 @@ __pycache__/
 cobs/build/
 cobs/cobs.egg-info/
 
+logdata_c/build/
+logdata_c/logdata_ext.egg-info/
+
+mpserial/build/
+mpserial/mp_serial_ext.egg-info/
+
 p1150_out.csv

@@ -1,4 +1,0 @@
-Metadata-Version: 2.1
-Name: logdata_ext
-Version: 0.2.0
-Summary: C extension for log data processing with bundled libcbor.
