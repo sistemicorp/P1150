@@ -650,22 +650,17 @@ class P1150(UCLogger):
                             if adc_src[idx] < level_num:
                                 triggered_event.set()
                                 break
+
                 elif isinstance(level_num, str):
                     if adc_src[idx] == level_num:
                         triggered_event.set()
                         break
+
                 else:
                     self.logger.error(f"unexpected trigger level {level} type {type(level)}")
 
             # write back any changes to precondition flag
             self._trigger_idx_precond = precond
-
-            adc_i.extend(li[i:])
-            adc_a0.extend(la0[i:])
-            adc_d0.extend(ld0[i:])
-            adc_d0s.extend(ld0s[i:])
-            adc_d1.extend(ld1[i:])
-            adc_isnk.extend(lisnk[i:])
 
             #delta = timer() - start
             #self.logger.info(f"lpf {delta:0.6f}")
@@ -1289,6 +1284,7 @@ class P1150(UCLogger):
 
                 self.logger.info(f"cal_status: {result}")
                 if result[-1]['cal_done']:
+                    response_status['cal_done'] = True
                     break
 
         # all done
