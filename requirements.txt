@@ -6,5 +6,5 @@ setuptools
 ./mpserial
 ./logdata_c
 
-# used be demo code only, you may not require
+# used by demo code only, you may not require
 matplotlib
