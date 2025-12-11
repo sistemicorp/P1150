@@ -25,7 +25,7 @@ logdata_ext = Extension(
     # Add the libcbor sources to the main extension source file.
     sources=["logdatamodule.c"] + libcbor_sources,
     # The include_dirs path tells the compiler where to find the libcbor .h files.
-    include_dirs=[''],
+    include_dirs=[],
     extra_compile_args=[],
     extra_link_args=[],
 )
