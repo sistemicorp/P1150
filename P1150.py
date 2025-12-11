@@ -301,15 +301,15 @@ class UCLogger(object):
 
             # Convert the list of bytes back to int32
             item["i"] = struct.unpack('<ffffffffffffffffffffffffffffffffffffffffffffffffff', item["i"])
-            item["i"] = [i / 1000000.0 for i in item["i"]]  # convert to mAmps (float)
+            item["i"] = [round(i / 1000000.0, 6) for i in item["i"]]  # convert to mAmps (float)
 
             # Convert the list of bytes back to int32
             item["isnk"] = struct.unpack('<ffffffffffffffffffffffffffffffffffffffffffffffffff', item["isnk"])
-            item["isnk"] = [i / 1000000.0 for i in item["isnk"]]  # convert to mAmps (float)
+            item["isnk"] = [round(i / 1000000.0, 6) for i in item["isnk"]]  # convert to mAmps (float)
 
             # Convert the list of bytes back to int16
             item["a0"] = struct.unpack('<HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH', item["a0"])
-            item["a0"] = [float(i) for i in item["a0"]]
+            item["a0"] = [round(float(i), 0) for i in item["a0"]]
 
             # Convert the list of bytes back to int8
             item["d01"] = struct.unpack('<BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', item["d01"])
@@ -338,7 +338,7 @@ class UCLogger(object):
 
                 t = z + x
                 w = (0.11, 0.78, 0.11)  # must add up to 1.0
-                r = [(sum(t[i + j] * w[j] for j in range(3))) for i in range(len(x))]
+                r = [round(sum(t[i + j] * w[j] for j in range(3)), 6) for i in range(len(x))]
                 return r, x[-2:]
 
             item["i"], self._low_pass_filter_i_cache = \
@@ -903,6 +903,16 @@ class P1150(UCLogger):
             payload = {"f": "cmd_vout", "mv": value_mv}  # in mV
             return self.uclog_response(payload)
 
+    def set_vout_remote_sense(self, en: bool=False) -> tuple[bool, list[dict] | None]:
+        """ Enable/Disable Pseudo Remote Sense on VOUT
+
+        :param en: <True/False>
+        :return:  success <True/False>, result <json/None>
+        """
+        with self._lock:
+            payload = {"f": "cmd_vout_rs", "en": en}
+            return self.uclog_response(payload)
+
     def set_ovc(self, value_ma: int) -> tuple[bool, list[dict] | None]:
         """ Set Over Current in mA
 
@@ -1072,7 +1082,7 @@ class P1150(UCLogger):
         #self.logger.info(f"{delta}")
         return True, d
 
-    def probe(self, connect: bool=True, hard_connect: bool=False) -> tuple[bool, list[dict] | None]:
+    def probe(self, connect: bool=True, hard_connect: bool=False, rs_comp: bool=False) -> tuple[bool, list[dict] | None]:
         """ Set Probe Connect
 
         If the probe is not connected, connecting will fail.  The P1125 can detect
@@ -1082,10 +1092,11 @@ class P1150(UCLogger):
 
         :param connect: <True/False>
         :param hard_connect: <True/False>
+        :param rs_comp: <True/False> enable Source Resistance VOUT Compensation
         :return: success <True/False>, result <json/None>
         """
         with self._lock:
-            payload = {"f": "cmd_probe", "v": connect, "hard": hard_connect}
+            payload = {"f": "cmd_probe", "v": connect, "hard": hard_connect, "comp": rs_comp}
             return self.uclog_response(payload)
 
     def clear_error(self) -> tuple[bool, list[dict] | None]:
