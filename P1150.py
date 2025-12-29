@@ -245,7 +245,7 @@ class UCLogger(object):
         else:
             self._cb_uclog_plot(item)
 
-    def _uclog_log(self, item):
+    def _uclog_log(self, item: tuple) -> None:
         """ ucLogger log stream default handler
         - if ucLogger GUI, then usually set to an instance of UnitLogger:Logger
         - else use logger
@@ -267,7 +267,7 @@ class UCLogger(object):
             self.logger.error(e)
             self.logger.error(item)
 
-    def _uclog_async(self, _item):
+    def _uclog_async(self, _item: bytes) -> None:
         """ Response handler to Port 1 destined for the GUI (not this Klass)
         - these are asynchronous messages from the target
         - these are generally in the form of { f: asc_*, s: true, ... }
@@ -283,7 +283,7 @@ class UCLogger(object):
             if self._cb_uclog_async:
                 self._cb_uclog_async(item)
 
-    def _uclog_adc(self, _item):
+    def _uclog_adc(self, _item: bytes) -> None:
         """ ADC stream handler
         - ucLog port 3
         """
@@ -357,7 +357,7 @@ class UCLogger(object):
 
         self._cb_uclog_adc(item)  # this calls P1125:adc_stream_in
 
-    def _uclog_cmdres(self, _item):
+    def _uclog_cmdres(self, _item: bytes) -> None:
         """ Command Response handler on Port 0 default handler
         - works with uclog_response()
         - received responses from target on port 0 end up here
@@ -439,7 +439,7 @@ class UCLogger(object):
                     #self.logger.info(f'RESP: {resp}')
                     return success, resp
 
-    def uclog_close(self):
+    def uclog_close(self) -> None:
         with self._lock_responses:
             if self._ucLogServer:
                 self._ucLogServer.shutdown()
@@ -526,6 +526,7 @@ class P1150(UCLogger):
         self._trigger_idx_precond = False
         self._mahr_stop_time_s = 60
         self._timebase_span = self.TBASE_MAP[P1150API.TBASE_SPAN_100MS]
+        self._timebase_t_recalc = False
         self._osc_t = []
         self.NUM_SAMPLES = 0
 
@@ -752,7 +753,8 @@ class P1150(UCLogger):
                 else:
                     t_start = -3 * self._timebase_span / 4
 
-                if len(self._osc_t) != self.NUM_SAMPLES:  # create self._osc_t only once
+                if self._timebase_t_recalc:  # create self._osc_t only once
+                    self._timebase_t_recalc = False
                     self._osc_t = [t_start + i / self.ADC_SAMPLE_RATE for i in range(self.NUM_SAMPLES)]
 
                 self._adc["t"] = self._osc_t
@@ -806,6 +808,8 @@ class P1150(UCLogger):
             self._trigger_idx = int(self.NUM_SAMPLES / 4)
         else:
             self._trigger_idx = int(self.NUM_SAMPLES - self.NUM_SAMPLES / 4)
+
+        self._timebase_t_recalc = True
 
     def close(self):
         with self._lock:
@@ -1044,9 +1048,8 @@ class P1150(UCLogger):
             return self.uclog_response(payload)
 
     def acquisition_complete(self) -> tuple[bool, list[dict]]:
-        """ Poll Acquisistion Complete
+        """ Poll Acquisition Complete
 
-        :param retries: number of polling retries
         :return: success <True/False>, {"triggered": <bool>}}
         """
         with self._lock:
