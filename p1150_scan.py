@@ -29,7 +29,7 @@ program, which may cause some devices to error.
 P1150 bootloader (a53) and application (a43) will respond to a 'ping'.
 """
 import sys
-import P1150
+from p1150_driver import P1150
 import serial.tools.list_ports
 
 # Must use __main__ due to multiprocessing within P1150 driver
