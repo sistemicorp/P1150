@@ -245,7 +245,7 @@ class UCLogger(object):
         else:
             self._cb_uclog_plot(item)
 
-    def _uclog_log(self, item):
+    def _uclog_log(self, item: tuple) -> None:
         """ ucLogger log stream default handler
         - if ucLogger GUI, then usually set to an instance of UnitLogger:Logger
         - else use logger
@@ -267,7 +267,7 @@ class UCLogger(object):
             self.logger.error(e)
             self.logger.error(item)
 
-    def _uclog_async(self, _item):
+    def _uclog_async(self, _item: bytes) -> None:
         """ Response handler to Port 1 destined for the GUI (not this Klass)
         - these are asynchronous messages from the target
         - these are generally in the form of { f: asc_*, s: true, ... }
@@ -283,7 +283,7 @@ class UCLogger(object):
             if self._cb_uclog_async:
                 self._cb_uclog_async(item)
 
-    def _uclog_adc(self, _item):
+    def _uclog_adc(self, _item: bytes) -> None:
         """ ADC stream handler
         - ucLog port 3
         """
@@ -301,15 +301,15 @@ class UCLogger(object):
 
             # Convert the list of bytes back to int32
             item["i"] = struct.unpack('<ffffffffffffffffffffffffffffffffffffffffffffffffff', item["i"])
-            item["i"] = [i / 1000000.0 for i in item["i"]]  # convert to mAmps (float)
+            item["i"] = [round(i / 1000000.0, 6) for i in item["i"]]  # convert to mAmps (float)
 
             # Convert the list of bytes back to int32
             item["isnk"] = struct.unpack('<ffffffffffffffffffffffffffffffffffffffffffffffffff', item["isnk"])
-            item["isnk"] = [i / 1000000.0 for i in item["isnk"]]  # convert to mAmps (float)
+            item["isnk"] = [round(i / 1000000.0, 6) for i in item["isnk"]]  # convert to mAmps (float)
 
             # Convert the list of bytes back to int16
             item["a0"] = struct.unpack('<HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH', item["a0"])
-            item["a0"] = [float(i) for i in item["a0"]]
+            item["a0"] = [round(float(i), 0) for i in item["a0"]]
 
             # Convert the list of bytes back to int8
             item["d01"] = struct.unpack('<BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', item["d01"])
@@ -338,7 +338,7 @@ class UCLogger(object):
 
                 t = z + x
                 w = (0.11, 0.78, 0.11)  # must add up to 1.0
-                r = [(sum(t[i + j] * w[j] for j in range(3))) for i in range(len(x))]
+                r = [round(sum(t[i + j] * w[j] for j in range(3)), 6) for i in range(len(x))]
                 return r, x[-2:]
 
             item["i"], self._low_pass_filter_i_cache = \
@@ -357,7 +357,7 @@ class UCLogger(object):
 
         self._cb_uclog_adc(item)  # this calls P1125:adc_stream_in
 
-    def _uclog_cmdres(self, _item):
+    def _uclog_cmdres(self, _item: bytes) -> None:
         """ Command Response handler on Port 0 default handler
         - works with uclog_response()
         - received responses from target on port 0 end up here
@@ -439,7 +439,7 @@ class UCLogger(object):
                     #self.logger.info(f'RESP: {resp}')
                     return success, resp
 
-    def uclog_close(self):
+    def uclog_close(self) -> None:
         with self._lock_responses:
             if self._ucLogServer:
                 self._ucLogServer.shutdown()
@@ -526,6 +526,7 @@ class P1150(UCLogger):
         self._trigger_idx_precond = False
         self._mahr_stop_time_s = 60
         self._timebase_span = self.TBASE_MAP[P1150API.TBASE_SPAN_100MS]
+        self._timebase_t_recalc = False
         self._osc_t = []
         self.NUM_SAMPLES = 0
 
@@ -650,22 +651,17 @@ class P1150(UCLogger):
                             if adc_src[idx] < level_num:
                                 triggered_event.set()
                                 break
+
                 elif isinstance(level_num, str):
                     if adc_src[idx] == level_num:
                         triggered_event.set()
                         break
+
                 else:
                     self.logger.error(f"unexpected trigger level {level} type {type(level)}")
 
             # write back any changes to precondition flag
             self._trigger_idx_precond = precond
-
-            adc_i.extend(li[i:])
-            adc_a0.extend(la0[i:])
-            adc_d0.extend(ld0[i:])
-            adc_d0s.extend(ld0s[i:])
-            adc_d1.extend(ld1[i:])
-            adc_isnk.extend(lisnk[i:])
 
             #delta = timer() - start
             #self.logger.info(f"lpf {delta:0.6f}")
@@ -757,7 +753,8 @@ class P1150(UCLogger):
                 else:
                     t_start = -3 * self._timebase_span / 4
 
-                if len(self._osc_t) != self.NUM_SAMPLES:  # create self._osc_t only once
+                if self._timebase_t_recalc:  # create self._osc_t only once
+                    self._timebase_t_recalc = False
                     self._osc_t = [t_start + i / self.ADC_SAMPLE_RATE for i in range(self.NUM_SAMPLES)]
 
                 self._adc["t"] = self._osc_t
@@ -811,6 +808,8 @@ class P1150(UCLogger):
             self._trigger_idx = int(self.NUM_SAMPLES / 4)
         else:
             self._trigger_idx = int(self.NUM_SAMPLES - self.NUM_SAMPLES / 4)
+
+        self._timebase_t_recalc = True
 
     def close(self):
         with self._lock:
@@ -906,6 +905,16 @@ class P1150(UCLogger):
         """
         with self._lock:
             payload = {"f": "cmd_vout", "mv": value_mv}  # in mV
+            return self.uclog_response(payload)
+
+    def set_vout_remote_sense(self, en: bool=False) -> tuple[bool, list[dict] | None]:
+        """ Enable/Disable Pseudo Remote Sense on VOUT
+
+        :param en: <True/False>
+        :return:  success <True/False>, result <json/None>
+        """
+        with self._lock:
+            payload = {"f": "cmd_vout_rs", "en": en}
             return self.uclog_response(payload)
 
     def set_ovc(self, value_ma: int) -> tuple[bool, list[dict] | None]:
@@ -1039,9 +1048,8 @@ class P1150(UCLogger):
             return self.uclog_response(payload)
 
     def acquisition_complete(self) -> tuple[bool, list[dict]]:
-        """ Poll Acquisistion Complete
+        """ Poll Acquisition Complete
 
-        :param retries: number of polling retries
         :return: success <True/False>, {"triggered": <bool>}}
         """
         with self._lock:
@@ -1077,7 +1085,7 @@ class P1150(UCLogger):
         #self.logger.info(f"{delta}")
         return True, d
 
-    def probe(self, connect: bool=True, hard_connect: bool=False) -> tuple[bool, list[dict] | None]:
+    def probe(self, connect: bool=True, hard_connect: bool=False, rs_comp: bool=False) -> tuple[bool, list[dict] | None]:
         """ Set Probe Connect
 
         If the probe is not connected, connecting will fail.  The P1125 can detect
@@ -1087,10 +1095,11 @@ class P1150(UCLogger):
 
         :param connect: <True/False>
         :param hard_connect: <True/False>
+        :param rs_comp: <True/False> enable Source Resistance VOUT Compensation
         :return: success <True/False>, result <json/None>
         """
         with self._lock:
-            payload = {"f": "cmd_probe", "v": connect, "hard": hard_connect}
+            payload = {"f": "cmd_probe", "v": connect, "hard": hard_connect, "comp": rs_comp}
             return self.uclog_response(payload)
 
     def clear_error(self) -> tuple[bool, list[dict] | None]:
@@ -1289,6 +1298,7 @@ class P1150(UCLogger):
 
                 self.logger.info(f"cal_status: {result}")
                 if result[-1]['cal_done']:
+                    response_status['cal_done'] = True
                     break
 
         # all done
