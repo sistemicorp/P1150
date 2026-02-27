@@ -25,12 +25,12 @@ Install Python requirements,
 python -m pip install -r requirements.txt
 ```
 
-## Run "hello, p1150"
+## Run "hello, P1150"
 
 In keeping with tradition, a "Hello, World" program, `p1150_hello.py`, is given as an example
 of a minimal program.  
 
-*BEFORE* you run `p1150_hello.py`, and with all the examples, you need to set the 
+**BEFORE** you run `p1150_hello.py` (or any of the examples), you need to set the 
 COM port inside the code. The easiest way to find the COM port is to run `p1150_scan.py`.
 
 
@@ -49,19 +49,6 @@ COM port inside the code. The easiest way to find the COM port is to run `p1150_
 
 
 ## P1150 Common API
-
-All of the P1150 API calls have this form,
-
-```python
-    success, response = p1150.set_vout(P1150_VOUT_MV)
-    if not success:
-        logger.error(f"{response}")
-        p1150.close()
-```
-* `success` (bool) indicates where the function call succeeded or not.
-* `response` (dict) contains information.
-
-Appropriate error handling when `success` is False should be implemented. 
 
 
     
@@ -88,52 +75,30 @@ Appropriate error handling when `success` is False should be implemented.
     temperature_update(self) -> (bool, dict):
     set_cal_sweep(self, sweep: bool) -> (bool, dict):
 
+
+### Usage
     
 
+P1150 API calls have this pattern,
 
-## Background Information
+```python
+    success, response = p1150.set_vout(P1150_VOUT_MV)
+    if not success:
+        logger.error(f"{response}")
+        p1150.close()
+```
+* `success` (bool) indicates where the function call succeeded or not.
+* `response` (dict) contains information.
 
-### COMS Protocol
+Appropriate error handling when `success` is False should be implemented. 
 
-The protocol over the serial port is an implementation of CBOR/COBS.  The protocol also uses
-the ELF file for extracting various variables and strings.
-
-- a51_bl.elf - Bootloader ELF
-- a43_app.elf - Application ELF
-
-The COMs protocol is beyond the scope of this driver, you should not need to debug it, or
-alter it in any way.
-
-The P1150 stream a lot of data very quickly, on the order of 2500 packets/s.
-
-### P1150 Firmware
-
-The P1150 uses an STM32H750 microcontroller, which has been factory programmed with a bootloader.
-The bootloader has the name "a51" (internal Sistemi project number).  The purpose of the bootloader
-is to load the "application" FW image (AFI) (project number a43).  The AFI needs to be loaded onto the STM32H750
-each time it is powered up or reset.
-
-Within the `assets` folder the hex file of the AFI is called, `a43_app.signed.ico`.
-
-The bootloader will only load signed images for security purposes.
-
-Because the AFI is loaded each time the P1150 is used, the version of the AFI always
-matches this repo.
-
-### P1150 Official GUI
-
-The P1150 GUI is built upon these technologies,
-* **[dearpygui](https://github.com/hoffstadt/DearPyGui)**
-* **[Nuitka](https://nuitka.net/)**
-
-Using the `P1150.py` driver you could make your own GUI.
-
-The biggest hurdle in making a GUI is handling all the data in the plot.  Most plotting
-frameworks are limited to a few 100k points.  Whereas with P1150 you will want to plot
-millions.
+Error handling is not implemented in the examples.
 
 
 # Example Scripts
+
+The Python module `matplotlib` is required for the following scripts. 
+
 
 ## p1150_hello.py
 
@@ -159,6 +124,47 @@ This script uses an external Keithley 2401 Source Meter controlled with PyVisa t
 use this script be sure to install `requirements_keithley2401.txt`.
 
 
+# P1150 Official GUI
+
+The P1150 GUI is built upon these technologies,
+* **[dearpygui](https://github.com/hoffstadt/DearPyGui)**
+* **[Nuitka](https://nuitka.net/)**
+
+Using the `P1150.py` driver you could make your own GUI.  The official GUI uses the same P1150 driver.
+
+The biggest hurdle in making a GUI is handling all the data in the plot.  Most plotting
+frameworks are limited to a few 100k points.  Whereas with P1150 you will want to plot
+millions.
+
+
+
+## Background Information
+
+### COMS Protocol
+
+The P1150 uses the serial port on the PC.  If you are on Linux, confirm that your user account
+has permission to access the serial port.
+
+The P1150 streams a lot of data very quickly, on the order of 2500 packets/s, with an aggregate ~2MB/s.
+That may not sound like a lot, but if the PC does not extract the data quickly enough, the P1150
+will not be able to buffer all that data.
+
+### P1150 Firmware Loading and Calibration
+
+The P1150 uses an STM32H750 microcontroller, which has been factory programmed with a bootloader.
+The bootloader has the name "a51" (internal Sistemi project number).  The purpose of the bootloader
+is to load the "application" FW image (AFI) (project number a43).  The AFI needs to be loaded onto the STM32H750
+each time it is powered up or reset.
+
+Within the `../p1150_driver/firmware` folder the hex file of the AFI is called `a43_app.signed.ico`.
+
+The bootloader will only load signed images for security purposes.
+
+Because the AFI is loaded each time the P1150 is used, the version of the AFI always
+matches this repo.  Loading the AFI takes ~1 second.  
+
+After the AFI is loaded the P1150 will enter calibration, which takes ~10 seconds.  After
+alibration the P1150 will be ready to take measurements.  Calibration is only performed once.
 
 > Portions  ©2025 Sistemi Corp - licensed under MIT
 > 
