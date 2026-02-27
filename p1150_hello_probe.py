@@ -29,7 +29,7 @@ to a load.
 import time
 from threading import Event
 from timeit import default_timer as timer
-import P1150
+from p1150_driver import P1150
 import matplotlib.pyplot as plt
 import logging
 

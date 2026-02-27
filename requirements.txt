@@ -2,9 +2,9 @@
 cbor2==5.7.0
 pyserial==3.5
 setuptools
-./cobs
-./mpserial
-./logdata_c
+-e ./p1150_driver/cobs_c
+-e ./p1150_driver/logdata_c
+-e ./p1150_driver/mpserial
 
 # used by demo code only, you may not require
 matplotlib

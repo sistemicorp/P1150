@@ -22,7 +22,7 @@ import logging
 import cbor2
 import cobs
 
-from logdata import LogData, TARGET_DIGIT_SHIFT, LOG_TYPE_PORT
+from .logdata import LogData, TARGET_DIGIT_SHIFT, LOG_TYPE_PORT
 
 logging.getLogger()
 
@@ -108,7 +108,7 @@ class LogDecode(object):
 
 
 from multiprocessing import Queue
-from mp_serial import MySerialManager
+from .mp_serial import MySerialManager
 
 class Serial(threading.Thread):
   def __init__(self, dev):

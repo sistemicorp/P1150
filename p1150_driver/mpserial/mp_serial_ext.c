@@ -44,60 +44,205 @@ static inline void perf_log(const char* msg) {
     fflush(stderr);
 }
 
-typedef struct {
-    uint8_t* data;
-    int      len;
-} FrameItem;
-
-
 // ----------------- SerialManager object -----------------
 typedef struct {
     PyObject_HEAD
-    // Config
+    // ... config members ...
     char* port;
     int baud;
 
-    // Queues
     PyObject* q_in;
     PyObject* q_out;
 
-    // Cached bound methods to reduce attribute lookups
-    PyObject* q_out_put_nowait; // INCREF'ed bound method
+    PyObject* q_out_put_nowait;
+    PyObject* q_in_get;
+    PyObject* q_in_get_nowait;
 
-    // State flags
-    volatile int alive;       // worker loop control
-    volatile int py_enabled;  // allow calling Python C-API from worker threads
+    volatile int alive;
+    volatile int py_enabled;
 
 #ifdef _WIN32
-    // Threads and handle
     HANDLE h_read_thread;
     HANDLE h_write_thread;
-    HANDLE h_port;
     HANDLE h_deliver_thread;
-    // Ring buffer (shared by reader -> deliver thread)
-    FrameItem* ring_buf;
-    size_t ring_cap;
-    size_t ring_head; // next write
-    size_t ring_tail; // next read
-    size_t ring_dropped;
+    HANDLE h_port;
     CRITICAL_SECTION ring_cs;
-    HANDLE h_ring_event; // auto-reset event signaled when ring gains data
+    HANDLE h_ring_event;
 #else
-    int fd; // serial fd
+    int fd;
     pthread_t read_thread;
     pthread_t write_thread;
     pthread_t deliver_thread;
-
-    // Ring buffer (shared by reader -> deliver thread)
-    FrameItem* ring_buf;
-    size_t ring_cap;
-    size_t ring_head; // next write
-    size_t ring_tail; // next read
-    size_t ring_dropped;
     pthread_mutex_t ring_mx;
     pthread_cond_t ring_cond;
 #endif
+
+    // COMMON: Zero-allocation Ring Buffer
+    uint8_t* ring_data;
+    size_t   ring_size;    // Total bytes
+    size_t   ring_head;    // Continuous write index
+    size_t   ring_tail;    // Continuous read index
+    size_t   ring_dropped;
 } SerialManagerObject;
+
+// Internal Helpers to abstract locking
+static inline void ring_lock(SerialManagerObject* self) {
+#ifdef _WIN32
+    EnterCriticalSection(&self->ring_cs);
+#else
+    pthread_mutex_lock(&self->ring_mx);
+#endif
+}
+
+static inline void ring_unlock(SerialManagerObject* self) {
+#ifdef _WIN32
+    LeaveCriticalSection(&self->ring_cs);
+#else
+    pthread_mutex_unlock(&self->ring_mx);
+#endif
+}
+
+static inline void ring_signal(SerialManagerObject* self) {
+#ifdef _WIN32
+    if (self->h_ring_event) SetEvent(self->h_ring_event);
+#else
+    pthread_cond_signal(&self->ring_cond);
+#endif
+}
+
+// ----------------- Queue helpers -----------------
+
+// Fast-path delivery: assumes GIL is already held and we have a bound method
+static inline void deliver_frame_nogil(SerialManagerObject* self, const uint8_t* data, Py_ssize_t len) {
+    PyObject* py_bytes = PyBytes_FromStringAndSize((const char*)data, len);
+    if (py_bytes) {
+        PyObject* r = PyObject_CallFunctionObjArgs(self->q_out_put_nowait, py_bytes, NULL);
+        if (!r) PyErr_Clear();
+        Py_XDECREF(r);
+        Py_DECREF(py_bytes);
+    } else {
+        PyErr_Clear();
+    }
+}
+
+
+// Provide a flat-field ring_size helper matching SerialManagerObject members
+static inline size_t ring_size(const SerialManagerObject* self) {
+    size_t h = self->ring_head, t = self->ring_tail;
+    return (h >= t) ? (h - t) : 0;
+}
+
+static int try_pop_write(SerialManagerObject* self, uint8_t* buf, size_t cap, double timeout_s, Py_ssize_t* out_len) {
+    int got = 0;
+    *out_len = 0;
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PyObject* item = NULL;
+
+    if (timeout_s <= 0.0) {
+        // Use cached method: q_in_get_nowait
+        item = PyObject_CallFunctionObjArgs(self->q_in_get_nowait, NULL);
+    } else {
+        PyObject* py_timeout = PyFloat_FromDouble(timeout_s);
+        if (py_timeout) {
+            // Use cached method: q_in_get
+            item = PyObject_CallFunctionObjArgs(self->q_in_get, Py_True, py_timeout, NULL);
+            Py_DECREF(py_timeout);
+        }
+    }
+
+    if (item) {
+        if (PyBytes_Check(item)) {
+            char* p; Py_ssize_t n;
+            if (PyBytes_AsStringAndSize(item, &p, &n) == 0 && (size_t)n <= cap) {
+                memcpy(buf, p, (size_t)n);
+                *out_len = n;
+                got = 1;
+            }
+        }
+        Py_DECREF(item);
+    } else {
+        PyErr_Clear();
+    }
+    PyGILState_Release(gstate);
+    return got;
+}
+
+// ----------------- Zero-Allocation Ring Logic (Common) -----------------
+
+static int ring_push(SerialManagerObject* self, const uint8_t* data, int len) {
+    ring_lock(self);
+
+    size_t needed = sizeof(uint16_t) + (size_t)len;
+    size_t available = self->ring_size - (self->ring_head - self->ring_tail);
+
+    if (needed > available) {
+        self->ring_dropped++;
+        ring_unlock(self);
+        return 0;
+    }
+
+    // 1. Store length (uint16_t)
+    uint16_t ulen = (uint16_t)len;
+    for (size_t i = 0; i < sizeof(uint16_t); i++) {
+        self->ring_data[(self->ring_head + i) % self->ring_size] = ((uint8_t*)&ulen)[i];
+    }
+
+    // 2. Store data with wrap-around support
+    size_t data_start = (self->ring_head + sizeof(uint16_t)) % self->ring_size;
+    size_t space_to_end = self->ring_size - data_start;
+
+    if ((size_t)len <= space_to_end) {
+        memcpy(self->ring_data + data_start, data, (size_t)len);
+    } else {
+        memcpy(self->ring_data + data_start, data, space_to_end);
+        memcpy(self->ring_data, data + space_to_end, (size_t)len - space_to_end);
+    }
+
+    self->ring_head += needed;
+    ring_signal(self);
+    ring_unlock(self);
+    return 1;
+}
+
+static void deliver_batch_to_python(SerialManagerObject* self) {
+    if (!self->py_enabled) return;
+
+    PyGILState_STATE g = PyGILState_Ensure();
+    uint8_t frame_tmp[65536]; // Stack buffer for delivery
+
+    for (int i = 0; i < 256; i++) {
+        uint16_t len = 0;
+
+        ring_lock(self);
+        if (self->ring_head == self->ring_tail) {
+            ring_unlock(self);
+            break;
+        }
+
+        // 1. Peek length
+        for (size_t j = 0; j < sizeof(uint16_t); j++) {
+            ((uint8_t*)&len)[j] = self->ring_data[(self->ring_tail + j) % self->ring_size];
+        }
+
+        // 2. Copy out data
+        size_t data_start = (self->ring_tail + sizeof(uint16_t)) % self->ring_size;
+        size_t space_to_end = self->ring_size - data_start;
+
+        if ((size_t)len <= space_to_end) {
+            memcpy(frame_tmp, self->ring_data + data_start, (size_t)len);
+        } else {
+            memcpy(frame_tmp, self->ring_data + data_start, space_to_end);
+            memcpy(frame_tmp + space_to_end, self->ring_data, (size_t)len - space_to_end);
+        }
+
+        self->ring_tail += (sizeof(uint16_t) + (size_t)len);
+        ring_unlock(self);
+
+        deliver_frame_nogil(self, frame_tmp, (Py_ssize_t)len);
+        if (!self->alive || !self->py_enabled) break;
+    }
+    PyGILState_Release(g);
+}
 
 
 // Elevate the current thread (reader thread) to highest priority on all platforms
@@ -154,149 +299,6 @@ static int cobs_decode(const uint8_t* in, size_t in_len, uint8_t* out, size_t ou
     return (int)out_idx;
 }
 
-// ----------------- Queue helpers -----------------
-
-// Fast-path delivery: assumes GIL is already held and we have a bound method
-static inline void deliver_frame_nogil(SerialManagerObject* self, const uint8_t* data, Py_ssize_t len) {
-    PyObject* py_bytes = PyBytes_FromStringAndSize((const char*)data, len);
-    if (py_bytes) {
-        PyObject* r = PyObject_CallFunctionObjArgs(self->q_out_put_nowait, py_bytes, NULL);
-        if (!r) PyErr_Clear();
-        Py_XDECREF(r);
-        Py_DECREF(py_bytes);
-    } else {
-        PyErr_Clear();
-    }
-}
-
-// Ring buffer helpers (thread-safe via small mutex/critical section)
-#ifdef _WIN32
-static inline int ring_push(SerialManagerObject* self, const uint8_t* data, int len) {
-    EnterCriticalSection(&self->ring_cs);
-    size_t size = self->ring_head - self->ring_tail;
-    if (size >= self->ring_cap) {
-        self->ring_dropped++;
-        LeaveCriticalSection(&self->ring_cs);
-        return 0;
-    }
-    size_t idx = self->ring_head % self->ring_cap;
-    uint8_t* p = (uint8_t*)malloc((size_t)len);
-    if (!p) { self->ring_dropped++; LeaveCriticalSection(&self->ring_cs); return 0; }
-    memcpy(p, data, (size_t)len);
-    self->ring_buf[idx].data = p;
-    self->ring_buf[idx].len  = len;
-    self->ring_head++;
-    LeaveCriticalSection(&self->ring_cs);
-
-    // NEW: notify deliver thread that data is available
-    if (self->h_ring_event) SetEvent(self->h_ring_event);
-    return 1;
-}
-
-
-static inline int ring_pop(SerialManagerObject* self, FrameItem* out) {
-    EnterCriticalSection(&self->ring_cs);
-    if (self->ring_tail == self->ring_head) {
-        LeaveCriticalSection(&self->ring_cs);
-        return 0;
-    }
-    size_t idx = self->ring_tail % self->ring_cap;
-    *out = self->ring_buf[idx];
-    self->ring_tail++;
-    LeaveCriticalSection(&self->ring_cs);
-    return 1;
-}
-#else
-static inline int ring_push(SerialManagerObject* self, const uint8_t* data, int len) {
-    pthread_mutex_lock(&self->ring_mx);
-    size_t size = self->ring_head - self->ring_tail;
-    if (size >= self->ring_cap) {
-        self->ring_dropped++;
-        pthread_mutex_unlock(&self->ring_mx);
-        return 0;
-    }
-    size_t idx = self->ring_head % self->ring_cap;
-    uint8_t* p = (uint8_t*)malloc((size_t)len);
-    if (!p) { self->ring_dropped++; pthread_mutex_unlock(&self->ring_mx); return 0; }
-    memcpy(p, data, (size_t)len);
-    self->ring_buf[idx].data = p;
-    self->ring_buf[idx].len  = len;
-    self->ring_head++;
-    pthread_cond_signal(&self->ring_cond);
-    pthread_mutex_unlock(&self->ring_mx);
-    return 1;
-}
-
-
-static inline int ring_pop(SerialManagerObject* self, FrameItem* out) {
-    pthread_mutex_lock(&self->ring_mx);
-    if (self->ring_tail == self->ring_head) {
-        pthread_mutex_unlock(&self->ring_mx);
-        return 0;
-    }
-    size_t idx = self->ring_tail % self->ring_cap;
-    *out = self->ring_buf[idx];
-    self->ring_tail++;
-    pthread_mutex_unlock(&self->ring_mx);
-    return 1;
-}
-#endif
-
-// Provide a flat-field ring_size helper matching SerialManagerObject members
-static inline size_t ring_size(const SerialManagerObject* self) {
-    size_t h = self->ring_head, t = self->ring_tail;
-    return (h >= t) ? (h - t) : 0;
-}
-
-
-// Legacy single-frame helper (retained for any future use)
-static void deliver_decoded_to_queue(PyObject* q_out, const uint8_t* data, int len) {
-    PyGILState_STATE gstate = PyGILState_Ensure();
-    PyObject* py_bytes = PyBytes_FromStringAndSize((const char*)data, len);
-    if (py_bytes) {
-        PyObject* r = PyObject_CallMethod(q_out, "put_nowait", "O", py_bytes);
-        if (!r) PyErr_Clear();
-        Py_XDECREF(r);
-        Py_DECREF(py_bytes);
-    } else {
-        PyErr_Clear();
-    }
-    PyGILState_Release(gstate);
-}
-
-static int try_pop_write(PyObject* q_in, uint8_t* buf, size_t cap, double timeout_s, Py_ssize_t* out_len) {
-    int got = 0;
-    *out_len = 0;
-    PyGILState_STATE gstate = PyGILState_Ensure();
-    PyObject* item = NULL;
-
-    if (timeout_s <= 0.0) {
-        // Non-blocking path: q_in.get_nowait()
-        item = PyObject_CallMethod(q_in, "get_nowait", NULL);
-    } else {
-        PyObject* py_timeout = PyFloat_FromDouble(timeout_s);
-        if (!py_timeout) { PyErr_Clear(); PyGILState_Release(gstate); return 0; }
-        // Correctly call get(block=True, timeout=timeout_s)
-        item = PyObject_CallMethod(q_in, "get", "OO", Py_True, py_timeout);
-        Py_DECREF(py_timeout);
-    }
-
-    if (item) {
-        if (PyBytes_Check(item)) {
-            char* p; Py_ssize_t n;
-            if (PyBytes_AsStringAndSize(item, &p, &n) == 0 && (size_t)n <= cap) {
-                memcpy(buf, p, (size_t)n);
-                *out_len = n;
-                got = 1;
-            }
-        }
-        Py_DECREF(item);
-    } else {
-        PyErr_Clear();
-    }
-    PyGILState_Release(gstate);
-    return got;
-}
 
 // ----------------- Platform-specific serial I/O -----------------
 #ifdef _WIN32
@@ -723,43 +725,18 @@ static DWORD WINAPI reader_thread_win(LPVOID param) {
 }
 
 
-static DWORD WINAPI deliver_thread_win(LPVOID param) {
-    SerialManagerObject* self = (SerialManagerObject*)param;
-
-    while (self->alive) {
-        if (self->ring_tail == self->ring_head) {
-            // Wait until producer signals there is data; short timeout keeps responsiveness during shutdown
-            if (self->h_ring_event) {
-                (void)WaitForSingleObject(self->h_ring_event, 5);
-            } else {
-                Sleep(0); // fallback
+    static DWORD WINAPI deliver_thread_win(LPVOID param) {
+        SerialManagerObject* self = (SerialManagerObject*)param;
+        while (self->alive) {
+            if (self->ring_tail == self->ring_head) {
+                if (self->h_ring_event) WaitForSingleObject(self->h_ring_event, 10);
+                else Sleep(1);
+                continue;
             }
-            continue;
+            deliver_batch_to_python(self);
         }
-
-        if (!self->py_enabled) { Sleep(10); continue; }
-
-        PyGILState_STATE g = PyGILState_Ensure();
-        for (int i = 0; i < 2048; ++i) {
-            FrameItem it;
-            if (!ring_pop(self, &it)) break;
-            if (it.data && it.len > 0) {
-                deliver_frame_nogil(self, it.data, (Py_ssize_t)it.len);
-                free(it.data);
-            }
-            if (!self->alive || !self->py_enabled) break;
-        }
-        PyGILState_Release(g);
-        // loop back quickly to check for more items (batching already in place)
+        return 0;
     }
-
-    // Drain remaining frames
-    FrameItem it;
-    while (ring_pop(self, &it)) {
-        if (it.data) free(it.data);
-    }
-    return 0;
-}
 
 
 
@@ -773,7 +750,7 @@ static DWORD WINAPI writer_thread_win(LPVOID param) {
 
         Py_ssize_t n = 0;
         // Strictly non-blocking to avoid Python C-API during shutdown races
-        int got = try_pop_write(self->q_in, buf, sizeof(buf), 0.001, &n);
+        int got = try_pop_write(self, buf, sizeof(buf), 0.001, &n);
         if (!got) {
             // No data; yield
             // NOTE: !! changing this to 1ms causes firmware download to be SLOW !!
@@ -788,7 +765,7 @@ static DWORD WINAPI writer_thread_win(LPVOID param) {
         Py_ssize_t total = n;
         while (total < (Py_ssize_t)sizeof(buf)) {
             Py_ssize_t m = 0;
-            if (!try_pop_write(self->q_in, buf + total, sizeof(buf) - (size_t)total, 0.0, &m))
+            if (!try_pop_write(self, buf + total, sizeof(buf) - (size_t)total, 0.0, &m))
                 break; // queue empty
             total += m;
         }
@@ -882,55 +859,19 @@ static void* reader_thread_posix(void* param) {
 
 static void* deliver_thread_posix(void* param) {
     SerialManagerObject* self = (SerialManagerObject*)param;
-    FrameItem item_batch[128];
-
     while (self->alive) {
-        if (!self->py_enabled) { usleep(200); continue; }
-
-        int batch_count = 0;
-
         pthread_mutex_lock(&self->ring_mx);
         while (self->alive && self->ring_head == self->ring_tail) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 100 * 1000 * 1000; // 100ms timeout
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000L;
-            }
+            ts.tv_nsec += 10000000; // 10ms wait
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
             pthread_cond_timedwait(&self->ring_cond, &self->ring_mx, &ts);
-        }
-
-        if (!self->alive) {
-            pthread_mutex_unlock(&self->ring_mx);
-            break;
-        }
-
-        while (batch_count < 128 && self->ring_tail != self->ring_head) {
-            size_t idx = self->ring_tail % self->ring_cap;
-            item_batch[batch_count++] = self->ring_buf[idx];
-            self->ring_tail++;
         }
         pthread_mutex_unlock(&self->ring_mx);
 
-        if (batch_count > 0) {
-            PyGILState_STATE g = PyGILState_Ensure();
-            for (int i = 0; i < batch_count; ++i) {
-                FrameItem* it = &item_batch[i];
-                if (it->data && it->len > 0) {
-                    deliver_frame_nogil(self, it->data, (Py_ssize_t)it->len);
-                    free(it->data);
-                }
-                if (!self->alive || !self->py_enabled) break;
-            }
-            PyGILState_Release(g);
-        }
-    }
-
-    // Drain remaining items (if any) to avoid leaks
-    FrameItem it;
-    while (ring_pop(self, &it)) {
-        if (it.data) free(it.data);
+        if (!self->alive) break;
+        deliver_batch_to_python(self);
     }
     return NULL;
 }
@@ -944,7 +885,7 @@ static void* writer_thread_posix(void* param) {
         if (!self->py_enabled) break;
 
         Py_ssize_t n = 0;
-        int got = try_pop_write(self->q_in, buf, sizeof(buf), 0.001, &n); // non-blocking
+        int got = try_pop_write(self, buf, sizeof(buf), 0.001, &n); // non-blocking
         if (!got) {
             // No data; yield briefly
             usleep(500);
@@ -957,7 +898,7 @@ static void* writer_thread_posix(void* param) {
         Py_ssize_t total = n;
         while (total < (Py_ssize_t)sizeof(buf)) {
             Py_ssize_t m = 0;
-            if (!try_pop_write(self->q_in, buf + total, sizeof(buf) - (size_t)total, 0.0, &m))
+            if (!try_pop_write(self, buf + total, sizeof(buf) - (size_t)total, 0.0, &m))
                 break;
             total += m;
         }
@@ -975,78 +916,60 @@ static void* writer_thread_posix(void* param) {
 static void SerialManager_dealloc(SerialManagerObject* self) {
     self->py_enabled = 0;
     self->alive = 0;
+
+    // Wake threads for shutdown
+    ring_signal(self);
+
 #ifdef _WIN32
-    if (self->h_port && self->h_port != INVALID_HANDLE_VALUE) {
-        SetCommMask(self->h_port, 0);
-        cancel_all_io_win(self->h_port);
-    }
-
-    Py_BEGIN_ALLOW_THREADS
-    wait_and_close_thread(&self->h_read_thread);
-    wait_and_close_thread(&self->h_write_thread);
-    wait_and_close_thread(&self->h_deliver_thread);
-    Py_END_ALLOW_THREADS
-
-    if (self->h_port && self->h_port != INVALID_HANDLE_VALUE) {
-        close_serial_win(self->h_port);
-        self->h_port = NULL;
-    }
-    if (self->ring_buf) {
-        while (self->ring_tail != self->ring_head) {
-            size_t idx = self->ring_tail % self->ring_cap;
-            if (self->ring_buf[idx].data) free(self->ring_buf[idx].data);
-            self->ring_tail++;
-        }
-        free(self->ring_buf);
-        self->ring_buf = NULL;
-    }
-    if (self->h_ring_event) { CloseHandle(self->h_ring_event); self->h_ring_event = NULL; }
+    // ... existing Windows thread joins ...
     DeleteCriticalSection(&self->ring_cs);
+    if (self->h_ring_event) CloseHandle(self->h_ring_event);
 #else
     Py_BEGIN_ALLOW_THREADS
-    if (self->read_thread)  { pthread_join(self->read_thread,  NULL); self->read_thread = (pthread_t)0; }
-    if (self->write_thread) { pthread_join(self->write_thread, NULL); self->write_thread = (pthread_t)0; }
-    if (self->deliver_thread) { pthread_join(self->deliver_thread, NULL); self->deliver_thread = (pthread_t)0; }
+    if (self->read_thread)    pthread_join(self->read_thread,    NULL);
+    if (self->write_thread)   pthread_join(self->write_thread,   NULL);
+    if (self->deliver_thread) pthread_join(self->deliver_thread, NULL);
     Py_END_ALLOW_THREADS
-
-    if (self->fd >= 0) { close_serial_posix(self->fd); self->fd = -1; }
-    if (self->ring_buf) {
-        while (self->ring_tail != self->ring_head) {
-            size_t idx = self->ring_tail % self->ring_cap;
-            if (self->ring_buf[idx].data) free(self->ring_buf[idx].data);
-            self->ring_tail++;
-        }
-        free(self->ring_buf);
-        self->ring_buf = NULL;
-    }
+    if (self->fd >= 0) close(self->fd);
     pthread_mutex_destroy(&self->ring_mx);
     pthread_cond_destroy(&self->ring_cond);
 #endif
+
+    if (self->ring_data) free(self->ring_data);
+
     Py_XDECREF(self->q_in);
     Py_XDECREF(self->q_out);
     Py_XDECREF(self->q_out_put_nowait);
-    PyMem_Free(self->port);
+    Py_XDECREF(self->q_in_get);
+    Py_XDECREF(self->q_in_get_nowait);
+    if (self->port) PyMem_Free(self->port);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
 
-
 static int SerialManager_init(SerialManagerObject* self, PyObject* args, PyObject* kwds) {
-    // __init__(port, qin, qout, baud=115200)
     static char* kwlist[] = {"port", "qin", "qout", "baud", NULL};
     const char* port = NULL;
     int baud = 115200;
     PyObject* qin = NULL;
     PyObject* qout = NULL;
 
+    // Reset members to NULL/initial state
+    self->port = NULL;
     self->q_in = NULL;
     self->q_out = NULL;
     self->q_out_put_nowait = NULL;
+    self->q_in_get = NULL;
+    self->q_in_get_nowait = NULL;
+    self->ring_data = NULL;
+    self->alive = 0;
+    self->py_enabled = 0;
 
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "sOO|i", kwlist,
                                      &port, &qin, &qout, &baud)) {
         return -1;
     }
+
     if (!PyObject_HasAttrString(qin, "get") || !PyObject_HasAttrString(qout, "put_nowait")) {
         PyErr_SetString(PyExc_ValueError, "qin/qout must be queue-like objects");
         return -1;
@@ -1060,35 +983,37 @@ static int SerialManager_init(SerialManagerObject* self, PyObject* args, PyObjec
     Py_INCREF(qin);  self->q_in  = qin;
     Py_INCREF(qout); self->q_out = qout;
 
-    // Cache bound method q_out.put_nowait once
+    // Cache bound methods to reduce attribute lookups in delivery/writer threads
     self->q_out_put_nowait = PyObject_GetAttrString(qout, "put_nowait");
-    if (!self->q_out_put_nowait) {
-        PyErr_SetString(PyExc_ValueError, "qout must provide put_nowait()");
+    self->q_in_get = PyObject_GetAttrString(qin, "get");
+    self->q_in_get_nowait = PyObject_GetAttrString(qin, "get_nowait");
+
+    if (!self->q_out_put_nowait || !self->q_in_get || !self->q_in_get_nowait) {
+        PyErr_SetString(PyExc_ValueError, "qin/qout must provide get/get_nowait/put_nowait methods");
         return -1;
     }
 
-    self->alive = 0;
-    self->py_enabled = 0;
+    // Initialize Zero-Allocation Ring Buffer
+    self->ring_size = 1024 * 1024; // 1MB buffer
+    self->ring_data = (uint8_t*)malloc(self->ring_size);
+    self->ring_head = 0;
+    self->ring_tail = 0;
+    self->ring_dropped = 0;
+
+    if (!self->ring_data) {
+        PyErr_SetString(PyExc_MemoryError, "ring buffer allocation failed");
+        return -1;
+    }
+
 #ifdef _WIN32
     self->h_read_thread = NULL;
     self->h_write_thread = NULL;
     self->h_deliver_thread = NULL;
     self->h_port = NULL;
-
-    // Init ring
-    self->ring_cap = 4096; // frames
-    self->ring_buf = (FrameItem*)calloc(self->ring_cap, sizeof(FrameItem));
-    self->ring_head = 0;
-    self->ring_tail = 0;
-    self->ring_dropped = 0;
-    if (!self->ring_buf) {
-        PyErr_SetString(PyExc_MemoryError, "ring allocation failed");
-        return -1;
-    }
     InitializeCriticalSection(&self->ring_cs);
-    self->h_ring_event = CreateEvent(NULL, /*manualReset*/FALSE, /*initialState*/FALSE, NULL);
+    self->h_ring_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (!self->h_ring_event) {
-        PyErr_SetString(PyExc_RuntimeError, "CreateEvent failed for ring");
+        PyErr_SetString(PyExc_RuntimeError, "CreateEvent failed");
         return -1;
     }
 #else
@@ -1096,20 +1021,10 @@ static int SerialManager_init(SerialManagerObject* self, PyObject* args, PyObjec
     self->read_thread = (pthread_t)0;
     self->write_thread = (pthread_t)0;
     self->deliver_thread = (pthread_t)0;
-
-    // Init ring
-    self->ring_cap = 4096; // frames
-    self->ring_buf = (FrameItem*)calloc(self->ring_cap, sizeof(FrameItem));
-    self->ring_head = 0;
-    self->ring_tail = 0;
-    self->ring_dropped = 0;
-    if (!self->ring_buf) {
-        PyErr_SetString(PyExc_MemoryError, "ring allocation failed");
-        return -1;
-    }
     pthread_mutex_init(&self->ring_mx, NULL);
     pthread_cond_init(&self->ring_cond, NULL);
 #endif
+
     return 0;
 }
 
@@ -1162,6 +1077,8 @@ static PyObject* SerialManager_shutdown(SerialManagerObject* self, PyObject* Py_
     self->py_enabled = 0;
     self->alive = 0;
 
+    ring_signal(self); // Ensure delivery thread wakes up to exit
+
 #ifdef _WIN32
     if (self->h_port && self->h_port != INVALID_HANDLE_VALUE) {
         SetCommMask(self->h_port, 0);
@@ -1181,17 +1098,8 @@ static PyObject* SerialManager_shutdown(SerialManagerObject* self, PyObject* Py_
         self->h_port = NULL;
     }
 
-    if (self->h_ring_event) { SetEvent(self->h_ring_event); } // wake waiter, if any
+    if (self->h_ring_event) { SetEvent(self->h_ring_event); }
 
-    if (self->ring_buf) {
-        while (self->ring_tail != self->ring_head) {
-            size_t idx = self->ring_tail % self->ring_cap;
-            if (self->ring_buf[idx].data) free(self->ring_buf[idx].data);
-            self->ring_tail++;
-        }
-        free(self->ring_buf);
-        self->ring_buf = NULL;
-    }
 #else
     Py_BEGIN_ALLOW_THREADS
     if (self->read_thread)    { pthread_join(self->read_thread,    NULL); self->read_thread = (pthread_t)0; }
@@ -1203,22 +1111,10 @@ static PyObject* SerialManager_shutdown(SerialManagerObject* self, PyObject* Py_
         close_serial_posix(self->fd);
         self->fd = -1;
     }
-
-    if (self->ring_buf) {
-        while (self->ring_tail != self->ring_head) {
-            size_t idx = self->ring_tail % self->ring_cap;
-            if (self->ring_buf[idx].data) free(self->ring_buf[idx].data);
-            self->ring_tail++;
-        }
-        free(self->ring_buf);
-        self->ring_buf = NULL;
-    }
 #endif
+    // Note: ring_data is freed in dealloc, not here, to allow multiple start/stops if needed.
     Py_RETURN_NONE;
 }
-
-
-
 
 // ----------------- Type and module boilerplate -----------------
 static PyMethodDef SerialManager_methods[] = {

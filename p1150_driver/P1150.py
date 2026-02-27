@@ -28,12 +28,12 @@ import os
 import struct
 from dataclasses import dataclass
 from threading import Lock, Event
-import uclog
+import numpy as np
+from . import uclog
 import traceback
 import cbor2
 import serial
 import serial.tools.list_ports
-from collections import deque
 import hashlib
 from time import sleep
 from timeit import default_timer as timer
@@ -190,21 +190,21 @@ class UCLogger(object):
 
         try:
             _t = self._port
-            base_dir = os.path.dirname(__file__)
+            driver_dir = os.path.dirname(__file__)
 
             app = kw.get('app', "a43")
             if app == "a43":
-                elf_file = os.path.join(base_dir, "assets", "a43_app.logdata")
+                elf_file = os.path.join(driver_dir, "firmware", "a43_app.logdata")
 
             elif app == "a57":
-                elf_file = os.path.join(base_dir, "assets", "a57_app.logdata")
+                elf_file = os.path.join(driver_dir, "firmware", "a57_app.logdata")
 
             else:
                 raise ValueError("app must be a43, a57")
 
             self.logger.info(f"{app}: {elf_file}")
 
-            bl_elf_file = os.path.join(base_dir, "assets", "a51_bl.logdata")
+            bl_elf_file = os.path.join(driver_dir, "firmware", "a51_bl.logdata")
             self.logger.info(bl_elf_file)
 
             _e = uclog.decoders([elf_file, bl_elf_file])
@@ -212,7 +212,7 @@ class UCLogger(object):
 
             self._ucLogServer = uclog.LogClientServer(_t,
                                                       _e,
-                                                  {'log': self._uclog_log, # log messages
+                                                      {'log': self._uclog_log, # log messages
                                                        0: self._uclog_cmdres,  # cmd/response
                                                        1: self._uclog_async,   # asynchronous messages
                                                        2: self._uclog_plot,    # debug plotter
@@ -245,7 +245,7 @@ class UCLogger(object):
         else:
             self._cb_uclog_plot(item)
 
-    def _uclog_log(self, item: tuple) -> None:
+    def _uclog_log(self, item):
         """ ucLogger log stream default handler
         - if ucLogger GUI, then usually set to an instance of UnitLogger:Logger
         - else use logger
@@ -254,7 +254,7 @@ class UCLogger(object):
             # TODO: although it is cool to put log items in another tab,
             #       its actually better to see these in the main log
             #       Remove that tab?  Eventually the tab will be removed for release?
-            self._cb_uclog_log.uclog_item(item)
+            self._cb_uclog_log(item)
 
         try:
             _, _, lvl, file, line, msg = item
@@ -267,7 +267,7 @@ class UCLogger(object):
             self.logger.error(e)
             self.logger.error(item)
 
-    def _uclog_async(self, _item: bytes) -> None:
+    def _uclog_async(self, _item):
         """ Response handler to Port 1 destined for the GUI (not this Klass)
         - these are asynchronous messages from the target
         - these are generally in the form of { f: asc_*, s: true, ... }
@@ -283,7 +283,7 @@ class UCLogger(object):
             if self._cb_uclog_async:
                 self._cb_uclog_async(item)
 
-    def _uclog_adc(self, _item: bytes) -> None:
+    def _uclog_adc(self, _item):
         """ ADC stream handler
         - ucLog port 3
         """
@@ -299,25 +299,25 @@ class UCLogger(object):
         try:
             item = cbor2.loads(_item)
 
-            # Convert the list of bytes back to int32
-            item["i"] = struct.unpack('<ffffffffffffffffffffffffffffffffffffffffffffffffff', item["i"])
-            item["i"] = [round(i / 1000000.0, 6) for i in item["i"]]  # convert to mAmps (float)
+            # Convert the list of bytes back to int32 and scale to mAmps (float) using numpy
+            item["i"] = np.frombuffer(item["i"], dtype='<f4').copy()
+            item["i"] = np.round(item["i"] / 1000000.0, 6)
 
-            # Convert the list of bytes back to int32
-            item["isnk"] = struct.unpack('<ffffffffffffffffffffffffffffffffffffffffffffffffff', item["isnk"])
-            item["isnk"] = [round(i / 1000000.0, 6) for i in item["isnk"]]  # convert to mAmps (float)
+            # Convert the list of bytes back to int32 and scale to mAmps (float) using numpy
+            item["isnk"] = np.frombuffer(item["isnk"], dtype='<f4').copy()
+            item["isnk"] = np.round(item["isnk"] / 1000000.0, 6)
 
-            # Convert the list of bytes back to int16
-            item["a0"] = struct.unpack('<HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH', item["a0"])
-            item["a0"] = [round(float(i), 0) for i in item["a0"]]
+            # Convert the list of bytes back to uint16 using numpy
+            item["a0"] = np.frombuffer(item["a0"], dtype='<u2').copy().astype(float)
+            item["a0"] = np.round(item["a0"], 0)
 
-            # Convert the list of bytes back to int8
-            item["d01"] = struct.unpack('<BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', item["d01"])
-            # note these are converted to float in _event_adc_stream_in
+            # Convert the list of bytes back to uint8 using numpy
+            item["d01"] = np.frombuffer(item["d01"], dtype='u1').copy()
 
-            # Convert the list of bytes back to char
+            # Convert the list of bytes back to char and then to string list
+            # Note: numpy isn't significantly faster for string/object conversions, but we keep it consistent
             item["d0s"] = struct.unpack('<cccccccccccccccccccccccccccccccccccccccccccccccccc', item["d0s"])
-            item["d0s"] = [i.decode('utf-8') for i in item["d0s"]]  # change to str
+            item["d0s"] = [i.decode('utf-8') for i in item["d0s"]]
 
             # check frame counter, to detect missing packets
             if self._adc_frame_count is None:
@@ -332,14 +332,25 @@ class UCLogger(object):
             return
 
         if self._low_pass_filter:
-            def lpf(x: list, z: list) -> tuple[list, list]:
+            def lpf(x: np.ndarray, z: list) -> tuple[np.ndarray, list]:
+                # Initialize cache if first run
                 if z[0] == 0.0:
                     z[0], z[1] = x[0], x[1]
 
-                t = z + x
-                w = (0.11, 0.78, 0.11)  # must add up to 1.0
-                r = [round(sum(t[i + j] * w[j] for j in range(3)), 6) for i in range(len(x))]
-                return r, x[-2:]
+                # Concatenate cache with new data
+                # t becomes [z0, z1, x0, x1, ... x49]
+                t = np.concatenate((z, x))
+
+                # Weights for the moving average
+                w = np.array([0.11, 0.78, 0.11])
+
+                # Use numpy's valid convolution to process the batch
+                # This yields len(x) samples because we added 2 from cache
+                r = np.convolve(t, w, mode='valid')
+                r = np.round(r, 6)
+
+                # Return processed array and update cache with last 2 samples of original x
+                return r, x[-2:].tolist()
 
             item["i"], self._low_pass_filter_i_cache = \
                 lpf(item["i"], self._low_pass_filter_i_cache)
@@ -357,7 +368,7 @@ class UCLogger(object):
 
         self._cb_uclog_adc(item)  # this calls P1125:adc_stream_in
 
-    def _uclog_cmdres(self, _item: bytes) -> None:
+    def _uclog_cmdres(self, _item):
         """ Command Response handler on Port 0 default handler
         - works with uclog_response()
         - received responses from target on port 0 end up here
@@ -439,7 +450,7 @@ class UCLogger(object):
                     #self.logger.info(f'RESP: {resp}')
                     return success, resp
 
-    def uclog_close(self) -> None:
+    def uclog_close(self):
         with self._lock_responses:
             if self._ucLogServer:
                 self._ucLogServer.shutdown()
@@ -457,6 +468,8 @@ class P1150(UCLogger):
     Notes:
     - All commands are blocking
     - All commands send back a success flag, if False, client must handle error.
+    - AI was used to convert the original code to use numpy arrays and take advantage
+      of any fast APIs via numpy
 
     """
     # Fake Voltages for D0/1 signals to be plotted, these are safe to change
@@ -526,7 +539,7 @@ class P1150(UCLogger):
         self._trigger_idx_precond = False
         self._mahr_stop_time_s = 60
         self._timebase_span = self.TBASE_MAP[P1150API.TBASE_SPAN_100MS]
-        self._timebase_t_recalc = False
+        self._timebase_t_recalc = True
         self._osc_t = []
         self.NUM_SAMPLES = 0
 
@@ -546,16 +559,18 @@ class P1150(UCLogger):
 
         self._tmr_start = 0.0  # for benchmarking with timer()
 
-        # _adc_buf is a temporary holding buffer, used when ADC data is incoming
-        # and the previous triggered data hasn't yet been picked up by the GUI
-        # 12500 size represents 100ms of data
-        self._adc_buf = {"t": deque(maxlen=12500),
-                         "i": deque(maxlen=12500),
-                         "a0": deque(maxlen=12500),
-                         "d0": deque(maxlen=12500),
-                         "d0s": deque(maxlen=12500),
-                         "d1": deque(maxlen=12500),
-                         "isnk": deque(maxlen=12500)}
+        # _adc_buf is a temporary holding buffer
+        # Using fixed-size numpy arrays for numeric data
+        self._adc_buf = {
+            "t": np.zeros(12500),
+            "i": np.zeros(12500),
+            "a0": np.zeros(12500),
+            "d0": np.zeros(12500),
+            "d0s": ["" for _ in range(12500)],  # d0s remains a list for strings
+            "d1": np.zeros(12500),
+            "isnk": np.zeros(12500),
+            "len": 0  # track current fill level
+        }
 
     def adc_stream_in(self, item) -> None:
         if not self._acquire:
@@ -580,109 +595,80 @@ class P1150(UCLogger):
         #start = timer()
 
         # extract d0/1 from the byte of d01 using batch operations and local bindings
-        # takes ~10usec to run
         d01 = item['d01']
         d0_vh, d0_vl = self.D0_VHIGH, self.D0_VLOW
         d1_vh, d1_vl = self.D1_VHIGH, self.D1_VLOW
-        item["d0"] = [((b & 0x1) * d0_vh + d0_vl) for b in d01]
-        item["d1"] = [(((b >> 1) & 0x1) * d1_vh + d1_vl) for b in d01]
 
-        def _append_and_trigger(item: dict, trig_src: str, level:  float | int | str, slope: str) -> None:
+        # Vectorized digital channel calculation
+        item["d0"] = (d01 & 0x1) * d0_vh + d0_vl
+        item["d1"] = ((d01 >> 1) & 0x1) * d1_vh + d1_vl
+
+        def _append_and_trigger(item: dict, trig_src: str, level: float | int | str, slope: str) -> None:
             """ Append data and trigger
             - self._adc is a fixed length deque, the length of the queue
               is set for one full timebase
-
-            - takes 50-100usec to run
-
-            :param item: dict of list of samples
-            :param trig_src:
-            :param level:
-            :param slope:
             """
-            #start = timer()
-            # takes <100usec
-
             adc = self._adc
-            adc_i = adc["i"]
-            adc_a0 = adc["a0"]
-            adc_d0 = adc["d0"]
-            adc_d0s = adc["d0s"]
-            adc_d1 = adc["d1"]
-            adc_isnk = adc["isnk"]
+            li, la0, ld0, ld1, lisnk = item['i'], item['a0'], item['d0'], item['d1'], item['isnk']
+            ld0s = item['d0s']
 
-            # read somewhere that assigning on one line is faster than multiple lines
-            li, la0, ld0, ld0s, ld1, lisnk = item['i'], item['a0'], item['d0'], item['d0s'], item['d1'], item['isnk']
-            idx, level_num, precond, adc_src, triggered_event = self._trigger_idx, level, self._trigger_idx_precond, adc[trig_src], self._acquire_triggered
+            idx_trigger_pos, level_num, precond, triggered_event = self._trigger_idx, level, self._trigger_idx_precond, self._acquire_triggered
 
             if slope == P1150API.TRIG_SLOPE_EITHER:
-                # if slope is either then for each batch of 50 samples,
-                # detect if signal will be falling or rising relative to trigger level
-                if adc_src[idx] < self._trigger_level:
+                if adc[trig_src][idx_trigger_pos] < self._trigger_level:
                     slope = P1150API.TRIG_SLOPE_RISE
                 else:
                     slope = P1150API.TRIG_SLOPE_FALL
 
-            # for each batch (50) of incoming data, detect signal crossing trigger level
+            # Process samples one-by-one to maintain perfect alignment
             n = len(li)
             for i in range(n):
-                # append new sample to the buffer
-                adc_i.append(li[i])
-                adc_a0.append(la0[i])
-                adc_d0.append(ld0[i])
-                adc_d0s.append(ld0s[i])
-                adc_d1.append(ld1[i])
-                adc_isnk.append(lisnk[i])
+                # Slice the arrays to shift left by 1 without full np.roll
+                for key in ["i", "a0", "d0", "d1", "isnk"]:
+                    adc[key][:-1] = adc[key][1:]
 
-                # check if trigger happened
+                adc["i"][-1] = li[i]
+                adc["a0"][-1] = la0[i]
+                adc["d0"][-1] = ld0[i]
+                adc["d1"][-1] = ld1[i]
+                adc["isnk"][-1] = lisnk[i]
+                adc["d0s"] = adc["d0s"][1:] + [ld0s[i]]
+
+                # Check trigger at the configured trigger index
+                # Note: We check the value at the 'trigger point' in the buffer
+                val = adc[trig_src][idx_trigger_pos]
+
                 if isinstance(level_num, (int, float)):
                     if slope == P1150API.TRIG_SLOPE_RISE:
                         if not precond:
-                            if adc_src[idx] < level_num:
-                                precond = True
-                        else:
-                            if adc_src[idx] > level_num:
-                                triggered_event.set()
-                                break
+                            if val < level_num: precond = True
+                        elif val > level_num:
+                            triggered_event.set()
+                            break
                     else:  # slope == P1150API.TRIG_SLOPE_FALL:
                         if not precond:
-                            if adc_src[idx] > level_num:
-                                precond = True
-                        else:
-                            if adc_src[idx] < level_num:
-                                triggered_event.set()
-                                break
-
+                            if val > level_num: precond = True
+                        elif val < level_num:
+                            triggered_event.set()
+                            break
                 elif isinstance(level_num, str):
-                    if adc_src[idx] == level_num:
+                    if val == level_num:
                         triggered_event.set()
                         break
 
-                else:
-                    self.logger.error(f"unexpected trigger level {level} type {type(level)}")
-
-            # write back any changes to precondition flag
             self._trigger_idx_precond = precond
 
-            #delta = timer() - start
-            #self.logger.info(f"lpf {delta:0.6f}")
-
         if self._acquire_datardy.is_set():
-            #self.logger.warning("incoming data with self._acquire_datardy set")
-            # new incoming data when previous data still not consumed, buffer new data into _adc_buf
-            # benchmarked at ~0.010 ms (~10usec) per call
-            self._adc_buf["i"].extend(item['i'])
-            self._adc_buf["a0"].extend(item['a0'])
-            self._adc_buf["d0"].extend(item["d0"])
-            self._adc_buf["d0s"].extend(item["d0s"])
-            self._adc_buf["d1"].extend(item["d1"])
-            self._adc_buf["isnk"].extend(item['isnk'])
-
-            # TODO: check if _adc_buf buffer overflows its 12500 samples long
-            #       if it has overflowed, then we have dropped incoming data
-            if 10000 < len(self._adc_buf["i"]) < 12000:
-                self.logger.warning(f"_adc_buf len {len(self._adc_buf['i'])}")
-            elif len(self._adc_buf["i"]) > 12000:
-                self.logger.error(f"_adc_buf len {len(self._adc_buf['i'])}")
+            # Buffer new data into _adc_buf if GUI hasn't picked up previous trigger
+            n = len(item['i'])
+            cur = self._adc_buf["len"]
+            if cur + n <= 12500:
+                for key in ["i", "a0", "d0", "d1", "isnk"]:
+                    self._adc_buf[key][cur:cur + n] = item[key]
+                self._adc_buf["d0s"][cur:cur + n] = item["d0s"]
+                self._adc_buf["len"] += n
+            else:
+                self.logger.error("_adc_buf overflow")
 
             if self._buffered_adc_frame_count and self._buffered_adc_frame_count != item['c']:
                 self.logger.error(f"adc frame count {item['c']}")
@@ -690,44 +676,34 @@ class P1150(UCLogger):
 
             return
 
-        if self._adc_buf['i']:  # if not empty - some buffered data came in
-            # this if clause takes 10-20 usec to run
-            # if there is buffered data, consume all of it
-            self._adc["i"].extend(self._adc_buf['i'])
-            self._adc["a0"].extend(self._adc_buf['a0'])
-            self._adc["d0"].extend(self._adc_buf['d0'])
-            self._adc["d0s"].extend(self._adc_buf['d0s'])
-            self._adc["d1"].extend(self._adc_buf['d1'])
-            self._adc["isnk"].extend(self._adc_buf['isnk'])
+        if self._adc_buf['len'] > 0:
+            # Consume buffered data
+            n = self._adc_buf['len']
+            for key in ["i", "a0", "d0", "d1", "isnk"]:
+                self._adc[key] = np.roll(self._adc[key], -n)
+                self._adc[key][-n:] = self._adc_buf[key][:n]
 
-            # clear this buffer from when data coming is when _acquire_datardy set
-            # this is important to this if() clause not to be true a 2nd time
-            # TODO: is it faster to just re-init self._adc_buf rather than clear()?
-            self._adc_buf['i'].clear()
-            self._adc_buf['a0'].clear()
-            self._adc_buf['d0'].clear()
-            self._adc_buf['d0s'].clear()
-            self._adc_buf['d1'].clear()
-            self._adc_buf['isnk'].clear()
+            self._adc["d0s"] = self._adc["d0s"][n:] + self._adc_buf["d0s"][:n]
+            self._adc_buf['len'] = 0
 
         # debug log to check health of streaming
         if self._buffered_adc_frame_count and self._buffered_adc_frame_count != item['c']:
             self.logger.warning(f"adc frame count {item['c']}")
         self._buffered_adc_frame_count = item['c'] + 1
 
-        # fill up the buffer, regardless of trigger setup, regardless of mode
-        if len(self._adc["i"]) < self.NUM_SAMPLES:
-            self._adc["i"].extend(item['i'])
-            self._adc["a0"].extend(item['a0'])
-            self._adc["d0"].extend(item["d0"])
-            self._adc["d0s"].extend(item["d0s"])
-            self._adc["d1"].extend(item["d1"])
-            self._adc["isnk"].extend(item['isnk'])
+        # fill up the buffer initial state
+        if self._adc["fill"] < self.NUM_SAMPLES:
+            n = len(item['i'])
+            cur = self._adc["fill"]
+            end = min(cur + n, self.NUM_SAMPLES)
+            take = end - cur
 
-            if len(self._adc["i"]) <= self.NUM_SAMPLES:
-                #if len(self._adc["i"]) % 1000 == 0:
-                #    delta = timer() - start
-                #    self.logger.info(f" filling {delta:0.6f}, {len(self._adc['i'])}")
+            for key in ["i", "a0", "d0", "d1", "isnk"]:
+                self._adc[key][cur:end] = item[key][:take]
+            self._adc["d0s"][cur:end] = item["d0s"][:take]
+            self._adc["fill"] = end
+
+            if self._adc["fill"] < self.NUM_SAMPLES:
                 return
 
         # At this point there is a full buffer of data representing the TIMEBASE setting
@@ -755,7 +731,7 @@ class P1150(UCLogger):
 
                 if self._timebase_t_recalc:  # create self._osc_t only once
                     self._timebase_t_recalc = False
-                    self._osc_t = [t_start + i / self.ADC_SAMPLE_RATE for i in range(self.NUM_SAMPLES)]
+                    self._osc_t = t_start + np.arange(self.NUM_SAMPLES) / self.ADC_SAMPLE_RATE
 
                 self._adc["t"] = self._osc_t
 
@@ -773,12 +749,12 @@ class P1150(UCLogger):
 
             if self.cb_acquisition_get_data:
                 d = {"t": [*self._adc["t"]],
-                     "i": [*self._adc["i"]],
-                     "a0": [*self._adc["a0"]],
-                     "d0": [*self._adc["d0"]],
-                     "d0s": [*self._adc["d0s"]],
-                     "d1": [*self._adc["d1"]],
-                     "isnk": [*self._adc["isnk"]]}
+                     "i": self._adc["i"].copy(),
+                     "a0": self._adc["a0"].copy(),
+                     "d0": self._adc["d0"].copy(),
+                     "d0s": self._adc["d0s"].copy(),
+                     "d1": self._adc["d1"].copy(),
+                     "isnk": self._adc["isnk"].copy()}
 
                 self.cb_acquisition_get_data(d)
                 self._event_clear_datardy()
@@ -790,13 +766,16 @@ class P1150(UCLogger):
         # takes ~11 usec
         self.NUM_SAMPLES = int(self.ADC_SAMPLE_RATE * self._timebase_span)
 
-        self._adc = {"t": deque(maxlen=self.NUM_SAMPLES),
-                     "i": deque(maxlen=self.NUM_SAMPLES),
-                     "a0": deque(maxlen=self.NUM_SAMPLES),
-                     "d0": deque(maxlen=self.NUM_SAMPLES),
-                     "d0s": deque(maxlen=self.NUM_SAMPLES),
-                     "d1": deque(maxlen=self.NUM_SAMPLES),
-                     "isnk": deque(maxlen=self.NUM_SAMPLES)}
+        self._adc = {
+            "t": np.zeros(self.NUM_SAMPLES),
+            "i": np.zeros(self.NUM_SAMPLES),
+            "a0": np.zeros(self.NUM_SAMPLES),
+            "d0": np.zeros(self.NUM_SAMPLES),
+            "d0s": ["" for _ in range(self.NUM_SAMPLES)],
+            "d1": np.zeros(self.NUM_SAMPLES),
+            "isnk": np.zeros(self.NUM_SAMPLES),
+            "fill": 0  # track initial fill
+        }
         self._acquire_triggered.clear()
         self._acquire_datardy.clear()
         #self.logger.info(f"self._adc cleared")
@@ -897,7 +876,7 @@ class P1150(UCLogger):
 
             return True, result
 
-    def set_vout(self, value_mv: int) -> tuple[bool, list[dict] | None]:
+    def set_vout(self, value_mv: int, ch: int=1) -> tuple[bool, list[dict] | None]:
         """ Set VOUT
 
         :param value_mv: <int>
@@ -950,7 +929,7 @@ class P1150(UCLogger):
         :param src: <P1150API.TRIG_SRC_*>
         :param pos: <P1150API.TRIG_POS_*>
         :param slope: <P1150API.TRIG_SLOPE_*>
-        :param level: <int in mV or uA> || character for D0s
+        :param level: <int in mV or mA> || character for D0s
         :return: success <True/False>, result <json/None>
         """
         with self._lock_stream:
@@ -1037,19 +1016,19 @@ class P1150(UCLogger):
             self._adc_frame_count = None
             self._buffered_adc_frame_count = 0
 
-            # clear any in waiting data
-            self._adc_buf['i'].clear()
-            self._adc_buf['a0'].clear()
-            self._adc_buf['d0'].clear()
-            self._adc_buf['d1'].clear()
-            self._adc_buf['isnk'].clear()
+            # Clear buffered data by resetting the length and zeroing the arrays
+            self._adc_buf["len"] = 0
+            for key in ["i", "a0", "d0", "d1", "isnk"]:
+                self._adc_buf[key].fill(0.0)
+            self._adc_buf["d0s"] = ["" for _ in range(12500)]
 
             payload = {"f": "cmd_adc", "en": False}
             return self.uclog_response(payload)
 
     def acquisition_complete(self) -> tuple[bool, list[dict]]:
-        """ Poll Acquisition Complete
+        """ Poll Acquisistion Complete
 
+        :param retries: number of polling retries
         :return: success <True/False>, {"triggered": <bool>}}
         """
         with self._lock:
@@ -1070,22 +1049,22 @@ class P1150(UCLogger):
             self.logger.error("No data to get")
             return False, {"ERROR": "No data to get"}
 
-        # NOTE: performance this is taking ~1ms, tried alternatives,
-        #       copy(), list(), which were slower
-        #       used timeit.timer() in _event_p1125_acqdata_log to benchmark.
-        d = {"t": [*self._adc["t"]],
-             "i": [*self._adc["i"]],
-             "a0": [*self._adc["a0"]],
-             "d0": [*self._adc["d0"]],
-             "d1": [*self._adc["d1"]],
-             "isnk": [*self._adc["isnk"]]}
+        # Return copies of the numpy arrays
+        d = {
+            "t": self._adc["t"].copy(),
+            "i": self._adc["i"].copy(),
+            "a0": self._adc["a0"].copy(),
+            "d0": self._adc["d0"].copy(),
+            "d1": self._adc["d1"].copy(),
+            "isnk": self._adc["isnk"].copy()
+        }
 
         self._event_clear_datardy()
         #delta = timer() - self._tmr_start
         #self.logger.info(f"{delta}")
         return True, d
 
-    def probe(self, connect: bool=True, hard_connect: bool=False, rs_comp: bool=False) -> tuple[bool, list[dict] | None]:
+    def probe(self, ch: int=1, connect: bool=True, hard_connect: bool=False, rs_comp: bool=False) -> tuple[bool, list[dict] | None]:
         """ Set Probe Connect
 
         If the probe is not connected, connecting will fail.  The P1125 can detect
@@ -1195,13 +1174,18 @@ class P1150(UCLogger):
         with self._lock:
             return self.uclog_response(cmd)
 
-    def ez_connect(self) -> tuple[bool, dict | None]:
+    def ez_connect(self, progress_callback=None) -> tuple[bool, dict | None]:
         """ Connect to P1150, upload AFI if necessary, Calibrate if necessary
         - hides all the details of connecting to P1150
-        - if success False, client should close()
+        - if success False, the client should close()
 
+        :param progress_callback: <function> called with progress percentage and message
+                                  def _connect_progress(progress: float, msg: str) -> None:
         :return: success <True/False>, response <dict>
         """
+        if progress_callback is not None:
+            progress_callback(0, "Start")
+
         success, response = self.ping()
         if not success:
             self.logger.error(f"ping {self._port}: {response}")
@@ -1226,10 +1210,14 @@ class P1150(UCLogger):
             self.logger.info(f"bootloader_init {result}")
             mtu = result[0]['mtu']
 
-            firmware_file = os.path.join(os.path.dirname(__file__), "assets", "a43_app.signed.ico")
+            driver_dir = os.path.dirname(__file__)
+            firmware_file = os.path.join(driver_dir, "firmware", "a43_app.signed.ico")
             with open(firmware_file, 'rb') as f:
                 data = f.read()
             self.logger.info(f'a43_app.signed.ico len: {len(data)}')
+
+            if progress_callback is not None:
+                progress_callback(1, "Bootloader")
 
             while len(data) > 0:
                 d, data = data[:mtu], data[mtu:]
@@ -1247,6 +1235,9 @@ class P1150(UCLogger):
             # the P1150 is rebooting and will re-enumerate with USB
             self.close()
             sleep(0.200)  # allow time for device to disconnect/reboot
+
+            if progress_callback is not None:
+                progress_callback(2, "Reconnect")
 
             # wait for host OS to see the COM port return
             start = timer()
@@ -1279,6 +1270,9 @@ class P1150(UCLogger):
         response_status = response_status[-1]
         self.logger.info(f"status {self._port}: {response_status}")
 
+        if progress_callback is not None:
+            progress_callback(3, "Connected")
+
         # calibration
         if not response_status['cal_done']:
             success, result = self.calibrate(blocking=False, force=True)
@@ -1297,9 +1291,15 @@ class P1150(UCLogger):
                     return False, {"ERROR": "calibrate in progress failed"}
 
                 self.logger.info(f"cal_status: {result}")
+                if progress_callback is not None:
+                    progress_callback(result[-1]['progress'], "Calibrating")
+
                 if result[-1]['cal_done']:
                     response_status['cal_done'] = True
                     break
+
+        if progress_callback is not None:
+            progress_callback(100, "Done")
 
         # all done
         _response.update(response_status)

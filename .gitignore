@@ -15,3 +15,12 @@ mpserial/build/
 mpserial/mp_serial_ext.egg-info/
 
 p1150_out.csv
+
+p1150_driver/cobs_c/cobs.egg-info/
+
+p1150_driver/logdata_c/logdata_ext.egg-info/
+
+p1150_driver/mpserial/mp_serial_ext.egg-info/
+p1150_driver/mpserial/build/
+
+*.so
