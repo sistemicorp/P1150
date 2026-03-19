@@ -19,7 +19,28 @@ NOTE: https://stackoverflow.com/questions/77364550/attributeerror-module-pkgutil
 ### Requirements
 
 
-Install Python requirements,
+It is recommended to install the project into a Python virtual environment so the dependencies
+stay isolated from your system Python.
+
+Create and activate a virtual environment:
+```commandline
+python -m venv .venv
+```
+
+Activate it:
+
+**Widows**
+```commandline
+.venv\Scripts\activate
+```
+
+**Linux**
+```commandline
+source .venv/bin/activate
+```
+
+
+Then install Python requirements,
 
 ```commandline
 python -m pip install -r requirements.txt
