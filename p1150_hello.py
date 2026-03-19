@@ -28,6 +28,7 @@ the probe.
 
 """
 import time
+import argparse
 from threading import Event
 from timeit import default_timer as timer
 from p1150_driver import P1150
@@ -44,7 +45,7 @@ logger.addHandler(consoleHandler)
 logger.setLevel(logging.INFO)
 
 # scanning for P1150 is not shown in this example, please see p1150_scan.py.
-P1150_PORT = "/dev/ttyACM2"  # use p1150_scan.py to determine this
+P1150_PORT = None
 DEFAULT_ACQ_TIMEOUT = 10.0
 P1150_VOUT_MV = 4000
 
@@ -81,9 +82,11 @@ def _cb_p1150_async(data: dict) -> None:
 
 # Must use __main__ due to multiprocessing within P1150 driver
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", required=True, help="Serial port for the P1150, e.g. COM15 or /dev/ttyACM0")
+    args = parser.parse_args()
 
-    if input(f"Did you remember to set the COM port?? Using {P1150_PORT} right now...").lower() in ["no", "n"]:
-        exit(1)
+    P1150_PORT = args.port
 
     logger.info(f"attempting connect on {P1150_PORT}...")
     connect_attempts = 2

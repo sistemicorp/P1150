@@ -51,12 +51,18 @@ python -m pip install -r requirements.txt
 In keeping with tradition, a "Hello, World" program, `p1150_hello.py`, is given as an example
 of a minimal program.  
 
-**BEFORE** you run `p1150_hello.py` (or any of the examples), you need to set the 
-COM port inside the code. The easiest way to find the COM port is to run `p1150_scan.py`.
+**BEFORE** you run `p1150_hello.py` (or any of the examples), you need to know the 
+COM port of the connected P1150. The easiest way to find the COM port is to run `p1150_scan.py`.
 
 
     >python p1150_scan.py
     P1150      : COM15, serial number FE823374
+
+
+Then run `p1150_hello.py` with the COM port as an argument,
+```commandline
+python p1150_hello.py --port COM15
+```
 
 
 `p1150_hello.py` performs the following tasks,
@@ -67,6 +73,10 @@ COM port inside the code. The easiest way to find the COM port is to run `p1150_
 * Take a single shot acquisition.
 * Plot acquisition.
 * Close
+
+NOTE: The first time P1150 is connected the firmware will be loaded and calibrated. This
+can take ~10 seconds.  But this happens only the first time you connect.  Subsequent
+connections will be faster.
 
 
 ## P1150 Common API
@@ -186,6 +196,17 @@ matches this repo.  Loading the AFI takes ~1 second.
 
 After the AFI is loaded the P1150 will enter calibration, which takes ~10 seconds.  After
 alibration the P1150 will be ready to take measurements.  Calibration is only performed once.
+
+### Updating This Repo
+
+There are some drivers that are built when this repo is installed the first time.  If you
+pull/update this repo, you should probably uninstall the drivers, and then re-install them.
+From your virtual environment, run the following commands,
+
+```commandline
+python -m pip uninstall cobs logdata_ext mp_serial_ext
+python -m pip install -r requirements.txt
+```
 
 > Portions  ©2025 Sistemi Corp - licensed under MIT
 > 

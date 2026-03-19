@@ -33,6 +33,7 @@ NOTES:
       is considered 0% error.
 """
 import sys
+import argparse
 import time
 import math
 from threading import Event
@@ -48,7 +49,7 @@ logger.setLevel(logging.INFO)
 
 # Set ports
 LEITHLEY2401_COM_NUM = "4"
-P1150_PORT = "COM3"  # use p1150_scan.py to determine this
+P1150_PORT = None
 P1150_ERROR_TOLERANCE_AMPS = 0.000001  # 1uA
 
 PLOT_COLOR_MAP = {
@@ -184,9 +185,11 @@ def all_close():
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", required=True, help="Serial port for the P1150, e.g. COM15 or /dev/ttyACM0")
+    args = parser.parse_args()
 
-    if input(f"Did you remember to set the COM port?? Using {P1150_PORT} right now...").lower() in ["no", "n"]:
-        exit(1)
+    P1150_PORT = args.port
 
     connect_attempts = 2
     while connect_attempts >= 1:
