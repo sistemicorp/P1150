@@ -30,7 +30,6 @@ from dataclasses import dataclass
 from threading import Lock, Event
 import numpy as np
 from . import uclog
-import traceback
 import cbor2
 import serial
 import serial.tools.list_ports
@@ -46,6 +45,7 @@ class StubLogger(object):
     def debug(self, *args, **kwargs): pass
     def warning(self, *args, **kwargs): pass
     def critical(self, *args, **kwargs): pass
+    def exception(self, *args, **kwargs): pass
 
 
 @dataclass(frozen=True)
@@ -222,12 +222,11 @@ class UCLogger(object):
 
         except serial.SerialException as e:
             self.connected = False
-            self.logger.error(e)
+            self.logger.exception(e)
 
         except Exception as e:
             self.connected = False
-            self.logger.error(e)
-            traceback.print_exc()
+            self.logger.exception(e)
             if self._ucLogServer:
                 self._ucLogServer.shutdown()
             self._ucLogServer = None
@@ -264,8 +263,8 @@ class UCLogger(object):
                 self.logger.info(f"== {lvl:5}:{file:30}:{line:4}: {msg}")
 
         except Exception as e:
-            self.logger.error(e)
             self.logger.error(item)
+            self.logger.exception(e)
 
     def _uclog_async(self, _item):
         """ Response handler to Port 1 destined for the GUI (not this Klass)
@@ -326,7 +325,7 @@ class UCLogger(object):
                 self.logger.error(f"frame count error at {self._adc_frame_count}")
 
         except Exception as e:
-            self.logger.error(e)
+            self.logger.exception(e)
             self.logger.error(f"last good frame {self._adc_frame_count}")
             self.logger.error(_item)
             return
@@ -424,7 +423,7 @@ class UCLogger(object):
                 self._ucLogServer[0](cbor2.dumps(payload))
 
             except Exception as e:
-                self.logger.error(e)
+                self.logger.exception(e)
                 return False, None
 
         # wait for the target to send response back

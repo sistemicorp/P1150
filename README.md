@@ -46,6 +46,8 @@ Then install Python requirements,
 python -m pip install -r requirements.txt
 ```
 
+(Note: if you update (pull) this repo, re-run the above command to install the latest version of the drivers)
+
 ## Run "hello, P1150"
 
 In keeping with tradition, a "Hello, World" program, `p1150_hello.py`, is given as an example
@@ -204,7 +206,6 @@ pull/update this repo, you should probably uninstall the drivers, and then re-in
 From your virtual environment, run the following commands,
 
 ```commandline
-python -m pip uninstall cobs logdata_ext mp_serial_ext
 python -m pip install -r requirements.txt
 ```
 

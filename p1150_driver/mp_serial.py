@@ -35,3 +35,5 @@ class MySerialManager:
         # Immediate native shutdown; no command queue signaling
         self._impl.shutdown()
 
+    def get_perf_stats(self) -> dict:
+        return self._impl.get_perf_stats()

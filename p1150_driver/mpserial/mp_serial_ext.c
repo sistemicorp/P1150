@@ -25,6 +25,8 @@
 
 #include <inttypes.h>
 
+#define CPU_SAMPLE_EVERY_N_LOOPS 512U
+
 static inline uint64_t now_ms(void) {
 #ifdef _WIN32
     return (uint64_t)GetTickCount64();
@@ -83,6 +85,23 @@ typedef struct {
     size_t   ring_head;    // Continuous write index
     size_t   ring_tail;    // Continuous read index
     size_t   ring_dropped;
+
+    // PERF counters (best-effort, low-overhead)
+    uint64_t perf_rx_bytes;
+    uint64_t perf_rx_frames;
+    uint64_t perf_cobs_decode_errors;
+    uint64_t perf_ring_push_dropped;
+    uint64_t perf_delivered_frames;
+    uint64_t perf_delivered_bytes;
+    uint64_t perf_tx_batches;
+    uint64_t perf_tx_bytes;
+    uint64_t perf_rx_idle_loops;
+
+    // CPU time counters (nanoseconds of actual thread CPU time)
+    uint64_t perf_cpu_reader_ns;
+    uint64_t perf_cpu_writer_ns;
+    uint64_t perf_cpu_deliver_ns;
+
 } SerialManagerObject;
 
 // Internal Helpers to abstract locking
@@ -110,13 +129,32 @@ static inline void ring_signal(SerialManagerObject* self) {
 #endif
 }
 
+static inline uint64_t thread_cpu_now_ns(void) {
+#ifdef _WIN32
+    FILETIME ct, et, kt, ut;
+    if (GetThreadTimes(GetCurrentThread(), &ct, &et, &kt, &ut)) {
+        ULARGE_INTEGER k, u;
+        k.LowPart = kt.dwLowDateTime; k.HighPart = kt.dwHighDateTime;
+        u.LowPart = ut.dwLowDateTime; u.HighPart = ut.dwHighDateTime;
+        return (uint64_t)((k.QuadPart + u.QuadPart) * 100ULL); // 100ns -> ns
+    }
+    return 0;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+        return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    }
+    return 0;
+#endif
+}
+
 // ----------------- Queue helpers -----------------
 
 // Fast-path delivery: assumes GIL is already held and we have a bound method
 static inline void deliver_frame_nogil(SerialManagerObject* self, const uint8_t* data, Py_ssize_t len) {
     PyObject* py_bytes = PyBytes_FromStringAndSize((const char*)data, len);
     if (py_bytes) {
-        PyObject* r = PyObject_CallFunctionObjArgs(self->q_out_put_nowait, py_bytes, NULL);
+        PyObject* r = PyObject_CallOneArg(self->q_out_put_nowait, py_bytes);
         if (!r) PyErr_Clear();
         Py_XDECREF(r);
         Py_DECREF(py_bytes);
@@ -177,6 +215,7 @@ static int ring_push(SerialManagerObject* self, const uint8_t* data, int len) {
 
     if (needed > available) {
         self->ring_dropped++;
+        self->perf_ring_push_dropped++;
         ring_unlock(self);
         return 0;
     }
@@ -209,8 +248,14 @@ static void deliver_batch_to_python(SerialManagerObject* self) {
 
     PyGILState_STATE g = PyGILState_Ensure();
     uint8_t frame_tmp[65536]; // Stack buffer for delivery
+    PyObject* py_batch = PyList_New(0);
+    if (!py_batch) {
+        PyErr_Clear();
+        PyGILState_Release(g);
+        return;
+    }
 
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 1024; i++) {
         uint16_t len = 0;
 
         ring_lock(self);
@@ -238,9 +283,31 @@ static void deliver_batch_to_python(SerialManagerObject* self) {
         self->ring_tail += (sizeof(uint16_t) + (size_t)len);
         ring_unlock(self);
 
-        deliver_frame_nogil(self, frame_tmp, (Py_ssize_t)len);
+        PyObject* py_bytes = PyBytes_FromStringAndSize((const char*)frame_tmp, (Py_ssize_t)len);
+        if (!py_bytes) {
+            PyErr_Clear();
+            continue;
+        }
+        if (PyList_Append(py_batch, py_bytes) != 0) {
+            PyErr_Clear();
+            Py_DECREF(py_bytes);
+            continue;
+        }
+        Py_DECREF(py_bytes);
+
+        self->perf_delivered_frames++;
+        self->perf_delivered_bytes += (uint64_t)len;
+
         if (!self->alive || !self->py_enabled) break;
     }
+
+    if (PyList_GET_SIZE(py_batch) > 0) {
+        PyObject* r = PyObject_CallOneArg(self->q_out_put_nowait, py_batch);
+        if (!r) PyErr_Clear();
+        Py_XDECREF(r);
+    }
+
+    Py_DECREF(py_batch);
     PyGILState_Release(g);
 }
 
@@ -249,9 +316,7 @@ static void deliver_batch_to_python(SerialManagerObject* self) {
 static void set_current_thread_highest_priority(void) {
 #ifdef _WIN32
     HANDLE h = GetCurrentThread();
-    if (!SetThreadPriority(h, THREAD_PRIORITY_TIME_CRITICAL)) {
-        SetThreadPriority(h, THREAD_PRIORITY_HIGHEST);
-    }
+    SetThreadPriority(h, THREAD_PRIORITY_HIGHEST);
     SetThreadPriorityBoost(h, FALSE);
 #else
     struct sched_param sp;
@@ -651,10 +716,19 @@ static DWORD WINAPI reader_thread_win(LPVOID param) {
     size_t  frame_len = 0;
 
     set_current_thread_highest_priority();
+    uint64_t cpu_prev_ns = thread_cpu_now_ns();
+    uint32_t cpu_sample_ctr = 0;
 
     int idle_backoff_ms = 0; // adaptive: 0, 1, 2, 3 (cap small to keep latency)
 
     while (self->alive) {
+        if (++cpu_sample_ctr >= CPU_SAMPLE_EVERY_N_LOOPS) {
+            uint64_t cpu_now_ns = thread_cpu_now_ns();
+            if (cpu_now_ns >= cpu_prev_ns) self->perf_cpu_reader_ns += (cpu_now_ns - cpu_prev_ns);
+            cpu_prev_ns = cpu_now_ns;
+            cpu_sample_ctr = 0;
+        }
+
         if (!self->h_port || self->h_port == INVALID_HANDLE_VALUE) break;
 
         // Non-blocking drain
@@ -671,6 +745,7 @@ static DWORD WINAPI reader_thread_win(LPVOID param) {
         if (n > 0) {
             // got data -> reset backoff
             idle_backoff_ms = 0;
+            self->perf_rx_bytes += (uint64_t)n;
 
             const uint8_t* p   = inbuf;
             const uint8_t* end = inbuf + n;
@@ -695,6 +770,9 @@ static DWORD WINAPI reader_thread_win(LPVOID param) {
                         int olen = cobs_decode(framebuf, frame_len, tmp, sizeof(tmp));
                         if (olen >= 0) {
                             (void)ring_push(self, tmp, olen);
+                            self->perf_rx_frames++;
+                        } else {
+                            self->perf_cobs_decode_errors++;
                         }
                     }
                     frame_len = 0;
@@ -718,43 +796,62 @@ static DWORD WINAPI reader_thread_win(LPVOID param) {
         } else {
             // Timeout: apply tiny adaptive backoff
             if (idle_backoff_ms < 3) idle_backoff_ms++;
+            self->perf_rx_idle_loops++;
             Sleep(idle_backoff_ms);
         }
     }
+    uint64_t cpu_end_ns = thread_cpu_now_ns();
+    if (cpu_end_ns >= cpu_prev_ns) self->perf_cpu_reader_ns += (cpu_end_ns - cpu_prev_ns);
     return 0;
 }
 
 
-    static DWORD WINAPI deliver_thread_win(LPVOID param) {
-        SerialManagerObject* self = (SerialManagerObject*)param;
-        while (self->alive) {
-            if (self->ring_tail == self->ring_head) {
-                if (self->h_ring_event) WaitForSingleObject(self->h_ring_event, 10);
-                else Sleep(1);
-                continue;
-            }
-            deliver_batch_to_python(self);
+static DWORD WINAPI deliver_thread_win(LPVOID param) {
+    SerialManagerObject* self = (SerialManagerObject*)param;
+    uint64_t cpu_prev_ns = thread_cpu_now_ns();
+    uint32_t cpu_sample_ctr = 0;
+
+    while (self->alive) {
+        if (++cpu_sample_ctr >= CPU_SAMPLE_EVERY_N_LOOPS) {
+            uint64_t cpu_now_ns = thread_cpu_now_ns();
+            if (cpu_now_ns >= cpu_prev_ns) self->perf_cpu_deliver_ns += (cpu_now_ns - cpu_prev_ns);
+            cpu_prev_ns = cpu_now_ns;
+            cpu_sample_ctr = 0;
         }
-        return 0;
+
+        if (self->ring_tail == self->ring_head) {
+            if (self->h_ring_event) WaitForSingleObject(self->h_ring_event, INFINITE);
+            else Sleep(1);
+            continue;
+        }
+        deliver_batch_to_python(self);
     }
 
-
+    uint64_t cpu_end_ns = thread_cpu_now_ns();
+    if (cpu_end_ns >= cpu_prev_ns) self->perf_cpu_deliver_ns += (cpu_end_ns - cpu_prev_ns);
+    return 0;
+}
 
 
 static DWORD WINAPI writer_thread_win(LPVOID param) {
     SerialManagerObject* self = (SerialManagerObject*)param;
     uint8_t buf[65536];
+    uint64_t cpu_prev_ns = thread_cpu_now_ns();
+    uint32_t cpu_sample_ctr = 0;
 
     while (self->alive) {
+        if (++cpu_sample_ctr >= CPU_SAMPLE_EVERY_N_LOOPS) {
+            uint64_t cpu_now_ns = thread_cpu_now_ns();
+            if (cpu_now_ns >= cpu_prev_ns) self->perf_cpu_writer_ns += (cpu_now_ns - cpu_prev_ns);
+            cpu_prev_ns = cpu_now_ns;
+            cpu_sample_ctr = 0;
+        }
+
         if (!self->py_enabled) break; // don't touch Python C-API after shutdown begins
 
         Py_ssize_t n = 0;
-        // Strictly non-blocking to avoid Python C-API during shutdown races
         int got = try_pop_write(self, buf, sizeof(buf), 0.001, &n);
         if (!got) {
-            // No data; yield
-            // NOTE: !! changing this to 1ms causes firmware download to be SLOW !!
-            Sleep(0);
             continue;
         }
 
@@ -773,8 +870,12 @@ static DWORD WINAPI writer_thread_win(LPVOID param) {
         // Single OS write for the batch
         if (total > 0) {
             (void)serial_write_win(self->h_port, buf, (size_t)total);
+            self->perf_tx_batches++;
+            self->perf_tx_bytes += (uint64_t)total;
         }
     }
+    uint64_t cpu_end_ns = thread_cpu_now_ns();
+    if (cpu_end_ns >= cpu_prev_ns) self->perf_cpu_writer_ns += (cpu_end_ns - cpu_prev_ns);
     return 0;
 }
 
@@ -788,8 +889,17 @@ static void* reader_thread_posix(void* param) {
     size_t  frame_len = 0;
 
     set_current_thread_highest_priority();
+    uint64_t cpu_prev_ns = thread_cpu_now_ns();
+    uint32_t cpu_sample_ctr = 0;
 
     while (self->alive) {
+        if (++cpu_sample_ctr >= CPU_SAMPLE_EVERY_N_LOOPS) {
+            uint64_t cpu_now_ns = thread_cpu_now_ns();
+            if (cpu_now_ns >= cpu_prev_ns) self->perf_cpu_reader_ns += (cpu_now_ns - cpu_prev_ns);
+            cpu_prev_ns = cpu_now_ns;
+            cpu_sample_ctr = 0;
+        }
+
         fd_set read_fds;
         FD_ZERO(&read_fds);
         if (self->fd < 0) break;
@@ -818,6 +928,7 @@ static void* reader_thread_posix(void* param) {
             // Error or EOF, either way, we can't continue.
             break;
         }
+        self->perf_rx_bytes += (uint64_t)n;
 
         const uint8_t* p   = inbuf;
         const uint8_t* end = inbuf + n;
@@ -843,6 +954,9 @@ static void* reader_thread_posix(void* param) {
                     int olen = cobs_decode(framebuf, frame_len, tmp, sizeof(tmp));
                     if (olen >= 0) {
                         ring_push(self, tmp, olen);
+                        self->perf_rx_frames++;
+                    } else {
+                        self->perf_cobs_decode_errors++;
                     }
                 }
                 frame_len = 0;
@@ -854,25 +968,36 @@ static void* reader_thread_posix(void* param) {
             if (!self->alive) break;
         }
     }
+    uint64_t cpu_end_ns = thread_cpu_now_ns();
+    if (cpu_end_ns >= cpu_prev_ns) self->perf_cpu_reader_ns += (cpu_end_ns - cpu_prev_ns);
     return NULL;
 }
 
 static void* deliver_thread_posix(void* param) {
     SerialManagerObject* self = (SerialManagerObject*)param;
+    uint64_t cpu_prev_ns = thread_cpu_now_ns();
+    uint32_t cpu_sample_ctr = 0;
+
     while (self->alive) {
+        if (++cpu_sample_ctr >= CPU_SAMPLE_EVERY_N_LOOPS) {
+            uint64_t cpu_now_ns = thread_cpu_now_ns();
+            if (cpu_now_ns >= cpu_prev_ns) self->perf_cpu_deliver_ns += (cpu_now_ns - cpu_prev_ns);
+            cpu_prev_ns = cpu_now_ns;
+            cpu_sample_ctr = 0;
+        }
+
         pthread_mutex_lock(&self->ring_mx);
         while (self->alive && self->ring_head == self->ring_tail) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 10000000; // 10ms wait
-            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-            pthread_cond_timedwait(&self->ring_cond, &self->ring_mx, &ts);
+            pthread_cond_wait(&self->ring_cond, &self->ring_mx);
         }
         pthread_mutex_unlock(&self->ring_mx);
 
         if (!self->alive) break;
         deliver_batch_to_python(self);
     }
+
+    uint64_t cpu_end_ns = thread_cpu_now_ns();
+    if (cpu_end_ns >= cpu_prev_ns) self->perf_cpu_deliver_ns += (cpu_end_ns - cpu_prev_ns);
     return NULL;
 }
 
@@ -880,15 +1005,25 @@ static void* deliver_thread_posix(void* param) {
 static void* writer_thread_posix(void* param) {
     SerialManagerObject* self = (SerialManagerObject*)param;
     uint8_t buf[65536];
+    uint64_t cpu_prev_ns = thread_cpu_now_ns();
+    uint32_t cpu_sample_ctr = 0;
 
     while (self->alive) {
+        if (++cpu_sample_ctr >= CPU_SAMPLE_EVERY_N_LOOPS) {
+            uint64_t cpu_now_ns = thread_cpu_now_ns();
+            if (cpu_now_ns >= cpu_prev_ns) self->perf_cpu_writer_ns += (cpu_now_ns - cpu_prev_ns);
+            cpu_prev_ns = cpu_now_ns;
+            cpu_sample_ctr = 0;
+        }
+
         if (!self->py_enabled) break;
 
         Py_ssize_t n = 0;
-        int got = try_pop_write(self, buf, sizeof(buf), 0.001, &n); // non-blocking
+        // Slightly longer wait lowers idle CPU while keeping low latency for infrequent TX
+        int got = try_pop_write(self, buf, sizeof(buf), 0.005, &n);
         if (!got) {
-            // No data; yield briefly
-            usleep(500);
+            // Rare TX workload: sleep a little instead of spin-yield
+            usleep(1000);
             continue;
         }
 
@@ -905,11 +1040,14 @@ static void* writer_thread_posix(void* param) {
 
         if (self->fd >= 0 && total > 0) {
             (void)serial_write_posix(self->fd, buf, (size_t)total);
+            self->perf_tx_batches++;
+            self->perf_tx_bytes += (uint64_t)total;
         }
     }
+    uint64_t cpu_end_ns = thread_cpu_now_ns();
+    if (cpu_end_ns >= cpu_prev_ns) self->perf_cpu_writer_ns += (cpu_end_ns - cpu_prev_ns);
     return NULL;
 }
-
 #endif
 
 // ----------------- Python type: SerialManager -----------------
@@ -1000,6 +1138,19 @@ static int SerialManager_init(SerialManagerObject* self, PyObject* args, PyObjec
     self->ring_tail = 0;
     self->ring_dropped = 0;
 
+    self->perf_rx_bytes = 0;
+    self->perf_rx_frames = 0;
+    self->perf_cobs_decode_errors = 0;
+    self->perf_ring_push_dropped = 0;
+    self->perf_delivered_frames = 0;
+    self->perf_delivered_bytes = 0;
+    self->perf_tx_batches = 0;
+    self->perf_tx_bytes = 0;
+    self->perf_rx_idle_loops = 0;
+    self->perf_cpu_reader_ns = 0;
+    self->perf_cpu_writer_ns = 0;
+    self->perf_cpu_deliver_ns = 0;
+
     if (!self->ring_data) {
         PyErr_SetString(PyExc_MemoryError, "ring buffer allocation failed");
         return -1;
@@ -1028,6 +1179,41 @@ static int SerialManager_init(SerialManagerObject* self, PyObject* args, PyObjec
     return 0;
 }
 
+static PyObject* SerialManager_get_perf_stats(SerialManagerObject* self, PyObject* Py_UNUSED(ignored)) {
+    PyObject* d = PyDict_New();
+    if (!d) return NULL;
+
+    PyDict_SetItemString(d, "rx_bytes", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_rx_bytes));
+    PyDict_SetItemString(d, "rx_frames", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_rx_frames));
+    PyDict_SetItemString(d, "cobs_decode_errors", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_cobs_decode_errors));
+    PyDict_SetItemString(d, "ring_push_dropped", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_ring_push_dropped));
+    PyDict_SetItemString(d, "ring_dropped", PyLong_FromUnsignedLongLong((unsigned long long)self->ring_dropped));
+    PyDict_SetItemString(d, "delivered_frames", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_delivered_frames));
+    PyDict_SetItemString(d, "delivered_bytes", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_delivered_bytes));
+    PyDict_SetItemString(d, "tx_batches", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_tx_batches));
+    PyDict_SetItemString(d, "tx_bytes", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_tx_bytes));
+    PyDict_SetItemString(d, "rx_idle_loops", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_rx_idle_loops));
+    PyDict_SetItemString(d, "cpu_reader_ns", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_cpu_reader_ns));
+    PyDict_SetItemString(d, "cpu_writer_ns", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_cpu_writer_ns));
+    PyDict_SetItemString(d, "cpu_deliver_ns", PyLong_FromUnsignedLongLong((unsigned long long)self->perf_cpu_deliver_ns));
+
+
+    self->perf_rx_bytes = 0;
+    self->perf_rx_frames = 0;
+    self->perf_cobs_decode_errors = 0;
+    self->perf_ring_push_dropped = 0;
+    self->ring_dropped = 0;
+    self->perf_delivered_frames = 0;
+    self->perf_delivered_bytes = 0;
+    self->perf_tx_batches = 0;
+    self->perf_tx_bytes = 0;
+    self->perf_rx_idle_loops = 0;
+    self->perf_cpu_reader_ns = 0;
+    self->perf_cpu_writer_ns = 0;
+    self->perf_cpu_deliver_ns = 0;
+
+    return d;
+}
 
 static PyObject* SerialManager_start(SerialManagerObject* self, PyObject* Py_UNUSED(ignored)) {
 #ifdef _WIN32
@@ -1121,6 +1307,7 @@ static PyMethodDef SerialManager_methods[] = {
     {"start", (PyCFunction)SerialManager_start, METH_NOARGS, "Start I/O threads"},
     {"is_running", (PyCFunction)SerialManager_is_running, METH_NOARGS, "Return whether the I/O threads are running"},
     {"shutdown", (PyCFunction)SerialManager_shutdown, METH_NOARGS, "Stop threads and close the serial port"},
+    {"get_perf_stats", (PyCFunction)SerialManager_get_perf_stats, METH_NOARGS, "Get performance counters"},
     {NULL, NULL, 0, NULL}
 };
 

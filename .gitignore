@@ -24,3 +24,7 @@ p1150_driver/mpserial/mp_serial_ext.egg-info/
 p1150_driver/mpserial/build/
 
 *.so
+
+p1150_driver/cobs_c/build/
+
+p1150_driver/logdata_c/build/

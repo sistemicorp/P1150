@@ -32,7 +32,7 @@ logdata_ext = Extension(
 
 setup(
     name="logdata_ext",
-    version="0.2.0",
+    version="0.3.0",
     description="C extension for log data processing with bundled libcbor.",
     ext_modules=[logdata_ext],
 )

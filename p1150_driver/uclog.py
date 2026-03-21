@@ -101,7 +101,7 @@ class LogDecode(object):
       else:
         r = item
     except Exception as e:
-      logging.error("exception ",exc_info=1)
+      logging.exception(e)
       r = item
     if self.on_data:
       self.on_data(r)
@@ -170,11 +170,17 @@ class Serial(threading.Thread):
         try:
           frame = self.q_out.get(timeout=0.01)
           if self.on_data:
-            self.on_data(frame)
+            if isinstance(frame, list):
+              for f in frame:
+                self.on_data(f)
+            else:
+              self.on_data(frame)
+
         except queue.Empty:
           pass
+
         except Exception as e:
-          logging.error(f"exception {e}", exc_info=1)
+          logging.exception(f"exception {e}")
 
       # Ensure native shutdown if still present
       if self.msm and self.msm.is_running():
@@ -183,7 +189,6 @@ class Serial(threading.Thread):
         self.msm = None
 
       logging.info("Serial run loop stopped")
-
 
 
 # Utitlity to chain a list of processes together
