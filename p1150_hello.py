@@ -2,8 +2,6 @@
 """
 MIT License
 
-Copyright (c) 2025 Sistemi Corp
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -80,7 +78,6 @@ def _cb_p1150_async(data: dict) -> None:
     logger.debug(f"p1150 async: {data}")
 
 
-# Must use __main__ due to multiprocessing within P1150 driver
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", required=True, help="Serial port for the P1150, e.g. COM15 or /dev/ttyACM0")

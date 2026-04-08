@@ -2,8 +2,6 @@
 """
 MIT License
 
-Copyright (c) 2025 Sistemi Corp
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -32,51 +30,49 @@ import sys
 from p1150_driver import P1150
 import serial.tools.list_ports
 
-# Must use __main__ due to multiprocessing within P1150 driver
-if __name__ == '__main__':
 
-    if sys.platform.startswith("linux"):
-        ports_to_search = [p.device for p in serial.tools.list_ports.comports() if "ttyACM" in p.device]
+if sys.platform.startswith("linux"):
+    ports_to_search = [p.device for p in serial.tools.list_ports.comports() if "ttyACM" in p.device]
 
-    elif sys.platform == "darwin":
-        ports_to_search = [p.device for p in serial.tools.list_ports.comports() if "cu.usb" in p.device]
+elif sys.platform == "darwin":
+    ports_to_search = [p.device for p in serial.tools.list_ports.comports() if "cu.usb" in p.device]
 
-    elif sys.platform == "win32":
-        ports_to_search = [p.device for p in serial.tools.list_ports.comports()]
+elif sys.platform == "win32":
+    ports_to_search = [p.device for p in serial.tools.list_ports.comports()]
+
+else:
+    print(f"Unknown platform {sys.platform}")
+    ports_to_search = [p.device for p in serial.tools.list_ports.comports()]
+
+#print(f"ports_to_search {ports_to_search}")
+p1150s_found = {}
+
+for port in ports_to_search:
+
+    try:
+        p1150 = P1150.P1150(port=port)
+
+    except Exception as e:
+        print(e)
+        print(f"{port} is not a P1150")
+        p1150s_found[port] = {"s": False}  # s(uccess)
+        continue
+
+    # check if the P1125 is reachable
+    success, result = p1150.ping()
+    #print(f"Ping: {result}")
+    if success:
+        # attached device is a P1150, it responded to our PING, run some checks
+        p1150s_found[port] = result[-1]
 
     else:
-        print(f"Unknown platform {sys.platform}")
-        ports_to_search = [p.device for p in serial.tools.list_ports.comports()]
+        #print(f"{port} is not a P1150")
+        p1150s_found[port] = {"s": False}  # s(uccess)
 
-    #print(f"ports_to_search {ports_to_search}")
-    p1150s_found = {}
+    p1150.close()
 
-    for port in ports_to_search:
-
-        try:
-            p1150 = P1150.P1150(port=port)
-
-        except Exception as e:
-            print(e)
-            print(f"{port} is not a P1150")
-            p1150s_found[port] = {"s": False}  # s(uccess)
-            continue
-
-        # check if the P1125 is reachable
-        success, result = p1150.ping()
-        #print(f"Ping: {result}")
-        if success:
-            # attached device is a P1150, it responded to our PING, run some checks
-            p1150s_found[port] = result[-1]
-
-        else:
-            #print(f"{port} is not a P1150")
-            p1150s_found[port] = {"s": False}  # s(uccess)
-
-        p1150.close()
-
-    # print out found P1150s
-    for port, p1150 in p1150s_found.items():
-        if p1150["s"] is True:
-            msg = f"P1150      : {port}, serial number {p1150['serial_hash']}"
-            print(msg)
+# print out found P1150s
+for port, p1150 in p1150s_found.items():
+    if p1150["s"] is True:
+        msg = f"P1150      : {port}, serial number {p1150['serial_hash']}"
+        print(msg)
