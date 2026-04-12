@@ -20,29 +20,17 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-A minimal program to scan for P1150 ports.  Note that non-P1150
-devices using a serial port will also be subject to a 'ping' from this
-program, which may cause some devices to error.
+P1150 bootloader (a51) and application (a43) will respond to a 'ping'.
 
-P1150 bootloader (a53) and application (a43) will respond to a 'ping'.
+NOTE: This script is deprecated since support to connect via serial number
+      is implemented.  This script will be removed in a future release.
+
 """
 import sys
 from p1150_driver import P1150
 import serial.tools.list_ports
 
-
-if sys.platform.startswith("linux"):
-    ports_to_search = [p.device for p in serial.tools.list_ports.comports() if "ttyACM" in p.device]
-
-elif sys.platform == "darwin":
-    ports_to_search = [p.device for p in serial.tools.list_ports.comports() if "cu.usb" in p.device]
-
-elif sys.platform == "win32":
-    ports_to_search = [p.device for p in serial.tools.list_ports.comports()]
-
-else:
-    print(f"Unknown platform {sys.platform}")
-    ports_to_search = [p.device for p in serial.tools.list_ports.comports()]
+ports_to_search = P1150.get_port_from_sn(None, list_all=True)
 
 #print(f"ports_to_search {ports_to_search}")
 p1150s_found = {}

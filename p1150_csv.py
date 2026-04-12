@@ -87,10 +87,10 @@ def _cb_p1150_async(data: dict) -> None:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", required=True, help="Serial port for the P1150, e.g. COM15 or /dev/ttyACM0")
+    parser.add_argument("--sn", required=True, help="Serial Number for the P1150")
     args = parser.parse_args()
 
-    P1150_PORT = args.port
+    P1150_PORT = P1150.get_port_from_sn(args.sn)
 
     logger.info(f"attempting connect on {P1150_PORT}...")
     connect_attempts = 2
@@ -110,7 +110,7 @@ if __name__ == '__main__':
             logger.info(e)
             exit(1)
 
-        success, p1150_details = p1150.ez_connect()
+        success, p1150_details = p1150.ez_connect(args.sn)
         if not success:
             logger.error(f"ez_connect {P1150_PORT}: {p1150_details}")
             p1150.close()

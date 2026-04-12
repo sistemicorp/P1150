@@ -48,6 +48,28 @@ class StubLogger(object):
     def exception(self, *args, **kwargs): pass
 
 
+def get_port_from_sn(sn: str | None = None, list_all: bool = False) -> str | None | list:
+    """ get port from serial number"""
+    USB_STM_VID = 0x0483
+    USB_SISTEMI_PID = 0xa430
+    all_com_ports = [p for p in serial.tools.list_ports.comports()]
+
+    if list_all:
+        return [p.device for p in all_com_ports if p.vid == USB_STM_VID and
+                       p.pid == USB_SISTEMI_PID]
+
+    if sn is None:
+        raise ValueError("sn must be provided")
+
+    p1150_port = [p.device for p in all_com_ports if p.vid == USB_STM_VID and
+                       p.pid == USB_SISTEMI_PID and p.serial_number == sn]
+
+    if not p1150_port:
+        return None
+
+    return p1150_port[0]
+
+
 @dataclass(frozen=True)
 class P1150API:
     """ P1150 Constants
@@ -1173,11 +1195,12 @@ class P1150(UCLogger):
         with self._lock:
             return self.uclog_response(cmd)
 
-    def ez_connect(self, progress_callback=None) -> tuple[bool, dict | None]:
+    def ez_connect(self, sn, progress_callback=None) -> tuple[bool, dict | None]:
         """ Connect to P1150, upload AFI if necessary, Calibrate if necessary
         - hides all the details of connecting to P1150
         - if success False, the client should close()
 
+        :param sn: <serial number>
         :param progress_callback: <function> called with progress percentage and message
                                   def _connect_progress(progress: float, msg: str) -> None:
         :return: success <True/False>, response <dict>
@@ -1240,11 +1263,10 @@ class P1150(UCLogger):
 
             # wait for host OS to see the COM port return
             start = timer()
-            ports_connected = [p.device for p in serial.tools.list_ports.comports()]
             found = False
             while timer() - start < self.TIME_RECONNECT_AFTER_FWLOAD_S:
-                ports_connected = [p.device for p in serial.tools.list_ports.comports()]
-                if self._port in ports_connected:
+                self._port = get_port_from_sn(sn)
+                if self._port:
                     self.logger.info(f"port {self._port} re-found")
                     found = True
                     break
@@ -1252,9 +1274,10 @@ class P1150(UCLogger):
                 sleep(0.05)
 
             if not found:
-                self.logger.error(f"P1150 {self._port} not FOUND in {ports_connected} - timeout")
+                self.logger.error(f"P1150 {self._port} not FOUND - timeout")
                 return False, {"ERROR": f"P1150 not found on port {self._port} after FW update"}
 
+            super(UCLogger, self).__init__()
             # wait for reconnect, although the port is found, sometimes more delay is required
             sleep(1)
             # client must retry to re-connect to application FW (a43)

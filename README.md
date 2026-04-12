@@ -7,6 +7,9 @@ The P1150 Driver here is the same one used for the P1150 GUI available at www.si
 You should be familiar with the GUI and your DUT current profile before attempting to automate
 measurements.
 
+Create a private clone of this repo and add your own automation scripts.  A fork will create a
+public repo, and you probably don't want that.
+
 
 ## Installing
 
@@ -19,7 +22,7 @@ NOTE: https://stackoverflow.com/questions/77364550/attributeerror-module-pkgutil
 ### Requirements
 
 
-It is recommended to install the project into a Python virtual environment so the dependencies
+It is recommended (but not required) to install the project into a Python virtual environment so the dependencies
 stay isolated from your system Python.
 
 Create and activate a virtual environment:
@@ -40,7 +43,7 @@ source .venv/bin/activate
 ```
 
 
-Then install Python requirements,
+Then install Python requirements.
 
 ```commandline
 python -m pip install -r requirements.txt
@@ -51,19 +54,10 @@ python -m pip install -r requirements.txt
 ## Run "hello, P1150"
 
 In keeping with tradition, a "Hello, World" program, `p1150_hello.py`, is given as an example
-of a minimal program.  
+of a minimal program.  Find the serial bumber of your P1150 on the back of the P1150.
 
-**BEFORE** you run `p1150_hello.py` (or any of the examples), you need to know the 
-COM port of the connected P1150. The easiest way to find the COM port is to run `p1150_scan.py`.
-
-
-    >python p1150_scan.py
-    P1150      : COM15, serial number FE823374
-
-
-Then run `p1150_hello.py` with the COM port as an argument,
 ```commandline
-python p1150_hello.py --port COM15
+python p1150_hello.py --sn FE823374
 ```
 
 
@@ -81,12 +75,20 @@ can take ~10 seconds.  But this happens only the first time you connect.  Subseq
 connections will be faster.
 
 
-## P1150 Common API
+# Support
+
+Send an email to info@sistemi.ca for support.  Include a full log along with a description of the problem.
+Confirm that you are using the latest version of the driver.  If you have cloned the repo, you
+will have to manually update the driver files.  Its not enough to copy the files, you must also
+rebuild them with the `pip` command shown above.
+
+
+# P1150 Common API
 
 
     
     ping(self) -> (bool, dict):
-    ez_connect(self) -> (bool, dict):
+    ez_connect(self, sn) -> (bool, dict):
     status(self) -> (bool, dict):
 
     calibrate(self, force: bool=False, blocking: bool=True) -> (bool, dict):
@@ -109,7 +111,7 @@ connections will be faster.
     set_cal_sweep(self, sweep: bool) -> (bool, dict):
 
 
-### Usage
+## Usage
     
 
 P1150 API calls have this pattern,
@@ -209,6 +211,6 @@ From your virtual environment, run the following commands,
 python -m pip install -r requirements.txt
 ```
 
-> Portions  ©2025 Sistemi Corp - licensed under MIT
+> Portions  ©2026 Sistemi Corp - licensed under MIT
 > 
-> Portions  ©2025 Unit Circle Inc - licensed under Apache 2.0
+> Portions  ©2026 Unit Circle Inc - licensed under Apache 2.0
