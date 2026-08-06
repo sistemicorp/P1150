@@ -59,10 +59,10 @@ wire to the P1150's A0, D0 or D1 input, plus two lines of firmware around the
 code being measured, turns every question of the form "what does this feature
 cost" from an estimate into a measurement.  It is worth raising with the
 developer early, before a session is spent inferring boundaries from a current
-trace.  p1150_marker_guide has the firmware and wiring detail; profile 5 below
+trace.  p1150_marker_guide has the firmware and wiring detail; profile 6 below
 is the short version.
 
-## The seven profiles worth knowing
+## The nine profiles worth knowing
 
 ### 1. Sleep / quiescent floor
 What: the current when the target has nothing to do.  Usually microamps.
@@ -75,17 +75,64 @@ Wrong looks like: floor sitting in the milliamps.  Sleep was never entered, or a
      pin) is still enabled.  On most targets this is the single largest
      battery-life bug, and it is invisible without a measurement.
 
-### 2. Boot / power-on inrush
-What: the surge as the target powers up, plus the whole boot sequence.
+### 2. Boot sequence
+What: the whole boot, from power-up to the target settling into its main loop.
 How: p1150_measure(duration_s=..., connect_probe_during=True).  This starts
      streaming *before* closing the probe relay, so the target is powered up
      while already being measured.  A normal capture starts after power is
      already applied and misses the entire event.
 Read: peak_ma, and total charge_mah for the boot.
-Wrong looks like: a peak that trips OVC, or a boot that costs more charge than
-     hours of sleep -- which matters a lot for a device that wakes cold often.
+Wrong looks like: a boot that costs more charge than hours of sleep -- which
+     matters a lot for a device that wakes cold often.
+Note: this does NOT reliably capture the inrush surge in the first
+     millisecond of power-up.  Logger mode re-arms between chunks and the relay
+     closes in one of those gaps, so a surge that brief lands in dead time as
+     often as not.  Use profile 3b for the surge itself.
 
-### 3. Periodic wake-up (BLE advertising, sensor poll, timer tick)
+### 3. Inrush surge from a switched rail
+What: the amps drawn for a millisecond or two whenever firmware enables an LDO
+     or SMPS to power a sub-circuit.  At the instant of enable the decoupling
+     capacitance downstream is discharged, and a discharged capacitor is a
+     short -- so the current is limited only by resistance in the path.  This
+     repeats on every duty cycle for the life of the product.
+How: nothing special.  Capture the target doing its normal work
+     (p1150_measure(30, ...) or capture_start/capture_stop) and every capture is
+     screened for it automatically.  A rail that is only enabled by some feature
+     needs that feature exercised, so ask the developer to trigger it.
+Read: p1150_inrush_check(run_id) -- peak, rate, per-switch cost, and the sag a
+     real cell would suffer.  The charge in a surge is negligible; this is a
+     reliability finding, not a battery-life one.
+Why it matters even when nothing looks wrong: the P1150 is a low-impedance
+     supply and simply delivers the surge.  A battery cannot, and sags by
+     (current x internal resistance) instead.  That sag is what resets the
+     target, and a cell's internal resistance is at its worst when aged, cold
+     and near flat -- so the failure appears in the field and not on the bench.
+     The fix is a regulator with soft-start, which is a schematic decision:
+     enormously cheaper to find now than after the boards exist.  Read
+     p1150_inrush_guide before diagnosing one.
+Wrong looks like: reporting a duty-cycled wake burst as an inrush.  A radio
+     waking for 6 ms at 300 mA is a load being driven, not capacitance
+     charging; the analysis separates them on width and on how far the peak
+     stands above the settled current, and calls that one a duty cycle.
+
+### 3b. Power-on inrush surge
+What: the same event at the instant the battery is first connected.
+How: p1150_inrush_test().  It arms a current-triggered one-shot capture while
+     the probe is still open, and only then closes the relay, so the instrument
+     is already waiting when the surge arrives.  It power-cycles the target;
+     say so first.
+Read: the peak and the sag, as above.
+Important: in a shipped product the battery is fitted once and left in, so this
+     event happens once in the device's life and is usually acceptable.  It is
+     ranked below profile 3 for that reason.  It does matter if the battery is
+     user-replaceable, if the pack's protection FET can re-connect under load,
+     if a charger can hot-plug the rail, or if the cell is a coin cell.
+Wrong looks like: an OVC trip during the test -- which is not a failed
+     measurement but the finding itself, and means the peak is above the limit
+     and unknown.  Also: concluding from a clean result here that the target has
+     no inrush problem.  It says nothing about switched rails.
+
+### 4. Periodic wake-up (BLE advertising, sensor poll, timer tick)
 What: a low floor with regular bursts.  The dominant profile for battery
      devices, and the one where average current alone is misleading.
 How: capture at least 10 full periods.  Advertising at 1 s intervals needs
@@ -98,7 +145,7 @@ Wrong looks like: fewer than ~5 events detected (capture was too short), or
      zero events (threshold sat above the bursts -- pass an explicit
      threshold_ma between the floor and the peak).
 
-### 4. A single event on demand (radio TX, flash write, sensor read)
+### 5. A single event on demand (radio TX, flash write, sensor read)
 What: one burst, examined closely.
 How: p1150_capture_single(timebase=..., trigger_ma=<between floor and peak>).
      Pick the shortest timebase that still contains the whole event: 10 ms for a
@@ -107,7 +154,7 @@ How: p1150_capture_single(timebase=..., trigger_ma=<between floor and peak>).
 Wrong looks like: a trigger that never fires (level above the actual peak), or
      an event clipped at the edge of the window (timebase too short).
 
-### 5. A specific piece of code, marked by the target itself
+### 6. A specific piece of code, marked by the target itself
 What: current over exactly the region a GPIO on the target marks -- one
      function, one driver, one feature -- rather than over whatever the trace
      happens to show.
@@ -120,14 +167,14 @@ How: ask the developer for a spare GPIO and a wire to A0, D0 or D1; have the
 Read: charge_uah and excess_uah per occurrence.  Excess is the cost
      attributable to the marked code; raw charge also contains the idle floor
      the target was drawing anyway.
-Why bother: profile 3 infers where an event starts from a current threshold,
+Why bother: profile 4 infers where an event starts from a current threshold,
      which only works when the work stands out above the floor and shifts a
      little between runs.  A marker states the boundaries, so quiet work is
      measurable too and two builds are compared over provably the same path.
 Wrong looks like: zero occurrences -- the code did not run, the lead is on the
      wrong pin, or the polarity is inverted.  p1150_aux_check says which.
 
-### 6. Scripted regression run
+### 7. Scripted regression run
 What: the same fixed workload, before and after a code change.
 How: capture_start(label="baseline") -> run the workload -> capture_stop.
      Change code, flash, then repeat with label="candidate".  Keep the duration
@@ -136,7 +183,7 @@ How: capture_start(label="baseline") -> run the workload -> capture_stop.
      accumulated mAh over a longer run is trivially larger and means nothing.
 Read: p1150_compare(baseline, candidate).
 
-### 7. Charging the battery
+### 8. Charging the battery
 What: confirming the target actually charges the pack, and how fast.
 Setup: the P1150 stays where the battery is (p1150_power_on as usual), and the
      developer then applies the target's charging source -- USB, wall adapter,
@@ -208,6 +255,277 @@ current, and proposes a likely cause.  The causes map to distinct fixes:
   at p1150_segment or p1150_events before concluding anything.
 - A threshold-detected event is only as good as the threshold.  If the answer
   matters, mark the region with a GPIO instead -- see p1150_marker_guide.
+- The P1150 is not a battery.  It holds its output voltage where a cell would
+  sag, so a target that pulls a large surge looks fine here and browns out in
+  the field.  If a capture reports an inrush warning, do not dismiss it because
+  the target ran perfectly during the measurement -- read p1150_inrush_guide.
+"""
+
+
+INRUSH_GUIDE = """\
+# Inrush current
+
+## What it is
+The surge a load draws in the instant it is energised, before anything reaches
+a steady state.  Bulk capacitance charging is the usual source: a capacitor
+presented with a voltage step draws I = C dV/dt, limited only by how much
+resistance is in the way.  Across a low-impedance supply and a short lead, that
+is amps for a millisecond or two.  Regulators starting, motors, LED drivers,
+relays and RF power amplifiers do the same thing for their own reasons.
+
+The defining shape is: a low current state, a very brief excursion far above it,
+then a settled state that is low again.  Here that means a peak over 1 A lasting
+under 4 ms, standing well above whatever the target settles at afterwards.  The
+ratio is what makes it interesting, not the absolute number -- 1.5 A into a
+device that then runs at 1.2 A is ordinary, and 1.5 A into one that then runs at
+3 mA is a design that will fail in the field.
+
+## Two kinds, and they are not equally important
+Get this distinction right before reporting anything, because it decides whether
+the finding is a curiosity or a design fault.
+
+### At power-up -- usually acceptable
+The surge when the battery is first connected.  In a real product that happens
+ONCE, on the assembly line: the cell is soldered or clipped in and stays there.
+The device is never again in the state of having a discharged bulk capacitance
+and a battery being connected to it.  So a surge that only happens then is
+usually fine, and treating it as a defect is crying wolf.
+
+It still matters when:
+  * the battery is user-replaceable, so the event repeats at every change;
+  * the pack's protection FET can trip and re-connect under load, which repeats
+    it too -- and a surge big enough to trip the P1150's limit is big enough to
+    trip a protection IC;
+  * a charger or a dock can hot-plug the rail;
+  * the product is a coin-cell design, where even the once-only event may fail
+    to start the device at all.
+
+### While the target is running -- the real problem
+A rail being switched.  Power-gating an LDO or an SMPS to save current is
+completely standard in a battery product: firmware enables the regulator when
+the sub-circuit is needed and disables it after.  At the instant of enable, the
+decoupling capacitance downstream of that regulator is discharged, and a
+discharged capacitor is a short circuit -- so the current is limited only by
+resistance in the path, which is to say it goes as high as the source will
+allow.  At t=0 the demand is effectively infinite.
+
+That repeats every duty cycle, for the life of the product, at every temperature
+and state of charge.  It is the same electrical event as the power-up surge, but
+it happens ten thousand times instead of once, and it happens in the field on a
+cold aged cell rather than on the bench on a fresh one.
+
+The server ranks a recurring surge above a power-up surge everywhere, and
+reports which kind it found as `recurrence`: ONCE_AT_POWER_UP, or WHILE_RUNNING.
+
+## Why the developer cannot see it, and you can
+Almost nobody has an instrument at the battery terminals, so an inrush problem
+produces no evidence at all -- just a device that occasionally fails to start,
+or resets under conditions nobody can reproduce.
+
+The P1150 is a low-impedance supply.  Asked for 2 A for a millisecond, it
+delivers 2 A and holds its output voltage steady, so the current is visible on
+the trace and the target behaves perfectly.  A battery cannot do that.  It has
+internal resistance, so it responds to the same demand by sagging:
+
+    voltage lost at the terminals = surge current x cell internal resistance
+
+A 2 A surge into a cell with 500 mOhm of internal resistance is a 1 V drop, for
+as long as the surge lasts.  If that takes the rail below the target's brown-out
+threshold, the target resets -- and it resets *during power-up*, which usually
+means it tries again, browns out again, and sits in a boot loop that looks
+nothing like a power problem.
+
+This is why the same board behaves differently on the bench and in the field:
+
+  * A cell's internal resistance rises as it ages.
+  * It rises sharply in the cold -- often 2-5x from +20 C to -10 C.
+  * It rises as the cell discharges, worst near the end of its usable charge.
+
+Those three stack.  A cell that is 100 mOhm new, warm and full can be well over
+1 Ohm when aged, cold and nearly flat.  A design with an inrush problem passes
+every bench test on a fresh cell at room temperature and then fails on cold
+mornings, on old units, at the end of the battery -- which is precisely the
+pattern of the hardest field returns to diagnose.  Inrush is a frequent root
+cause of it.
+
+So this is worth raising unprompted.  A developer profiling battery life is not
+looking for it, will not ask about it, and has no way to find it.
+
+## Measuring it
+
+### The recurring kind -- just capture normally
+Every capture this server takes is screened for inrush automatically, so an
+ordinary p1150_measure or capture_start/capture_stop of the target doing its
+normal work will report a switched rail without anyone asking.  That is
+deliberate: nobody thinks to ask, and it is the finding most worth having.
+
+To go looking for it on purpose:
+
+  1. Capture the target running its normal duty cycle, long enough to contain
+     several cycles -- p1150_measure(30, "duty-cycle") or capture_start/stop
+     around a scripted workload.  A rail that is only enabled when some feature
+     runs needs that feature exercised, so ask the developer to trigger it.
+  2. p1150_inrush_check(run_id) for the full analysis: the rate, the per-switch
+     cost, the sag, and the remedies.
+  3. p1150_capture_single(timebase="TBASE_SPAN_10MS", trigger_ma=<half the
+     peak>, position="TRIG_POS_CENTER") to see the shape of one surge in
+     detail, including what happened just before the enable.
+
+If the target has a marker GPIO wired up (p1150_marker_guide), raising it around
+the regulator-enable call pins the surge to the exact line of code that causes
+it, which turns "something switches a rail 4 times a second" into "this call
+does".
+
+### The power-up kind
+    p1150_inrush_test()
+
+Power-cycles the target, arms a current-triggered one-shot capture while the
+probe is still open, and only then closes the relay -- so the instrument is
+already waiting when the surge arrives.  Tell the developer first: the target
+loses power and reboots.
+
+Do not use p1150_measure(connect_probe_during=True) for the surge.  It captures
+the boot sequence well, but logger mode re-arms between chunks and the relay
+closes in one of those gaps, so a millisecond-long event lands in dead time as
+often as not.  Absence of a surge in that capture proves nothing.
+
+Remember the ranking: a clean power-up result says nothing about switched rails,
+and a switched rail is the more likely defect.  Do not stop after this test.
+
+### Set the over-current limit high, and understand what it does
+Run the test at ovc_ma=3200 (the P1150's own default and about its ceiling).
+The limit exists to protect against a short, and it cuts the output when the
+target exceeds it.  Two consequences matter:
+
+  * A limit set below the surge CLIPS the measurement.  A 2 A surge behind a
+    500 mA limit records as a 500 mA plateau, and reads as a clean, modest
+    peak.  The analysis flags this when it can -- it lowers its own detection
+    threshold to just under the limit and marks the peak as a lower bound --
+    but the real number is simply not recoverable without re-measuring.
+  * A trip during the test is not a failed measurement.  It is the finding: the
+    target demands more than 3.2 A at power-up, which no small cell can supply.
+    Clear it with p1150_clear_error, then p1150_power_on to restore power.
+
+If the developer's target has been tripping OVC at power-on and they have been
+raising the limit to get past it, that is the bug, not the workaround.
+
+### Test at the low end of the voltage range
+Inrush is worst where the battery is weakest.  Measure at the bottom of the
+cell's range (~3300 mV for single-cell Li-ion) as well as at nominal.  A
+regulator's start-up behaviour can differ noticeably there too.
+
+## Judging the result
+The tool estimates the terminal voltage sag for three cases: a fresh warm cell,
+a part-aged one, and an aged cold one near flat.  The third is the one to look
+at -- it is where field failures occur.  Where both kinds of surge are present
+the sag is modelled on the RECURRING one, even if the power-up surge is larger,
+because the recurring one is what the product lives with; `battery_sag_basis`
+says which event was used.
+
+Two things make that estimate much sharper, and both have to be asked for:
+
+    p1150_set_battery(chemistry="LiPo", esr_mohm=..., brownout_mv=...)
+
+  * chemistry -- sets the internal resistance assumed.  Coin cells are a
+    different world: a CR2032 is around 10 Ohm when new and hundreds of ohms
+    cold and depleted, so it cannot supply even 100 mA.  A coin-cell design that
+    shows an inrush needs a local capacitor to supply the surge, full stop.
+  * esr_mohm -- a measured internal resistance, if they have one.  It turns the
+    estimate from an order of magnitude into a number.
+  * brownout_mv -- the lowest terminal voltage the target still runs at: the
+    regulator's dropout voltage or the MCU's brown-out reset level, whichever is
+    higher.  Without it the sag can be calculated but not judged, and judging it
+    is the whole question.  Ask for it whenever a surge is found.
+
+Note what is NOT a reason to dismiss an inrush: the charge in the surge is
+negligible, often well under a microamp-hour, so it has no effect on battery
+life whatsoever.  This is a reliability finding, not a battery-life one, and the
+usual instinct to weigh it against average current is wrong.
+
+## Fixing a switched rail
+
+### The proper fix is a regulator with soft-start
+A soft-start ramps the regulator's output over a controlled time -- typically
+tens of microseconds to a few milliseconds -- instead of stepping it.  The
+downstream capacitance charges gradually, so the surge never exists rather than
+being limited after the fact.  Many LDO and SMPS families offer it as a pin (an
+external capacitor sets the ramp) or fixed internally, and a part with
+soft-start generally costs the same as the one without.
+
+The catch, and the reason this measurement is worth so much during firmware
+development: it is a SCHEMATIC decision.  Once boards are built the choice is a
+respin, and once units are deployed it is a recall or a documented limitation.
+Almost nobody discovers the problem before that point, because seeing it takes
+an instrument at the battery terminals that most developers do not have.  If the
+hardware is still in design, say so plainly -- this is the moment the finding is
+cheap to act on.
+
+If the regulator is already fitted and has no soft-start:
+
+1. Put a slew-rate-limited load switch in front of the rail.  A load switch with
+   a soft-start / slew-control pin, or an RC on the gate of a series P-FET,
+   achieves the same ramp externally for a few cents.
+2. Reduce the decoupling on the switched rail to what that sub-circuit actually
+   needs.  Bulk capacitance carried over from a reference design is the usual
+   reason a switched rail surges as hard as it does; the surge is proportional
+   to it.
+3. Stagger the enables.  If more than one rail or peripheral is switched at the
+   same moment, spacing them a few milliseconds apart in firmware costs nothing
+   and divides the peak.
+4. Ramp the load rather than the rail, where that is possible -- an LED driver's
+   brightness, a motor's PWM, a radio's TX power.
+5. Series resistance (NTC limiter, or a resistor bypassed by a FET) is a last
+   resort: it works, but it costs voltage across itself for the whole time the
+   rail is on.
+
+### Ask whether the power-gating is paying for itself
+Every enable spends the surge plus the charge to refill the capacitance, and
+that cost is incurred whether or not the rail does any useful work.  The
+analysis reports it as `equivalent_average_ma`: the per-switch charge multiplied
+by the rate.  A rail cycled quickly can easily cost more in capacitor recharge
+than it saves by being off -- for example a rail switched 10 times a second,
+whose capacitance takes 0.1 uAh to refill, costs about 3.6 mA on average, which
+is more than many such rails draw when simply left powered.
+
+This is not a question developers think to ask, and the answer is sometimes that
+the power-gating should be less frequent, hysteretic, or removed.
+
+## Fixing a power-up surge
+Only worth doing when the exceptions above apply -- a replaceable battery, a
+protection FET that trips, a coin cell, a hot-pluggable rail -- or when it trips
+protection.  In rough order:
+
+1. Stagger the loads in firmware.  Bringing rails and peripherals up one at a
+   time, a few milliseconds apart, costs nothing and frequently removes the
+   problem outright.  If several spikes are reported rather than one, this is
+   almost certainly available.
+2. Slew-rate-limit the branch that surges, as above.
+3. Check the DC-DC converter's soft-start.  A missing or wrongly sized
+   soft-start capacitor turns every start-up into a full-current event.  So does
+   a converter starting into a pre-biased output.
+4. Reduce bulk capacitance to what the design needs.
+5. Add series resistance in the battery path: an NTC inrush limiter, or a
+   resistor bypassed by a FET once the rail is up.
+6. For a surge that is inherent to the load -- a motor start, a transmit burst,
+   a thermal print head -- put a capacitor local to it, sized to supply the
+   surge, so the cell only ever sees the average.  This is the standard answer
+   for coin-cell and high-impedance-source designs.
+
+Re-measure after each change and watch the peak, and for a switched rail the
+rate as well.  The peak is the number that matters; duration and charge barely
+move and do not need to.
+
+## Confounders
+  * A long or thin probe lead adds resistance and inductance and will make the
+    measured surge smaller and slower than the real one.  Keep the leads short
+    for this measurement in particular.
+  * Repeating the test immediately understates the surge: the target's bulk
+    capacitance has not fully discharged, so there is less to charge.
+    p1150_inrush_test pauses for that, but a target with large capacitance and
+    no bleed path may need longer -- if a second test reads much lower than the
+    first, that is what happened, and the first number is the real one.
+  * A JTAG debugger or any other supply feeding the target changes the picture
+    entirely; the P1150 only sees what flows through its own probe.
 """
 
 

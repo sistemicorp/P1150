@@ -11,7 +11,10 @@ every session.
 
 * Battery capacity turns raw current into the numbers a developer actually
   reasons about: how long the device lasts, what share of the battery one
-  wake-up costs, whether a measured charge current is a sensible C rate.
+  wake-up costs, whether a measured charge current is a sensible C rate.  The
+  cell's chemistry and internal resistance, alongside the voltage the target
+  stops working at, turn a measured current surge into the question that
+  matters -- would the real battery sag far enough to reset it.
 
 * Auxiliary-input setup describes what the target drives into A0/D0/D1 and what
   counts as "asserted" on it.  A0 is an analog input reported in millivolts, so
@@ -65,13 +68,27 @@ def get() -> dict:
     return cfg
 
 
-def set_battery(capacity_mah: float, chemistry: str = None,
-                nominal_mv: int = None) -> dict:
-    cfg = {"capacity_mah": float(capacity_mah), "source": "p1150_set_battery"}
+def set_battery(capacity_mah: float = None, chemistry: str = None,
+                nominal_mv: int = None, esr_mohm: float = None,
+                brownout_mv: int = None) -> dict:
+    """Record what the target's battery is, and what the target needs of it.
+
+    Merges rather than replaces: the ESR and the brown-out threshold usually
+    come up later, when an inrush measurement raises the question, and having to
+    restate the capacity to add one of them invites getting it wrong.
+    """
+    cfg = get()
+    if capacity_mah:
+        cfg["capacity_mah"] = float(capacity_mah)
     if chemistry:
         cfg["chemistry"] = chemistry
     if nominal_mv:
         cfg["nominal_mv"] = int(nominal_mv)
+    if esr_mohm:
+        cfg["esr_mohm"] = float(esr_mohm)
+    if brownout_mv:
+        cfg["brownout_mv"] = int(brownout_mv)
+    cfg["source"] = "p1150_set_battery"
     with open(_path(), "w") as f:
         json.dump(cfg, f, indent=2)
     return cfg
@@ -80,6 +97,19 @@ def set_battery(capacity_mah: float, chemistry: str = None,
 def capacity_mah():
     """Configured capacity in mAh, or None."""
     return get().get("capacity_mah") or None
+
+
+def battery_model() -> dict:
+    """What the inrush analysis needs to say how a real cell would behave.
+
+    Separate from capacity_mah() because none of it is required: an inrush is
+    still worth reporting without knowing the chemistry, it just cannot be
+    turned into a voltage sag as confidently.
+    """
+    cfg = get()
+    return {"chemistry": cfg.get("chemistry"),
+            "esr_mohm": cfg.get("esr_mohm"),
+            "brownout_mv": cfg.get("brownout_mv")}
 
 
 # ------------------------------------------------------------------ #

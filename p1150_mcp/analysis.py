@@ -204,6 +204,1009 @@ def find_events(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
 
 
 # ------------------------------------------------------------------ #
+# Inrush                                                               #
+# ------------------------------------------------------------------ #
+# An inrush is the surge drawn the instant a load is energised: bulk capacitance
+# charging, a DC-DC converter starting up, a motor or an LED driver kicking in.
+# It is defined by its shape rather than by its size alone -- a low current
+# state, a very brief excursion far above it, and a settled state afterwards
+# that is low again.
+#
+# It is worth reporting unprompted, because the developer almost certainly is
+# not looking for it.  A real battery cannot supply a surge like this: it sags
+# by I*ESR instead, and that sag is what resets the target.  The P1150 is a low
+# impedance supply, so it delivers the surge rather than sagging, and the
+# current appears on the trace where a battery would have hidden it behind a
+# brown-out.  A board that boots perfectly on the bench, or on a fresh warm
+# cell, can reset every time on an aged cell on a cold morning at a low state of
+# charge -- the three conditions that together put a cell's ESR at its highest.
+# Without an instrument at the battery terminals there is nothing to see but an
+# intermittent reset that will not reproduce indoors.
+#
+# TWO KINDS, AND THEY ARE NOT EQUALLY IMPORTANT.
+#
+# The one everybody thinks of is at power-up, when the battery is first
+# connected.  In a real product that happens once, on the assembly line: the
+# battery is soldered or clipped in and stays there.  A surge that only ever
+# happens then is usually acceptable, and saying otherwise is crying wolf.
+#
+# The one that actually bites is a rail being switched.  Power-gating an LDO or
+# an SMPS to save current is standard practice in a battery product, and every
+# time firmware enables that regulator, the decoupling capacitance downstream of
+# it is an effective short circuit at the instant of enable -- the current is
+# limited only by resistance in the path, so it goes as high as the supply will
+# allow.  That repeats for the life of the product, on every duty cycle, at
+# every temperature and state of charge.  The remedy is a regulator with a
+# soft-start, which ramps its output instead of stepping it; parts that have one
+# cost the same as parts that do not, but the choice is made at schematic time
+# and is expensive to revisit once boards exist.  Which is exactly why finding
+# this during firmware development is worth so much: nobody discovers it until
+# the hardware is built, and by then a soft-start part is a respin.
+#
+# So a recurring surge outranks a power-on surge in everything below.
+
+INRUSH_PEAK_MA = 1000.0         # a one-off excursion below 1 A is not this problem
+INRUSH_MAX_DURATION_MS = 4.0    # longer than this is a load, not an inrush
+INRUSH_SETTLED_RATIO = 5.0      # the peak must stand this far above what follows
+INRUSH_MERGE_GAP_MS = 0.5       # sub-peaks closer than this are one event
+INRUSH_SETTLE_WINDOW_MS = 20.0  # window defining the "before" and "after" levels
+INRUSH_EDGE_FRACTION = 0.10     # width is measured at 10% of the peak
+INRUSH_SEARCH_MS = 50.0         # cap on how far the width search walks outward
+
+# A surge that repeats is reported from a lower bar than a one-off, because
+# repetition is itself most of the evidence.  A switched rail on a small circuit
+# need not reach an amp to be the same design fault, and unlike a single spike
+# it cannot be dismissed as a startup transient -- it has a cause that fires
+# again every duty cycle.  Held well above the settled floor so an ordinary
+# duty-cycled wake-up burst is not swept up in it.
+INRUSH_RECURRING_PEAK_MA = 250.0
+INRUSH_RECURRING_RATIO = 10.0
+INRUSH_RECURRING_MIN_EVENTS = 3
+
+# Guard against a pathological trace -- current hovering either side of the
+# detection threshold -- turning into a per-region Python loop over tens of
+# thousands of "events".
+INRUSH_MAX_REGIONS = 5000
+
+# How close to the start of a capture, and how near to zero beforehand, an event
+# has to be before it is taken for the power-up surge rather than a switched
+# rail.  Only a hint: the caller usually knows outright, and says so.
+INRUSH_POWER_ON_WINDOW_MS = 5.0
+INRUSH_POWER_ON_FLOOR_MA = 0.05
+
+# The P1150's over-current protection shuts the output off when the target draws
+# more than this.  3200 mA is the power-on default.
+OVC_DEFAULT_MA = 3200.0
+# Within this fraction of the limit, the measured peak is a lower bound rather
+# than a measurement: the protection is acting, so the number on the trace is
+# the instrument's limit and not the target's demand.
+OVC_CLIP_FRACTION = 0.90
+
+# Severity of a spike relative to what the target settles at afterwards, which
+# is the only fair reference -- 1.5 A into a device that then runs at 1.2 A is
+# ordinary, and 1.5 A into one that then runs at 3 mA is not.
+INRUSH_RATIO_NOTABLE = 5.0
+INRUSH_RATIO_SEVERE = 20.0
+
+# Internal resistance of a cell, in milliohms, as (fresh and warm, mid-life at
+# room temperature, aged and cold and near flat).  The third column is the one
+# that matters: it is where field failures happen, and it is 5-15x the first.
+#
+# These are order-of-magnitude figures for a small single cell, good enough to
+# tell "no problem" from "this browns out in the field" -- which is the decision
+# being made.  ESR also scales roughly inversely with capacity, so a 2000 mAh
+# cell is several times stiffer than a 200 mAh one of the same chemistry.  A
+# measured value always wins: record it with p1150_set_battery(esr_mohm=...).
+CHEMISTRY_ESR_MOHM = {
+    "liion":    (80.0, 250.0, 900.0),
+    "lipo":     (150.0, 450.0, 1500.0),
+    "lifepo4":  (60.0, 200.0, 700.0),
+    "nimh":     (100.0, 300.0, 1000.0),
+    "nicd":     (100.0, 300.0, 1000.0),
+    "alkaline": (250.0, 700.0, 2500.0),
+    # A coin cell is in ohms, not milliohms, and is a different world: a CR2032
+    # cannot deliver 1 A at all, at any age or temperature.
+    "coin":     (10000.0, 30000.0, 100000.0),
+}
+# Used when the chemistry was not recorded.  A small LiPo is the common case for
+# a target being profiled here, and it sits mid-range, so it neither cries wolf
+# nor waves through a design that a coin cell could never run.
+ESR_UNKNOWN = CHEMISTRY_ESR_MOHM["lipo"]
+
+ESR_SCENARIOS = ("fresh_warm", "mid_life", "aged_cold_flat")
+ESR_SCENARIO_LABEL = {
+    "fresh_warm": "new cell, room temperature, well charged",
+    "mid_life": "part-aged cell, room temperature, mid state of charge",
+    "aged_cold_flat": "aged cell, cold, low state of charge -- the worst case, "
+                      "and where field resets actually happen",
+}
+
+# Chemistry strings a developer might reasonably type, mapped to the table keys.
+_CHEM_ALIASES = {
+    "liion": "liion", "lion": "liion", "lithiumion": "liion", "18650": "liion",
+    "21700": "liion", "licoo2": "liion", "nmc": "liion",
+    "lipo": "lipo", "lipoly": "lipo", "lithiumpolymer": "lipo",
+    "lifepo4": "lifepo4", "lfp": "lifepo4",
+    "nimh": "nimh", "nickelmetalhydride": "nimh",
+    "nicd": "nicd", "nicad": "nicd",
+    "alkaline": "alkaline", "aa": "alkaline", "aaa": "alkaline",
+    "coin": "coin", "coincell": "coin", "button": "coin", "buttoncell": "coin",
+    "cr2032": "coin", "cr2016": "coin", "cr2450": "coin", "lir2032": "coin",
+}
+
+
+def esr_profile(chemistry: str = None, esr_mohm: float = None) -> dict:
+    """The three internal-resistance cases to evaluate a surge against.
+
+    An explicit measured value pins the mid case and scales the other two by the
+    same ratios the table uses, so a developer who measures their own cell gets
+    a cold-and-aged estimate out of it rather than having to guess three.
+    """
+    key = None
+    if chemistry:
+        flat = "".join(ch for ch in str(chemistry).lower() if ch.isalnum())
+        key = _CHEM_ALIASES.get(flat)
+        if key is None:
+            key = next((v for k, v in _CHEM_ALIASES.items() if k in flat), None)
+
+    table = CHEMISTRY_ESR_MOHM.get(key, ESR_UNKNOWN)
+    if esr_mohm:
+        # Keep the shape of the chemistry's ageing curve, anchored on the
+        # measured figure: a cell that is stiff when new is stiff in the cold
+        # too, relative to itself.
+        scale = float(esr_mohm) / table[0]
+        values = tuple(v * scale for v in table)
+        source = f"measured {float(esr_mohm):g} mOhm, aged"
+        if key:
+            source += f" using the {key} ageing ratio"
+    else:
+        values = table
+        source = (f"typical for {key}" if key else
+                  f"chemistry '{chemistry}' not recognised -- assumed small "
+                  f"LiPo" if chemistry else
+                  "assumed small LiPo -- chemistry not recorded")
+    return {"esr_mohm": {s: _f(v, 1) for s, v in zip(ESR_SCENARIOS, values)},
+            "chemistry": key or (chemistry or None),
+            "source": source,
+            "measured": bool(esr_mohm)}
+
+
+def sag_mv(current_ma: float, esr_mohm: float) -> float:
+    """Terminal voltage a cell of this resistance loses at this current."""
+    return current_ma * esr_mohm / 1000.0
+
+
+def _median_window(i64: np.ndarray, lo: int, hi: int):
+    """Median over a clipped slice, or None when the slice lies outside."""
+    lo, hi = max(0, int(lo)), min(int(i64.size), int(hi))
+    if hi <= lo:
+        return None
+    return float(np.median(i64[lo:hi]))
+
+
+def _spike_bounds(i64: np.ndarray, peak_idx: int, level: float,
+                  limit: int) -> tuple:
+    """Widen from the peak to where the current last falls below `level`.
+
+    Measuring the width at a fraction of the peak rather than at the detection
+    threshold is what a scope does, and it is the honest number: the width of a
+    2 A spike measured at 1 A depends on how tall the spike is, which makes a
+    bigger surge look briefer.
+    """
+    n = i64.size
+    lo, hi = max(0, peak_idx - limit), min(n, peak_idx + limit + 1)
+    left = np.flatnonzero(i64[lo:peak_idx] < level)
+    start = lo + int(left[-1]) + 1 if left.size else lo
+    right = np.flatnonzero(i64[peak_idx + 1:hi] < level)
+    end = peak_idx + 1 + int(right[0]) if right.size else hi
+    return start, end
+
+
+def _merge_runs(starts: np.ndarray, ends: np.ndarray, gap: int) -> list:
+    """Join runs separated by less than `gap` samples.
+
+    A real inrush rings: the current dips below the threshold between sub-peaks
+    of the same event, and counting those as separate surges would report six
+    events where the target has one.
+    """
+    merged = []
+    for a, b in zip(starts.tolist(), ends.tolist()):
+        if merged and a - merged[-1][1] <= gap:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    return merged
+
+
+def find_inrush(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
+                peak_ma: float = INRUSH_PEAK_MA,
+                max_duration_ms: float = INRUSH_MAX_DURATION_MS,
+                settled_ratio: float = INRUSH_SETTLED_RATIO,
+                ovc_ma: float = None, max_events: int = 20,
+                ovc_tripped: bool = None,
+                recurring_peak_ma: float = INRUSH_RECURRING_PEAK_MA,
+                power_on_capture: bool = None) -> dict:
+    """Locate current spikes with the shape of an inrush, and say if they repeat.
+
+    A candidate is an excursion above the detection threshold; each is then
+    measured for its full width at 10% of its own peak, and compared against the
+    current the target settles at afterwards.  Three things separate an inrush
+    from ordinary activity: it is brief, it is far above what follows it, and it
+    is large -- either in absolute terms, or by happening over and over.
+
+    Repetition is the important axis.  A surge at the start of a capture that
+    began with the target unpowered is the power-up one, which in a real product
+    happens once when the battery is fitted.  A surge in the middle of a running
+    capture is a rail being switched on, and that one recurs forever.
+
+    The detection threshold drops to just under the over-current limit when that
+    limit is below the bar, because the instrument clips there: a target with a
+    2 A surge measured behind a 500 mA limit shows a 500 mA plateau, and a plain
+    "above 1 A" test would call that clean.
+    """
+    i64 = np.asarray(i_ma, dtype=np.float64)
+    n = i64.size
+    if n == 0:
+        return {"error": "capture contains no samples"}
+
+    # Detection runs at the lower, recurring bar; the one-off bar is applied
+    # when classifying, so a small surge is still found and then judged on
+    # whether it repeats rather than being discarded for its size alone.
+    recurring_ma = min(float(recurring_peak_ma), float(peak_ma))
+    detect_ma = recurring_ma
+    reason = (f"excursion above {detect_ma:g} mA; a single spike is only called "
+              f"an inrush at {float(peak_ma):g} mA or more, but a repeating one "
+              f"counts from {recurring_ma:g} mA")
+    if ovc_ma and OVC_CLIP_FRACTION * float(ovc_ma) < detect_ma:
+        detect_ma = OVC_CLIP_FRACTION * float(ovc_ma)
+        reason = (f"excursion above {detect_ma:g} mA -- lowered because the "
+                  f"over-current limit is {float(ovc_ma):g} mA, so nothing "
+                  f"larger than that can be measured")
+
+    out = {
+        "capture_duration_s": _f(n / fs, 4),
+        "capture_peak_ma": _f(float(i64.max())),
+        "detect_threshold_ma": _f(detect_ma),
+        "detect_threshold_reason": reason,
+        "inrush_peak_ma": _f(float(peak_ma)),
+        "recurring_peak_ma": _f(recurring_ma),
+        "max_inrush_duration_ms": max_duration_ms,
+        "sample_resolution_us": _f(1e6 / fs, 2),
+        "ovc_ma": _f(float(ovc_ma)) if ovc_ma else None,
+        # Every count and handle the caller reads is present from the start, so
+        # a capture with nothing in it returns the same shape as one that is
+        # full of surges. The alternative is a KeyError on the quietest, most
+        # ordinary trace there is.
+        "events": [],
+        "inrush_events": 0,
+        "recurring_events": 0,
+        "power_on_events": 0,
+        "sustained_events": 0,
+        "clipped_events": 0,
+        "normal_load_events": 0,
+        "candidates": 0,
+        "worst": None,
+        "worst_recurring": None,
+    }
+
+    starts, ends = _intervals(i64 >= detect_ma)
+    if starts.size == 0:
+        return out
+
+    gap = max(1, int(INRUSH_MERGE_GAP_MS * 1e-3 * fs))
+    limit = max(1, int(INRUSH_SEARCH_MS * 1e-3 * fs))
+    settle = max(1, int(INRUSH_SETTLE_WINDOW_MS * 1e-3 * fs))
+    regions = _merge_runs(starts, ends, gap)
+    out["candidates"] = len(regions)
+    if len(regions) > INRUSH_MAX_REGIONS:
+        # A trace hovering either side of the threshold, not a target switching
+        # a rail forty thousand times. Measure the largest and say what was
+        # skipped rather than spending a minute proving it.
+        regions.sort(key=lambda r: -float(i64[r[0]:r[1]].max()))
+        regions = sorted(regions[:INRUSH_MAX_REGIONS])
+        out["candidates_truncated"] = (
+            f"{out['candidates']} excursions crossed {detect_ma:g} mA, far more "
+            f"than a switched rail produces. The {INRUSH_MAX_REGIONS} largest "
+            f"were measured; the rest are counted only. Current sitting near "
+            f"the threshold, rather than stepping across it, produces this.")
+
+    events = []
+    for a, b in regions:
+        peak_idx = a + int(np.argmax(i64[a:b]))
+        peak = float(i64[peak_idx])
+        # Width is taken at 10% of this spike's own peak.  On a target whose
+        # steady draw is already above that level the search would run away, so
+        # it is capped at INRUSH_SEARCH_MS either side -- well past the 4 ms
+        # that still counts as an inrush, so nothing real gets truncated.
+        s, e = _spike_bounds(i64, peak_idx, INRUSH_EDGE_FRACTION * peak, limit)
+
+        pre = _median_window(i64, s - settle, s)
+        post = _median_window(i64, e, e + settle)
+        # A spike at the very end of a capture has nothing after it to settle
+        # to. Saying so is better than inventing a ratio from one sample.
+        settled = post if post is not None else pre
+
+        width_ms = (e - s) / fs * 1000.0
+        above_ms = (b - a) / fs * 1000.0
+        ratio = (peak / settled) if settled and settled > 0 else None
+        charge_uah = float(i64[s:e].sum()) / fs / 3600.0 * 1000.0
+
+        # A flat top at the limit is the signature of protection acting rather
+        # than of the target's own demand.
+        clipped = bool(ovc_ma and peak >= OVC_CLIP_FRACTION * float(ovc_ma))
+        if ovc_tripped and peak >= 0.5 * float(ovc_ma or OVC_DEFAULT_MA):
+            clipped = True
+        flat = float((i64[a:b] >= 0.95 * peak).mean()) if b > a else 0.0
+        # Power gone after the surge: the supply shut off rather than rode it.
+        # Only ever claimed for a spike that also reached the limit -- a target
+        # dropping to microamps after boot looks identical in the samples, and
+        # calling that a shutdown would be worse than saying nothing.
+        tail = i64[e:]
+        collapsed = bool(clipped and tail.size > settle and
+                         float(np.median(tail)) < 0.5)
+
+        # What the spike costs above what the target was drawing anyway. For a
+        # rail that is switched repeatedly this is the number that decides
+        # whether power-gating it is paying for itself at all.
+        excess_uah = charge_uah - (settled or 0.0) * (e - s) / fs / 3600.0 * 1000.0
+
+        ev = {
+            "index": len(events),
+            "start_s": _f(s / fs, 5),
+            "peak_ma": _f(peak),
+            "peak_at_s": _f(peak_idx / fs, 5),
+            "duration_ms": _f(width_ms, 4),
+            "time_above_threshold_ms": _f(above_ms, 4),
+            "before_ma": _f(pre) if pre is not None else None,
+            "settled_ma": _f(settled) if settled is not None else None,
+            "peak_over_settled": _f(ratio, 1) if ratio else None,
+            "charge_uah": _f(charge_uah),
+            "excess_uah": _f(excess_uah),
+            "rise_time_us": _f((peak_idx - s) / fs * 1e6, 1),
+            "samples_above_threshold": int(b - a),
+        }
+
+        if clipped:
+            ev["classification"] = "CLIPPED_BY_OVC"
+            ev["peak_is_lower_bound"] = True
+            ev["note"] = (
+                f"The current reached the P1150's over-current limit "
+                f"({float(ovc_ma or OVC_DEFAULT_MA):g} mA), so "
+                f"{ev['peak_ma']} mA is the "
+                f"instrument's limit and not the target's demand -- the real "
+                f"peak is higher, possibly much higher, and cannot be known "
+                f"until the limit is raised above it.")
+            if flat > 0.5:
+                ev["flat_top_pct"] = _f(100.0 * flat, 1)
+        elif ratio is not None and ratio < settled_ratio:
+            # Not a surge at all: the target draws about this much anyway, so
+            # there is no step for a battery to fail to supply. Reporting a
+            # 1.5 A peak on a device that runs at 1.2 A as an inrush would be
+            # noise, and noise is what stops the real ones being believed.
+            ev["classification"] = "NORMAL_LOAD"
+            ev["note"] = (
+                f"Only {ev['peak_over_settled']}x what the target draws either "
+                f"side of it ({ev['settled_ma']} mA), so this is its normal "
+                f"working current rather than a start-up surge. A battery sees "
+                f"it as a steady load, not a step.")
+        elif width_ms > max_duration_ms:
+            ev["classification"] = "SUSTAINED"
+            ev["note"] = (
+                f"Held above the threshold for {ev['duration_ms']} ms, longer "
+                f"than the {max_duration_ms} ms that defines an inrush. This is "
+                f"a real load being driven, not capacitance charging -- and a "
+                f"battery has to supply it for the whole {ev['duration_ms']} ms, "
+                f"not just for a moment.")
+        elif peak >= peak_ma:
+            ev["classification"] = "INRUSH"
+        elif ratio is None or ratio >= INRUSH_RECURRING_RATIO:
+            # Under the one-off bar, but sharp and far above the floor. Only
+            # meaningful if it turns out to repeat, which is decided once every
+            # region has been measured.
+            ev["classification"] = "SURGE"
+        else:
+            ev["classification"] = "MINOR_SURGE"
+            ev["note"] = (
+                f"{ev['peak_ma']} mA is below the {peak_ma:g} mA at which a "
+                f"single spike is called an inrush, and it is only "
+                f"{ev['peak_over_settled']}x the settled current. Noted in case "
+                f"it turns out to repeat, but on its own it is not a finding.")
+        if collapsed:
+            ev["supply_collapsed_after"] = True
+            ev["collapse_note"] = (
+                "Current fell to essentially zero after the surge and stayed "
+                "there: the P1150 shut its output off. The target is unpowered "
+                "from this point in the capture onward, so nothing after it is "
+                "the target's behaviour.")
+        events.append(ev)
+
+    # ---- which of these is the power-up one? ------------------------ #
+    # It matters more than anything else here. In a shipped product the battery
+    # goes in once and stays in, so a surge that only happens at power-up is
+    # mostly a curiosity; one that happens while the target is running is a rail
+    # being switched, and that repeats for the life of the device.
+    surges = [e for e in events
+              if e["classification"] in ("INRUSH", "CLIPPED_BY_OVC", "SURGE")]
+    if surges:
+        first = surges[0]
+        if power_on_capture:
+            first["at_power_on"] = True
+        elif power_on_capture is None and \
+                first["start_s"] <= INRUSH_POWER_ON_WINDOW_MS * 1e-3 and \
+                (first["before_ma"] or 0.0) < INRUSH_POWER_ON_FLOOR_MA:
+            first["at_power_on"] = True
+            first["at_power_on_inferred"] = (
+                "Taken for the power-up surge because it sits at the very start "
+                "of the capture with no current before it. If the target was "
+                "already running and this is a rail being switched on, it is "
+                "the more serious kind -- re-run the analysis on a capture that "
+                "starts while the target is up.")
+
+    recurring = [e for e in surges if not e.get("at_power_on")]
+    out["inrush_events"] = sum(1 for e in events
+                               if e["classification"] in ("INRUSH",
+                                                          "CLIPPED_BY_OVC"))
+    out["recurring_events"] = len(recurring)
+    out["power_on_events"] = sum(1 for e in surges if e.get("at_power_on"))
+    out["sustained_events"] = sum(1 for e in events
+                                  if e["classification"] == "SUSTAINED")
+    out["clipped_events"] = sum(1 for e in events
+                                if e["classification"] == "CLIPPED_BY_OVC")
+    out["normal_load_events"] = sum(1 for e in events
+                                    if e["classification"] == "NORMAL_LOAD")
+
+    # ---- how often, and what the repetition costs ------------------- #
+    if len(recurring) >= 2:
+        t = np.array([e["peak_at_s"] for e in recurring], dtype=np.float64)
+        periods = np.diff(t)
+        mp = float(periods.mean())
+        jitter = (100.0 * float(periods.std()) / mp) if mp > 0 else None
+        rate = (1.0 / mp) if mp > 0 else None
+        rep = {
+            "occurrences": len(recurring),
+            "mean_period_s": _f(mp, 5),
+            "rate_hz": _f(rate, 3) if rate else None,
+            "period_jitter_pct": _f(jitter, 1) if jitter is not None else None,
+            "mean_peak_ma": _f(float(np.mean([e["peak_ma"] for e in recurring]))),
+            "max_peak_ma": _f(float(max(e["peak_ma"] for e in recurring))),
+            "mean_duration_ms": _f(
+                float(np.mean([e["duration_ms"] for e in recurring])), 4),
+        }
+        # A regular period points at a timer; an irregular one at something
+        # event-driven. Both recur, but they are found in different code.
+        if jitter is not None:
+            rep["regular"] = bool(jitter < 20.0)
+            rep["timing_note"] = (
+                "Evenly spaced, so something periodic drives it -- a timer, a "
+                "duty cycle, a poll." if jitter < 20.0 else
+                "Irregularly spaced, so it is event-driven rather than on a "
+                "timer -- triggered by traffic, by a sensor, or by user action.")
+
+        # What the repetition actually costs, in the units the developer cares
+        # about. Charging the same capacitance over and over is not free, and
+        # this is the number that says whether power-gating that rail is paying
+        # for itself at all -- which is not a question anyone thinks to ask.
+        if rate:
+            mean_excess = float(np.mean([e["excess_uah"] for e in recurring]))
+            rep["mean_excess_uah_per_event"] = _f(mean_excess)
+            rep["equivalent_average_ma"] = _f(mean_excess * rate * 3600.0 / 1000.0)
+        out["repetition"] = rep
+
+    # The worst one is what the design has to survive, so it leads -- and
+    # "worst" means most concerning, not merely largest. A 1.5 A spike on a
+    # device that draws 1.2 A anyway must not outrank a 1.2 A surge on one that
+    # idles at 3 mA, which is the one that will strand a customer. A surge while
+    # the target is running outranks the same surge at power-up, because that
+    # one happens once in the product's life and this one happens always.
+    rank = {"CLIPPED_BY_OVC": 0, "INRUSH": 1, "SURGE": 2, "SUSTAINED": 3,
+            "MINOR_SURGE": 4, "NORMAL_LOAD": 5}
+    events.sort(key=lambda e: (bool(e.get("at_power_on")),
+                               rank.get(e["classification"], 9),
+                               -e["peak_ma"]))
+    out["worst"] = events[0] if events else None
+    out["worst_recurring"] = max(recurring, key=lambda e: e["peak_ma"]) \
+        if recurring else None
+    if len(events) > max_events:
+        out["events_note"] = (
+            f"{len(events)} spikes measured; the {max_events} most significant "
+            f"are listed. The counts and the repetition statistics above cover "
+            f"all of them.")
+    out["events"] = events[:max_events]
+    return out
+
+
+def inrush_analysis(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
+                    ovc_ma: float = None, supply_mv: float = None,
+                    chemistry: str = None, esr_mohm: float = None,
+                    brownout_mv: float = None,
+                    peak_ma: float = INRUSH_PEAK_MA,
+                    max_duration_ms: float = INRUSH_MAX_DURATION_MS,
+                    settled_ratio: float = INRUSH_SETTLED_RATIO,
+                    ovc_tripped: bool = None,
+                    recurring_peak_ma: float = INRUSH_RECURRING_PEAK_MA,
+                    power_on_capture: bool = None) -> dict:
+    """Find inrush spikes and say what a real battery would do about them.
+
+    The current is only half the answer.  What the developer needs to know is
+    whether the cell they ship with can supply that surge without sagging below
+    the point where the target resets -- and that depends on the cell's internal
+    resistance, which is at its worst exactly when the product is in the field:
+    aged, cold, and near flat.
+
+    Recurrence decides how much any of it matters.  A surge at power-up happens
+    once, when the battery is fitted; a surge while the target is running is a
+    switched rail and happens for the life of the product.
+    """
+    found = find_inrush(i_ma, fs, peak_ma, max_duration_ms, settled_ratio,
+                        ovc_ma, ovc_tripped=ovc_tripped,
+                        recurring_peak_ma=recurring_peak_ma,
+                        power_on_capture=power_on_capture)
+    if "error" in found:
+        return found
+
+    out = dict(found)
+    events = found.get("events") or []
+    clipped = bool(found["clipped_events"])
+    n_rec = found["recurring_events"]
+    rec_worst = found.get("worst_recurring")
+    rep = found.get("repetition") or {}
+
+    # A recurring surge is only reported from the lower bar once there are
+    # enough of them to be a pattern rather than a coincidence. Above the
+    # one-off bar a single one is enough on its own.
+    big_recurring = bool(rec_worst and rec_worst["peak_ma"] >= peak_ma)
+    many_recurring = n_rec >= INRUSH_RECURRING_MIN_EVENTS
+    repeats = n_rec >= 2 and (big_recurring or many_recurring)
+
+    # ---- verdict ---------------------------------------------------- #
+    # Ordered by what it costs the product, not by how large the number is.
+    if clipped:
+        verdict = "OVC_TRIP"
+    elif repeats:
+        verdict = "RECURRING_INRUSH" if big_recurring else "RECURRING_SURGE"
+    elif n_rec and big_recurring:
+        verdict = "INRUSH"
+    elif found["power_on_events"] and any(
+            e.get("at_power_on") and e["peak_ma"] >= peak_ma for e in events):
+        verdict = "POWER_ON_INRUSH"
+    elif any(e["classification"] == "SUSTAINED" and e["peak_ma"] >= peak_ma
+             for e in events):
+        # Only above the one-off bar. A 300 mA burst lasting a few milliseconds
+        # is a radio waking up or a sensor converting -- the most ordinary thing
+        # a battery-powered target does, and reporting it would bury the
+        # findings that matter under one per capture.
+        verdict = "SUSTAINED_HIGH_CURRENT"
+    else:
+        verdict = "PASS"
+    out["verdict"] = verdict
+
+    # The event the rest of the report is built around: the recurring one where
+    # there is one, because that is the one the product lives with.
+    worst = rec_worst if (repeats or (n_rec and big_recurring)) \
+        else found.get("worst")
+
+    severity = {
+        "OVC_TRIP": "CRITICAL",
+        "RECURRING_INRUSH": "HIGH",
+        "RECURRING_SURGE": "MEDIUM",
+        "INRUSH": "MEDIUM",
+        "POWER_ON_INRUSH": "LOW",
+        "SUSTAINED_HIGH_CURRENT": "MEDIUM",
+        "PASS": "NONE",
+    }[verdict]
+
+    if not events or worst is None:
+        out["severity"] = "NONE"
+        out["assessment"] = (
+            f"No current spike reached {found['detect_threshold_ma']} mA. The "
+            f"highest current anywhere in this capture was "
+            f"{found['capture_peak_ma']} mA, which no battery of a sane size "
+            f"has trouble supplying.")
+        return out
+    if verdict == "PASS":
+        out["severity"] = severity
+        if worst["classification"] == "NORMAL_LOAD":
+            out["assessment"] = (
+                f"Current reached {worst['peak_ma']} mA, but the target draws "
+                f"{worst['settled_ma']} mA either side of it -- only "
+                f"{worst['peak_over_settled']}x. That is its working current, "
+                f"not a switching surge, so there is no step for a battery to "
+                f"fail to supply. Whether a cell can sustain "
+                f"{worst['settled_ma']} mA continuously is a separate question, "
+                f"and a capacity one.")
+        elif worst["classification"] == "SUSTAINED":
+            out["assessment"] = (
+                f"Current reached {worst['peak_ma']} mA and held there for "
+                f"{worst['duration_ms']} ms. That is a load being driven -- a "
+                f"radio waking, a sensor converting, a peripheral working -- "
+                f"not capacitance being charged, and it is below the "
+                f"{peak_ma:g} mA at which a burst is worth flagging on its own. "
+                f"Use p1150_events to characterise it as a duty cycle, which is "
+                f"the right lens for a burst like this.")
+        else:
+            out["assessment"] = (
+                f"A {worst['peak_ma']} mA spike {worst['duration_ms']} ms wide "
+                f"was measured, below the {peak_ma:g} mA at which a single one "
+                f"is called an inrush, and it did not repeat during this "
+                f"{found['capture_duration_s']} s capture. Nothing to act on. "
+                f"If the target power-gates a rail that was not exercised here, "
+                f"capture again while it is, since a switched rail is the one "
+                f"that matters.")
+        return out
+    out["severity"] = severity
+
+    # ---- one-off at power-up, or a rail being switched? ------------- #
+    if verdict == "POWER_ON_INRUSH":
+        out["recurrence"] = "ONCE_AT_POWER_UP"
+        inferred = next((e.get("at_power_on_inferred") for e in events
+                         if e.get("at_power_on_inferred")), None)
+        if inferred:
+            # The whole "this only happens once" argument rests on it being the
+            # power-up surge, so where that was guessed rather than recorded,
+            # the guess has to travel with the conclusion.
+            out["recurrence"] = "ONCE_AT_POWER_UP_INFERRED"
+            out["recurrence_caveat"] = inferred
+        out["recurrence_note"] = (
+            f"This surge is at the instant power was applied, and nothing like "
+            f"it happened again during the capture. In a product whose battery "
+            f"is fitted once and left in, that means it happens once in the "
+            f"device's life -- so it is much less serious than it looks, and "
+            f"the usual answer is to note it and move on. It still matters if "
+            f"the battery is user-replaceable, if the pack's protection FET can "
+            f"re-connect under load, or if a charger can hot-plug the rail: "
+            f"each of those repeats the event. Check too that it does not trip "
+            f"protection, since a surge that trips the P1150's limit will trip "
+            f"a pack protection IC as readily.")
+    elif repeats or (n_rec and big_recurring):
+        out["recurrence"] = "WHILE_RUNNING"
+        every = (f"every {rep['mean_period_s']} s ({rep['rate_hz']} Hz)"
+                 if rep.get("rate_hz") else "more than once")
+        out["recurrence_note"] = (
+            f"This surge happens while the target is already running, "
+            f"{f'{n_rec} times in this capture, {every}' if n_rec > 1 else 'once in this capture'}"
+            f" -- so it is NOT the power-up inrush. A brief spike into a load "
+            f"that was drawing nothing a moment earlier is what enabling an LDO "
+            f"or an SMPS looks like: at the instant of enable, the decoupling "
+            f"capacitance downstream is effectively a short circuit, and the "
+            f"current is limited only by the resistance in the path. Unlike a "
+            f"power-up surge, this one repeats for the life of the product, at "
+            f"every temperature and state of charge."
+            + ("" if n_rec > 1 else
+               " It occurred only once here, but if it is a rail being "
+               "switched it happens on every duty cycle -- capture for longer, "
+               "or while exercising the feature that turns it on, to see the "
+               "rate."))
+
+    # ---- what a battery would do ------------------------------------ #
+    prof = esr_profile(chemistry, esr_mohm)
+    out["battery_model"] = prof
+    peak = worst["peak_ma"]
+    out["battery_sag_basis"] = {
+        "peak_ma": peak,
+        "at_s": worst["peak_at_s"],
+        "which": ("the recurring surge" if worst is rec_worst else
+                  "the power-up surge" if worst.get("at_power_on") else
+                  "the largest event"),
+    }
+    # When the sag is modelled on a recurring surge, a bigger one-off peak
+    # elsewhere in the capture would otherwise look like it had been missed.
+    biggest = found.get("worst")
+    if biggest is not None and biggest is not worst and \
+            biggest["peak_ma"] > peak:
+        out["battery_sag_basis"]["note"] = (
+            f"A larger {biggest['peak_ma']} mA peak was measured at "
+            f"{biggest['peak_at_s']} s, but the sag below is modelled on the "
+            f"recurring surge instead: the larger one happens at power-up, once "
+            f"in the product's life, and the recurring one happens forever.")
+    rows = []
+    for scenario in ESR_SCENARIOS:
+        r = prof["esr_mohm"][scenario]
+        drop = sag_mv(peak, r)
+        row = {"scenario": scenario,
+               "condition": ESR_SCENARIO_LABEL[scenario],
+               "esr_mohm": r,
+               "sag_mv": _f(drop, 1)}
+        if supply_mv:
+            row["terminal_mv_at_peak"] = _f(max(0.0, supply_mv - drop), 1)
+            row["sag_pct"] = _f(100.0 * drop / supply_mv, 1)
+            if drop >= supply_mv:
+                # The model has run past what the cell can physically do. The
+                # honest statement is not "it sags by 9 V" but "it cannot
+                # deliver this current at all" -- into a dead short it manages
+                # only V/R, and the target simply collapses instead.
+                row["cell_cannot_supply"] = True
+                row["max_deliverable_ma"] = _f(1000.0 * supply_mv / r, 1)
+        if supply_mv and brownout_mv:
+            row["browns_out"] = bool(supply_mv - drop < brownout_mv)
+        rows.append(row)
+    out["battery_sag"] = rows
+    impossible = [r["scenario"] for r in rows if r.get("cell_cannot_supply")]
+    if impossible:
+        out["cell_cannot_supply"] = impossible
+        worst_case = rows[-1]
+        out["cell_cannot_supply_note"] = (
+            f"For {', '.join(impossible)}, the modelled sag exceeds the supply "
+            f"voltage entirely -- meaning the cell cannot deliver {peak:g} mA "
+            f"at all. It is not that the target dips; it is that the demand is "
+            f"impossible and the rail collapses. Into a dead short, a cell of "
+            f"{worst_case['esr_mohm']:g} mOhm at {supply_mv:g} mV manages about "
+            f"{worst_case.get('max_deliverable_ma')} mA. The surge has to be "
+            f"supplied by a capacitor local to the load, or removed.")
+    if clipped:
+        # Everything below is computed from a peak the instrument clipped, so
+        # every figure is a floor. Presenting it without saying so would let a
+        # tripped supply read as a comfortable pass, which is the worst
+        # possible failure mode for this tool.
+        out["battery_sag_is_lower_bound"] = True
+        out["battery_sag_warning"] = (
+            f"These figures are computed from {peak:g} mA, which is where the "
+            f"over-current limit clipped the measurement -- not from the "
+            f"target's actual demand. The real sag is LARGER, by an unknown "
+            f"factor. Nothing here can be read as a pass; re-measure with the "
+            f"limit raised above the surge before drawing any conclusion.")
+    out["battery_sag_note"] = (
+        "First-order estimate: sag = peak current x cell internal resistance. "
+        "It ignores the cell's transient behaviour, which over a few "
+        "milliseconds is somewhat stiffer than its DC resistance suggests, and "
+        "it ignores the resistance of the protection FET, connector, and PCB "
+        "traces between the cell and the load -- which add to it. Treat it as "
+        "the right order of magnitude, and measure the cell's ESR to do better."
+        + ("" if supply_mv else
+           " Supply voltage was not recorded for this run, so only the size of "
+           "the drop is shown, not what it leaves at the terminals."))
+
+    if prof["chemistry"] == "coin" and peak >= 100:
+        out["coin_cell_warning"] = (
+            f"This is a coin cell, whose internal resistance is measured in "
+            f"ohms rather than milliohms. A {peak:g} mA surge is not something "
+            f"it can supply at all -- its terminal voltage collapses instead, "
+            f"and the target resets or never boots. A coin-cell design needs a "
+            f"bulk capacitor sized to supply the surge locally, so the cell "
+            f"only ever sees the average.")
+
+    if supply_mv and brownout_mv:
+        risky = [r["scenario"] for r in rows if r.get("browns_out")]
+        if risky:
+            out["brownout_risk"] = risky
+            out["brownout_verdict"] = (
+                f"At {peak:g} mA the terminal voltage falls below the "
+                f"{brownout_mv:g} mV the target needs, for: "
+                f"{', '.join(risky)}. That is a reset in the field, and it will "
+                f"not reproduce on the bench with a fresh cell."
+                + (" And the real surge is larger than the clipped figure this "
+                   "is based on." if clipped else ""))
+        elif clipped:
+            out["brownout_verdict"] = (
+                f"The clipped peak of {peak:g} mA alone would not take the "
+                f"terminal voltage below {brownout_mv:g} mV -- but the true "
+                f"peak is higher and unknown, so this says nothing about "
+                f"whether the target browns out. Re-measure with the "
+                f"over-current limit raised.")
+        else:
+            out["brownout_verdict"] = (
+                f"Even at the worst case modelled the terminal voltage stays "
+                f"above the {brownout_mv:g} mV the target needs.")
+    elif not brownout_mv:
+        out["brownout_unknown"] = (
+            "The target's minimum operating voltage is not recorded, so this "
+            "cannot say whether the sag causes a reset. Ask the developer for "
+            "the brown-out threshold -- the regulator's dropout, or the MCU's "
+            "BOR level, whichever is higher -- and record it with "
+            "p1150_set_battery(brownout_mv=...).")
+
+    # ---- what it means, and what to do ------------------------------ #
+    notes = []
+    if verdict == "OVC_TRIP":
+        notes.append(
+            f"The surge hit the P1150's over-current limit of "
+            f"{float(ovc_ma or OVC_DEFAULT_MA):g} mA and the supply shut off, "
+            f"so the target lost power. The true peak is unknown and is at "
+            f"least that. Re-run with the limit raised to measure it -- and "
+            f"note that the limit tripping is itself the finding: a surge this "
+            f"large is well beyond what a small cell can deliver.")
+    elif verdict in ("INRUSH", "RECURRING_INRUSH", "RECURRING_SURGE",
+                     "POWER_ON_INRUSH"):
+        notes.append(
+            f"A {worst['peak_ma']} mA surge lasting {worst['duration_ms']} ms, "
+            f"against {worst['settled_ma']} mA either side of it -- "
+            f"{worst['peak_over_settled']}x. The energy in it is negligible "
+            f"({worst['charge_uah']} uAh, so battery life is not the issue); "
+            f"the problem is entirely that a cell has to deliver that current "
+            f"instantly, and a tired one cannot.")
+    elif verdict == "SUSTAINED_HIGH_CURRENT":
+        notes.append(
+            f"The current stays high for {worst['duration_ms']} ms rather than "
+            f"spiking briefly, so this is a load being driven and not "
+            f"capacitance charging. Inrush limiting will not help; the fix is "
+            f"either to reduce the load or to confirm the cell is specified for "
+            f"that continuous draw.")
+
+    if ovc_ma and worst["peak_ma"] > 0.7 * float(ovc_ma) and \
+            verdict != "OVC_TRIP":
+        notes.append(
+            f"The peak reaches "
+            f"{_f(100.0 * worst['peak_ma'] / float(ovc_ma), 0)}% of the "
+            f"over-current limit currently set ({float(ovc_ma):g} mA). "
+            f"Run-to-run variation will trip it, which looks like a firmware "
+            f"fault and is not one. A pack protection IC will treat it the same "
+            f"way.")
+
+    if rep.get("timing_note"):
+        jit = rep.get("period_jitter_pct")
+        jitter_txt = f" with {jit}% jitter" if jit is not None else ""
+        notes.append(
+            f"The surges repeat {rep['rate_hz']} times a second{jitter_txt}. "
+            f"{rep['timing_note']} Find the code that enables that rail: the "
+            f"surge is at the enable, so whatever runs on that period is what "
+            f"switches it.")
+    elif len(events) > 1 and verdict != "PASS":
+        notes.append(
+            f"{len(events)} separate spikes were found, not one. Rails coming "
+            f"up in sequence, or a peripheral being enabled repeatedly -- "
+            f"worth knowing, because staggering them further is often the whole "
+            f"fix.")
+
+    # Whether power-gating the rail is even paying for itself. Recharging the
+    # same capacitance every cycle is a real cost, and nobody thinks to weigh
+    # it against what the gating saves.
+    if rep.get("equivalent_average_ma"):
+        notes.append(
+            f"Recharging that capacitance {rep['rate_hz']} times a second "
+            f"costs {rep['equivalent_average_ma']} mA on average "
+            f"({rep['mean_excess_uah_per_event']} uAh per switch-on), which is "
+            f"spent whether or not the rail does any work. If the rail is being "
+            f"power-gated to save current, compare that against what it draws "
+            f"when simply left on -- gating a rail more often than its "
+            f"capacitance can pay back is a net loss, and a common one.")
+    out["findings"] = notes
+
+    if verdict != "PASS":
+        recurring_first = [
+            "Identify which rail is being switched. The surge is at the "
+            "instant an LDO or SMPS is enabled, when the decoupling "
+            "capacitance downstream of it is still discharged and therefore "
+            "looks like a short circuit. Match the timing above against the "
+            "code that turns a regulator on.",
+            "Specify a regulator with SOFT-START. This is the proper fix: the "
+            "part ramps its output over a controlled time instead of stepping "
+            "it, so the capacitance charges gradually and the surge does not "
+            "exist. Many LDO and SMPS families offer a soft-start pin, or an "
+            "adjustable ramp set by a capacitor, at the same price as the part "
+            "without one -- but the choice is made at schematic time, which is "
+            "why finding this before the boards are built is worth so much.",
+            "If the regulator is already fitted and has no soft-start, put a "
+            "slew-rate-limited load switch in front of the rail (a soft-start "
+            "pin, or an RC on the gate of a series FET), which achieves the "
+            "same ramp externally.",
+            "Reduce the decoupling on the switched rail to what that "
+            "sub-circuit actually needs. Bulk capacitance carried over from a "
+            "reference design is the usual reason a switched rail surges as "
+            "hard as it does.",
+            "Reconsider whether the rail needs power-gating at all, or needs "
+            "gating that often. Each enable costs the surge plus the charge to "
+            "refill the capacitance; a rail cycled rapidly can cost more than "
+            "leaving it powered.",
+        ]
+        power_on_first = [
+            "Find what is being energised at that instant: bulk capacitance "
+            "charging through a near-zero source impedance is the usual "
+            "answer, and the surge is limited only by ESR and trace "
+            "resistance.",
+            "Stagger the rails and the peripherals in firmware. Enabling "
+            "loads one at a time, milliseconds apart, costs nothing and often "
+            "removes the problem outright.",
+            "Use a load switch with a controlled slew rate (a soft-start pin, "
+            "or a gate RC) on the branch that draws the surge, so the "
+            "capacitance charges over milliseconds instead of microseconds.",
+            "Check the DC-DC converter's soft-start. A missing or wrongly "
+            "sized soft-start capacitor turns every start-up into a "
+            "full-current event.",
+            "Reduce bulk capacitance to what the design actually needs, or "
+            "add series resistance -- an NTC inrush limiter, or a resistor "
+            "bypassed by a FET once the rail is up.",
+            "Where the surge is unavoidable (a motor, a transmit burst), put "
+            "a capacitor local to the load big enough to supply it, so the "
+            "cell only ever sees the average.",
+        ]
+        out["remedies"] = recurring_first \
+            if out.get("recurrence") == "WHILE_RUNNING" else power_on_first
+        out["verify"] = (
+            "After changing anything, capture the same workload again and "
+            "compare the peak, and for a switched rail the rate as well. The "
+            "peak is the number to drive down; duration and charge barely "
+            "matter here. p1150_inrush_test re-measures the power-up surge "
+            "specifically; a switched rail needs an ordinary capture taken "
+            "while the firmware exercises it.")
+    return out
+
+
+def inrush_screen(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
+                  ovc_ma: float = None,
+                  peak_ma: float = INRUSH_PEAK_MA,
+                  recurring_peak_ma: float = INRUSH_RECURRING_PEAK_MA,
+                  power_on_capture: bool = None) -> dict:
+    """One-line inrush check, cheap enough to run on every capture.
+
+    Returns an empty dict when there is nothing to say.  The point is that a
+    developer measuring battery life has no reason to ask about inrush and no
+    way to see it, so a capture that contains one should say so unprompted
+    rather than waiting to be asked -- and a switched rail turns up in an
+    ordinary battery-life capture, not in a test anyone would think to run.
+    """
+    i64 = np.asarray(i_ma, dtype=np.float64)
+    if i64.size == 0:
+        return {}
+    detect = min(float(peak_ma), float(recurring_peak_ma))
+    if ovc_ma and OVC_CLIP_FRACTION * float(ovc_ma) < detect:
+        detect = OVC_CLIP_FRACTION * float(ovc_ma)
+    # Fast reject: one pass over the array, and most captures stop here.
+    if float(i64.max()) < detect:
+        return {}
+
+    r = find_inrush(i64, fs, peak_ma, ovc_ma=ovc_ma, max_events=1,
+                    recurring_peak_ma=recurring_peak_ma,
+                    power_on_capture=power_on_capture)
+    worst = r.get("worst")
+    rec = r.get("worst_recurring")
+    rep = r.get("repetition") or {}
+    n_rec = r["recurring_events"]
+    repeats = n_rec >= 2 and (
+        (rec and rec["peak_ma"] >= peak_ma) or
+        n_rec >= INRUSH_RECURRING_MIN_EVENTS)
+    if not worst or not (r["inrush_events"] or r["sustained_events"] or repeats):
+        return {}
+
+    if r["clipped_events"]:
+        msg = (f"A current spike reached the over-current limit "
+               f"({float(ovc_ma or OVC_DEFAULT_MA):g} mA) "
+               f"{worst['duration_ms']} ms wide, so the supply cut out and the "
+               f"true peak is higher than measured.")
+        peak_reported, n = worst["peak_ma"], r["inrush_events"]
+    elif repeats:
+        # The serious case, and the one that shows up in a capture taken for
+        # something else entirely.
+        rate = f"{rep['rate_hz']} times a second" if rep.get("rate_hz") \
+            else f"{n_rec} times"
+        msg = (f"A {rec['peak_ma']} mA surge lasting {rec['duration_ms']} ms "
+               f"repeats {rate} while the target is running, against "
+               f"{rec['settled_ma']} mA either side of it. That is what "
+               f"enabling an LDO or SMPS rail looks like -- its decoupling "
+               f"capacitance is a short circuit at the instant of enable. "
+               f"Unlike a power-up surge this one happens for the life of the "
+               f"product, and a real battery may sag far enough at that current "
+               f"to reset the target when the cell is aged, cold or near flat. "
+               f"The fix is a regulator with soft-start, and it is a schematic "
+               f"decision -- much cheaper to find now than after a respin.")
+        peak_reported, n = rec["peak_ma"], n_rec
+    elif r["inrush_events"]:
+        at_power_on = bool(worst.get("at_power_on"))
+        msg = (f"An inrush spike of {worst['peak_ma']} mA lasting "
+               f"{worst['duration_ms']} ms was recorded, against "
+               f"{worst['settled_ma']} mA settled. A real battery may sag "
+               f"badly enough at that current to reset the target -- worst "
+               f"when the cell is aged, cold or near flat."
+               + (" It is at the instant power was applied, which in a product "
+                  "whose battery stays fitted happens once, so it is the less "
+                  "serious kind."
+                  if at_power_on else
+                  " It happens while the target is already running, so it is a "
+                  "rail being switched rather than the power-up surge -- "
+                  "capture for longer to see whether it repeats."))
+        peak_reported, n = worst["peak_ma"], r["inrush_events"]
+    else:
+        msg = (f"Current reached {worst['peak_ma']} mA and stayed above "
+               f"{r['detect_threshold_ma']} mA for {worst['duration_ms']} ms.")
+        peak_reported, n = worst["peak_ma"], r["sustained_events"]
+
+    out = {"inrush_warning": msg, "inrush_peak_ma": peak_reported,
+           "inrush_events": n}
+    if repeats and rep.get("rate_hz"):
+        out["inrush_rate_hz"] = rep["rate_hz"]
+        out["inrush_recurring"] = True
+    return out
+
+
+# ------------------------------------------------------------------ #
 # Auxiliary marker channels                                            #
 # ------------------------------------------------------------------ #
 # A0/D0/D1 carry a signal the target itself drives -- typically a GPIO raised
@@ -578,7 +1581,8 @@ def compare_markers(base_i: np.ndarray, base_asserted: np.ndarray,
                     cand_i: np.ndarray, cand_asserted: np.ndarray,
                     fs: int = SAMPLE_RATE, threshold_pct: float = 5.0,
                     battery_mah: float = None,
-                    min_duration_us: float = 0.0) -> dict:
+                    min_duration_us: float = 0.0,
+                    fs_cand: int = None) -> dict:
     """Regression check over just the marked region of two runs.
 
     Charge per occurrence is the verdict metric, not average current over the
@@ -587,7 +1591,8 @@ def compare_markers(base_i: np.ndarray, base_asserted: np.ndarray,
     marked comparison stricter than a whole-capture one.
     """
     b = marker_analysis(base_i, base_asserted, fs, battery_mah, min_duration_us)
-    c = marker_analysis(cand_i, cand_asserted, fs, battery_mah, min_duration_us)
+    c = marker_analysis(cand_i, cand_asserted, fs_cand or fs, battery_mah,
+                        min_duration_us)
 
     if not b.get("occurrences") or not c.get("occurrences"):
         missing = "baseline" if not b.get("occurrences") else "candidate"
@@ -859,12 +1864,14 @@ def _signature(sm_b, sm_c, ev_b, ev_c, tol_pct):
 
 
 def compare(base: np.ndarray, cand: np.ndarray, fs: int = SAMPLE_RATE,
-            threshold_pct: float = 5.0, battery_mah: float = None) -> dict:
+            threshold_pct: float = 5.0, battery_mah: float = None,
+            fs_cand: int = None) -> dict:
     """Baseline vs candidate, with a verdict and a likely cause."""
+    fs_c = fs_cand or fs
     sm_b = summarize(base, fs, battery_mah)
-    sm_c = summarize(cand, fs, battery_mah)
+    sm_c = summarize(cand, fs_c, battery_mah)
     ev_b = find_events(base, fs)
-    ev_c = find_events(cand, fs)
+    ev_c = find_events(cand, fs_c)
 
     dur_b, dur_c = sm_b["duration_s"], sm_c["duration_s"]
     dur_mismatch_pct = abs(100.0 * (dur_c - dur_b) / dur_b) if dur_b else 0.0

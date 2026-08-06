@@ -51,6 +51,30 @@ STREAM_CHUNK_S = 0.200
 CONNECT_ATTEMPTS = 2
 CHUNK_TIMEOUT_S = 10.0
 
+# Window length of each timebase span, in seconds.  Needed because the sample
+# rate is only 125 kSps for spans up to one second: the acquisition buffer holds
+# 125,000 samples, so a longer span necessarily arrives decimated.  Reporting a
+# duration in milliseconds -- which is the whole basis of the inrush test -- has
+# to use the rate the capture actually came back at, not the nominal one.
+TBASE_SECONDS = {
+    "TBASE_SPAN_10MS": 0.010, "TBASE_SPAN_20MS": 0.020,
+    "TBASE_SPAN_50MS": 0.050, "TBASE_SPAN_100MS": 0.100,
+    "TBASE_SPAN_200MS": 0.200, "TBASE_SPAN_500MS": 0.500,
+    "TBASE_SPAN_1S": 1.0, "TBASE_SPAN_2S": 2.0,
+    "TBASE_SPAN_5S": 5.0, "TBASE_SPAN_10S": 10.0,
+}
+
+# Settling time between arming the trigger and closing the probe relay for an
+# inrush measurement.  acquisition_start returns once the command is accepted;
+# this makes sure the instrument is genuinely waiting on its trigger before the
+# event it is waiting for is created, since the event lasts a millisecond and
+# does not come round again.
+ARM_SETTLE_S = 0.05
+
+# The P1150's over-current limit at power-on.  Used as the assumed limit when a
+# capture is analysed without one having been set in this session.
+OVC_DEFAULT_MA = 3200
+
 # Two channels at 125k samples/s * 4 bytes = 1 MB/s retained.  The cap stops an
 # agent that forgets to call capture_stop from consuming all memory: the 900 s
 # default is ~900 MB.  Lower P1150_MAX_CAPTURE_S on a memory-constrained bench.
@@ -285,9 +309,15 @@ class Session:
         if errs:
             out["hint"] = (
                 "OVER_CURRENT_SOURCE means the target drew more than the OVC "
-                "limit and the supply cut out; raise ovc_ma if the target "
-                "legitimately needs it. Clear with p1150_clear_error, then "
-                "p1150_power_on again."
+                "limit and the supply cut out; the target is unpowered until "
+                "this is cleared. Clear with p1150_clear_error, then "
+                "p1150_power_on again with a limit above the target's true "
+                "peak. If it tripped at power-on, the cause is almost always "
+                "inrush -- a surge of amps lasting a millisecond as bulk "
+                "capacitance charges. That is worth measuring rather than "
+                "designing around: p1150_inrush_test finds it, and a real "
+                "battery would have browned the target out instead of "
+                "supplying it. See p1150_inrush_guide."
             ) if "OVER_CURRENT_SOURCE" in errs else \
                 "Call p1150_clear_error, then re-check status."
         return out
@@ -375,6 +405,55 @@ class Session:
                 "or pass trigger_level explicitly.")
         return analysis.digital_threshold()[0]
 
+    @staticmethod
+    def effective_fs(timebase: str, n_samples: int) -> int:
+        """Samples per second this capture actually came back at.
+
+        Derived from the span and the sample count rather than assumed, because
+        spans longer than a second exceed the 125,000-sample acquisition buffer
+        and arrive decimated.  A duration read off a decimated capture using the
+        nominal rate is wrong by exactly that factor, which for the inrush test
+        is the difference between a 1 ms surge and a 10 ms one.
+        """
+        span = TBASE_SECONDS.get(timebase)
+        if not span or n_samples <= 1:
+            return SAMPLE_RATE
+        fs = n_samples / span
+        # Snap to the nominal rate when it is within rounding: the acquisition
+        # can be a sample or two short of the full window.
+        return SAMPLE_RATE if abs(fs - SAMPLE_RATE) < 0.05 * SAMPLE_RATE \
+            else int(round(fs))
+
+    def _acquire_single(self, dev, timeout_s: float, timeout_msg: str,
+                        on_armed=None) -> tuple:
+        """Arm a one-shot acquisition, optionally act, and wait for the data.
+
+        on_armed runs once the instrument is waiting on its trigger.  That
+        ordering is the only way to catch an event the caller itself causes --
+        closing the probe relay for a power-on inrush -- because the surge is
+        over in a millisecond and there is no second chance at it.
+        """
+        self._arm_aux()
+        self._acq_event.clear()
+        ok, r = dev.acquisition_start(PxxxxAPI.ACQUIRE_MODE_SINGLE)
+        if not ok:
+            raise DeviceError(f"acquisition_start failed: {r}")
+        try:
+            if on_armed is not None:
+                time.sleep(ARM_SETTLE_S)
+                on_armed()
+            start = timer()
+            while not self._acq_event.is_set():
+                if timer() - start > timeout_s:
+                    raise DeviceError(timeout_msg)
+                time.sleep(0.005)
+        finally:
+            try:
+                dev.acquisition_stop()
+            except Exception:
+                pass
+        return _join([self._acq_chunk] if self._acq_chunk else [])
+
     def capture_single(self, timebase: str, trigger_ma: float = None,
                        position: str = PxxxxAPI.TRIG_POS_LEFT,
                        slope: str = PxxxxAPI.TRIG_SLOPE_RISE,
@@ -388,7 +467,7 @@ class Session:
         target says when its own work begins, instead of the capture guessing
         from a current threshold that a quiet feature may never cross.
 
-        Returns (i, isnk, aux); currents in mA.
+        Returns (i, isnk, aux, fs); currents in mA.
         """
         dev = self.require()
         if self._capture_thread is not None:
@@ -408,39 +487,116 @@ class Session:
                 else self._aux_trigger_level(channel)
             dev.set_trigger(src=AUX_TRIG_SRC[channel], pos=position,
                             slope=slope, level=level)
+            msg = (f"Trigger did not fire within {timeout_s}s on {channel} at "
+                   f"{level}. Check that the target really drives that pin, "
+                   f"that the lead is on the right one, and that the slope "
+                   f"matches the edge the firmware produces. p1150_aux_check "
+                   f"shows what the input is actually doing.")
         elif trigger_ma is None:
             dev.set_trigger(src=PxxxxAPI.TRIG_SRC_NONE)
+            msg = f"No acquisition data within {timeout_s}s."
         else:
             dev.set_trigger(src=PxxxxAPI.TRIG_SRC_CUR, pos=position,
                             slope=slope, level=float(trigger_ma))
+            msg = (f"Trigger did not fire within {timeout_s}s at {trigger_ma} "
+                   f"mA. Check the level is above the resting current but "
+                   f"below the event peak.")
 
-        self._arm_aux()
-        self._acq_event.clear()
-        ok, r = dev.acquisition_start(PxxxxAPI.ACQUIRE_MODE_SINGLE)
+        i, isnk, aux = self._acquire_single(dev, timeout_s, msg)
+        return i, isnk, aux, self.effective_fs(timebase, i.size)
+
+    # ---- inrush ----------------------------------------------------- #
+
+    def inrush_capture(self, voltage_mv: int, ovc_ma: int,
+                       timebase: str = PxxxxAPI.TBASE_SPAN_100MS,
+                       trigger_ma: float = 20.0,
+                       position: str = PxxxxAPI.TRIG_POS_LEFT,
+                       timeout_s: float = 15.0) -> tuple:
+        """Power the target up while already armed, to catch the inrush.
+
+        The surge exists only in the microseconds after the probe relay closes,
+        so the order here is the whole trick: set the voltage, arm a one-shot
+        acquisition triggered on current with the probe still open (so nothing
+        can trigger it), and only then close the relay.  The instrument is
+        waiting when the event arrives.
+
+        This is why measure(connect_probe_during=True) is not good enough for
+        inrush: logger mode re-arms between chunks, and the relay closes in one
+        of those gaps, so a millisecond-long surge lands in dead time as often
+        as not.  It captures the boot sequence fine; it cannot be trusted for
+        the surge at the front of it.
+
+        The target is powered down for this and comes back up, by definition --
+        there is no way to measure a power-on surge without a power-on.
+
+        Returns (i, isnk, aux, fs, info); currents in mA.
+        """
+        dev = self.require()
+        if self._capture_thread is not None:
+            raise DeviceError("A background capture is running; "
+                              "call p1150_capture_stop first.")
+        if timebase not in TBASE_SECONDS:
+            raise DeviceError(f"Unknown timebase {timebase}")
+
+        # Open the relay first: the target has to be unpowered for there to be
+        # an inrush to measure, and a target that is already running would
+        # simply never trigger.
+        was_on = self.probe_on
+        if was_on:
+            dev.probe(connect=False)
+            self.probe_on = False
+            # Let the target's rails actually discharge. Re-powering a board
+            # whose bulk capacitance is still charged shows a fraction of the
+            # real surge, which is the most misleading result available here.
+            time.sleep(0.5)
+
+        ok, r = dev.set_vout(int(voltage_mv))
         if not ok:
-            raise DeviceError(f"acquisition_start failed: {r}")
-        start = timer()
+            raise DeviceError(f"set_vout({voltage_mv}) failed: {r}")
+        self.vout_mv = int(voltage_mv)
+        ok, r = dev.set_ovc(int(ovc_ma))
+        if not ok:
+            raise DeviceError(f"set_ovc({ovc_ma}) failed: {r}")
+        self.ovc_ma = int(ovc_ma)
+
+        ok, _ = dev.set_timebase(timebase)
+        if not ok:
+            raise DeviceError(f"set_timebase({timebase}) failed")
+        dev.set_trigger(src=PxxxxAPI.TRIG_SRC_CUR, pos=position,
+                        slope=PxxxxAPI.TRIG_SLOPE_RISE, level=float(trigger_ma))
+
+        def power_up():
+            ok, r = dev.probe(connect=True)
+            if not ok:
+                raise DeviceError(f"probe connect failed: {r}")
+            self.probe_on = True
+
+        i, isnk, aux = self._acquire_single(
+            dev, timeout_s,
+            f"The target drew less than the {trigger_ma} mA trigger level "
+            f"within {timeout_s}s of being powered, so nothing was captured. "
+            f"Either the target is not drawing power at all -- check the probe "
+            f"contact at the battery terminals, and p1150_self_test -- or its "
+            f"start-up current is genuinely below {trigger_ma} mA, which would "
+            f"mean it has no inrush worth worrying about. Retry with a lower "
+            f"trigger_ma to confirm.",
+            on_armed=power_up)
+
+        info = {"voltage_mv": self.vout_mv, "ovc_ma": self.ovc_ma,
+                "timebase": timebase, "trigger_ma": trigger_ma,
+                "probe_was_connected": was_on}
+        # An over-current trip latches on the device and is invisible in the
+        # samples, which just stop rising. Without this the capture reads as a
+        # clean 3.2 A peak rather than as the supply cutting out.
         try:
-            while not self._acq_event.is_set():
-                if timer() - start > timeout_s:
-                    raise DeviceError(
-                        f"Trigger did not fire within {timeout_s}s on "
-                        f"{channel} at {level}. Check that the target really "
-                        f"drives that pin, that the lead is on the right one, "
-                        f"and that the slope matches the edge the firmware "
-                        f"produces. p1150_aux_check shows what the input is "
-                        f"actually doing."
-                        if trigger_on else
-                        f"Trigger did not fire within {timeout_s}s at "
-                        f"{trigger_ma} mA. Check the level is above the "
-                        f"resting current but below the event peak.")
-                time.sleep(0.005)
-        finally:
-            try:
-                dev.acquisition_stop()
-            except Exception:
-                pass
-        return _join([self._acq_chunk] if self._acq_chunk else [])
+            st = self.status()
+            info["device_errors"] = st.get("errors")
+            info["ovc_tripped"] = bool(st.get("errors") and
+                                       "OVER_CURRENT_SOURCE" in st["errors"])
+            info["probe_connected"] = st.get("probe_connected")
+        except Exception:
+            pass
+        return i, isnk, aux, self.effective_fs(timebase, i.size), info
 
     def self_test(self) -> dict:
         """Measure the P1150's own calibration resistors as a known load.

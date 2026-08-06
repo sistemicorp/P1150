@@ -35,7 +35,7 @@ except ImportError:                                  # mcp < 2.0
 
 from . import analysis, storage, config
 from .device import SESSION, SAMPLE_RATE
-from .scenarios import GUIDE, MARKER_GUIDE
+from .scenarios import GUIDE, MARKER_GUIDE, INRUSH_GUIDE
 
 mcp = _Server("p1150")
 
@@ -52,16 +52,43 @@ def _fail(e: Exception) -> dict:
     return {"error": str(e)}
 
 
+def _powered_up_during(meta: dict) -> bool:
+    """Did this capture begin with the target unpowered?
+
+    It decides how a surge at the front of the capture is read: the power-up
+    one, which happens once when the battery is fitted, or a rail being
+    switched, which happens forever.  Recorded at capture time rather than
+    guessed from the samples, because a target asleep at a few microamps looks
+    exactly like one that is not powered at all.
+    """
+    meta = meta or {}
+    return bool(meta.get("capture_type") == "inrush" or
+                meta.get("connect_probe_during"))
+
+
+def _fs(meta: dict) -> int:
+    """The rate a stored run was actually sampled at.
+
+    Captures over a timebase longer than one second come back decimated, so a
+    duration computed from the nominal 125 kSps would be wrong by that factor.
+    Runs stored before the rate was recorded were all at the nominal rate.
+    """
+    return int((meta or {}).get("sample_rate") or SAMPLE_RATE)
+
+
 def _store(label: str, i_ma: np.ndarray, extra: dict = None,
-           isnk_ma: np.ndarray = None, aux: dict = None) -> dict:
+           isnk_ma: np.ndarray = None, aux: dict = None,
+           fs: int = SAMPLE_RATE) -> dict:
     """Persist a capture and return the summary the agent actually sees."""
     if i_ma.size == 0:
         return {"error": "Capture returned no samples."}
     battery = config.capacity_mah()
-    summary = analysis.summarize(i_ma, SAMPLE_RATE, battery)
+    summary = analysis.summarize(i_ma, fs, battery)
     meta = dict(summary)
     meta.update(extra or {})
     meta["voltage_mv"] = SESSION.vout_mv
+    meta["ovc_ma"] = SESSION.ovc_ma
+    meta["sample_rate"] = int(fs)
     if aux:
         # Record the levels in force at capture time. They can be overridden
         # later, but a run must still be readable after the project's aux setup
@@ -75,6 +102,22 @@ def _store(label: str, i_ma: np.ndarray, extra: dict = None,
     out.update(extra or {})
     if aux:
         out.update(_marker_headline(aux, meta, run_id))
+    # Every capture is screened for an inrush surge, whatever it was taken for.
+    # A developer measuring battery life has no reason to ask about inrush and
+    # no way to see it without an instrument at the battery terminals -- so a
+    # capture that contains one has to say so unprompted, or it never comes up
+    # until the field returns start.
+    try:
+        warn = analysis.inrush_screen(i_ma, fs, SESSION.ovc_ma,
+                                      power_on_capture=_powered_up_during(meta))
+        if warn:
+            warn["inrush_hint"] = (
+                f"p1150_inrush_check('{run_id}') measures the surge and "
+                f"estimates whether a real battery would sag far enough to "
+                f"reset the target. p1150_inrush_guide explains why it matters.")
+            out.update(warn)
+    except Exception:
+        pass
     if not battery:
         out["hint"] = ("Battery capacity is not configured, so battery life and "
                        "percentage-of-battery figures are unavailable. Ask the "
@@ -139,13 +182,50 @@ def p1150_measurement_guide() -> str:
     """How to measure battery current well with a P1150.
 
     Read this before the first measurement in a conversation. Covers: choosing a
-    supply voltage and over-current limit, the five common current profiles
-    (sleep floor, boot inrush, periodic wake-up, single triggered event,
-    scripted regression run), which tool and capture length suits each, how to
+    supply voltage and over-current limit, the eight current profiles worth
+    knowing (sleep floor, boot sequence, power-on inrush surge, periodic
+    wake-up, single triggered event, GPIO-marked code region, scripted
+    regression run, charging), which tool and capture length suits each, how to
     read a regression result, and the mistakes that produce measurements that
     look fine but mean nothing.
     """
     return GUIDE
+
+
+@mcp.tool()
+def p1150_inrush_guide() -> str:
+    """Why a current surge resets targets in the field, and what to do about it.
+
+    Read this before running p1150_inrush_test or interpreting an inrush
+    warning, and whenever a target resets unpredictably, fails to start on a
+    weak or cold battery, boot-loops, or trips the over-current limit.
+
+    Inrush is the one thing measurable here that is a reliability bug rather
+    than a battery-life one, and it is invisible without an instrument at the
+    battery terminals. The P1150 is a low-impedance supply: it delivers the
+    surge and holds its voltage, so the target works perfectly on the bench. A
+    real battery sags by (surge current x internal resistance) instead, and
+    since a cell's internal resistance is at its highest when aged, cold and
+    near flat, the failure appears in the field and refuses to reproduce.
+
+    Crucially it distinguishes the two kinds, which are not equally important.
+    A surge at power-up happens once, when the battery is fitted, and is usually
+    acceptable. A surge from a rail being switched -- an LDO or SMPS
+    power-gated to save current, whose decoupling capacitance is a short circuit
+    at the instant of enable -- repeats for the life of the product. That one is
+    the real defect, its proper fix is a regulator with soft-start, and because
+    that is a schematic decision it is far cheaper to find during firmware
+    development than after the boards exist.
+
+    Covers: both kinds and when the power-up one does matter, where the surge
+    comes from, why the developer cannot see it, how to measure each without
+    missing it, why the over-current limit must be set high, what to ask the
+    developer for (chemistry, cell internal resistance, the target's brown-out
+    voltage), how to judge the sag, whether the power-gating is even paying for
+    itself, the fixes in the order they are worth trying, and the confounders
+    that make a measured surge smaller than the real one.
+    """
+    return INRUSH_GUIDE
 
 
 @mcp.tool()
@@ -176,33 +256,68 @@ def p1150_marker_guide() -> str:
 # Project setup                                                        #
 # ------------------------------------------------------------------ #
 @mcp.tool()
-def p1150_set_battery(capacity_mah: float, chemistry: str = None,
-                      nominal_mv: int = None) -> dict:
-    """Record the capacity of the battery this target runs on, in mAh.
+def p1150_set_battery(capacity_mah: float = None, chemistry: str = None,
+                      nominal_mv: int = None, esr_mohm: float = None,
+                      brownout_mv: int = None) -> dict:
+    """Record what battery this target runs on, and what it needs of it.
 
-    ASK THE DEVELOPER FOR THIS at the start of a project, before the first
-    measurement -- it cannot be inferred from a current waveform or from the
-    code, and without it the measurements stay abstract. With it, every result
-    gains the numbers people actually act on: how long the device lasts, what
-    share of the battery one wake-up or one boot costs, how many times an
+    ASK THE DEVELOPER FOR THE CAPACITY at the start of a project, before the
+    first measurement -- it cannot be inferred from a current waveform or from
+    the code, and without it the measurements stay abstract. With it, every
+    result gains the numbers people actually act on: how long the device lasts,
+    what share of the battery one wake-up or one boot costs, how many times an
     operation can run before the pack is flat, and whether a measured charging
     current is a sensible C rate.
 
-    The setting persists across sessions, so it only needs asking once per
-    project. Call p1150_get_battery to see what is currently set.
+    Settings persist across sessions and are merged, not replaced, so each can
+    be added when it comes up. Call p1150_get_battery to see what is set.
 
     capacity_mah: the pack's rated capacity, e.g. 220 for a small LiPo, 2000 for
         an 18650, 3000 for a phone-sized cell, 225 for a CR2032 coin cell.
-    chemistry: optional, e.g. "Li-ion", "LiPo", "LiFePO4", "alkaline", "NiMH".
-    nominal_mv: optional nominal cell voltage, useful as a reminder of what to
-        pass to p1150_power_on.
+
+    chemistry: e.g. "Li-ion", "LiPo", "LiFePO4", "alkaline", "NiMH", "CR2032".
+        Worth recording even approximately: it sets the internal resistance
+        assumed when judging whether a current surge would brown the target out,
+        and coin cells behave completely differently from everything else.
+
+    nominal_mv: nominal cell voltage, useful as a reminder of what to pass to
+        p1150_power_on.
+
+    esr_mohm: the cell's internal resistance in milliohms, if it is known or has
+        been measured. Only needed for the inrush brown-out estimate, which
+        otherwise assumes a typical figure for the chemistry. A measured value
+        is much better than an assumed one -- it is the difference between
+        "this might reset in the cold" and "this will".
+
+    brownout_mv: the lowest terminal voltage the target still works at -- the
+        regulator's dropout or the MCU's brown-out reset level, whichever is
+        higher. WORTH ASKING FOR whenever an inrush surge is found: without it
+        the sag a real battery would suffer can be calculated but not judged,
+        and judging it is the entire question. Typically 3000-3300 mV for a
+        3.3 V system on a Li-ion cell.
     """
     try:
-        if capacity_mah <= 0:
+        if capacity_mah is not None and capacity_mah <= 0:
             return {"error": "capacity_mah must be greater than zero."}
-        cfg = config.set_battery(capacity_mah, chemistry, nominal_mv)
-        cfg["note"] = ("Recorded. Battery life, percentage-of-battery and C rate "
-                       "figures are now included in measurement results.")
+        if not any(v is not None for v in
+                   (capacity_mah, chemistry, nominal_mv, esr_mohm,
+                    brownout_mv)):
+            return {"error": "Nothing to record. Pass at least one of "
+                             "capacity_mah, chemistry, nominal_mv, esr_mohm, "
+                             "brownout_mv."}
+        cfg = config.set_battery(capacity_mah, chemistry, nominal_mv,
+                                 esr_mohm, brownout_mv)
+        notes = []
+        if cfg.get("capacity_mah"):
+            notes.append("Battery life, percentage-of-battery and C rate "
+                         "figures are included in measurement results.")
+        else:
+            notes.append("No capacity recorded yet, so battery life and "
+                         "percentage-of-battery figures are still unavailable.")
+        if cfg.get("brownout_mv"):
+            notes.append("Inrush results now say whether a real cell would sag "
+                         "below the target's operating voltage.")
+        cfg["note"] = " ".join(notes)
         return cfg
     except Exception as e:
         return _fail(e)
@@ -210,18 +325,31 @@ def p1150_set_battery(capacity_mah: float, chemistry: str = None,
 
 @mcp.tool()
 def p1150_get_battery() -> dict:
-    """Show the battery capacity currently configured for this project.
+    """Show the battery settings configured for this project.
+
+    Reports capacity, chemistry, internal resistance and the target's brown-out
+    voltage, and the internal-resistance figures that would be assumed for an
+    inrush assessment given what is set.
 
     If nothing is set, ask the developer for the pack's mAh rating and record it
     with p1150_set_battery.
     """
     try:
         cfg = config.get()
+        model = config.battery_model()
+        cfg["assumed_esr"] = analysis.esr_profile(model["chemistry"],
+                                                  model["esr_mohm"])
         if not cfg.get("capacity_mah"):
-            return {"configured": False,
-                    "action": "Ask the developer what capacity battery (in mAh) "
-                              "the target runs on, then call p1150_set_battery."}
+            cfg["configured"] = False
+            cfg["action"] = ("Ask the developer what capacity battery (in mAh) "
+                             "the target runs on, then call p1150_set_battery.")
+            return cfg
         cfg["configured"] = True
+        if not cfg.get("brownout_mv"):
+            cfg["brownout_hint"] = (
+                "The target's minimum operating voltage is not recorded. It is "
+                "needed only to judge an inrush surge -- ask for it if one "
+                "turns up.")
         return cfg
     except Exception as e:
         return _fail(e)
@@ -589,6 +717,13 @@ def p1150_power_on(voltage_mv: int, ovc_ma: int = 500) -> dict:
         which is easy to misread as a firmware fault. 500 mA suits most
         low-power boards; raise it if the target legitimately draws more.
 
+        If it trips the moment power is applied, the cause is almost always
+        inrush -- a surge of amps for a millisecond as bulk capacitance charges.
+        Raising the limit gets past it, but the surge is worth measuring first
+        with p1150_inrush_test: a battery cannot supply it and would brown the
+        target out instead. Note also that a limit below a surge silently CLIPS
+        it, so a capture taken at 500 mA cannot show a 2 A peak.
+
     Power stays on until p1150_power_off or p1150_disconnect, so firmware can be
     re-flashed over JTAG between measurements without cycling power.
     """
@@ -641,10 +776,17 @@ def p1150_measure(duration_s: float, label: str,
     charge (mAh), resting floor, peak, and percentiles. The samples themselves
     are kept on disk; use p1150_segment, p1150_events and p1150_compare to
     examine them further.
+
+    The capture is also screened for inrush surges, and reports one if found --
+    a rail being power-gated surges every time firmware enables it, and turns up
+    in a capture like this one without anyone looking for it. Pass such a
+    warning on to the developer; see p1150_inrush_check.
     """
     try:
         i, isnk, aux = SESSION.measure(duration_s, connect_probe_during)
-        return _store(label, i, {"capture_type": "timed"},
+        return _store(label, i,
+                      {"capture_type": "timed",
+                       "connect_probe_during": bool(connect_probe_during)},
                       isnk_ma=isnk, aux=aux)
     except Exception as e:
         return _fail(e)
@@ -777,7 +919,7 @@ def p1150_charge_summary(run_id: str) -> dict:
             return {"error": f"Run '{run_id}' has no sink-current channel, so "
                              f"charging cannot be assessed. Re-capture with "
                              f"p1150_verify_charging."}
-        out = analysis.charge_test(i, isnk, SAMPLE_RATE, config.capacity_mah())
+        out = analysis.charge_test(i, isnk, _fs(meta), config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
         return out
@@ -831,14 +973,238 @@ def p1150_capture_single(label: str, timebase: str = "TBASE_SPAN_100MS",
         TRIG_SLOPE_FALL on an active-low one.
     """
     try:
-        i, isnk, aux = SESSION.capture_single(timebase, trigger_ma, position,
-                                              slope, timeout_s,
-                                              trigger_on, trigger_level)
+        i, isnk, aux, fs = SESSION.capture_single(
+            timebase, trigger_ma, position, slope, timeout_s,
+            trigger_on, trigger_level)
         return _store(label, i, {"capture_type": "single",
                                  "timebase": timebase,
                                  "trigger_ma": trigger_ma,
                                  "trigger_on": trigger_on},
-                      isnk_ma=isnk, aux=aux)
+                      isnk_ma=isnk, aux=aux, fs=fs)
+    except Exception as e:
+        return _fail(e)
+
+
+# ------------------------------------------------------------------ #
+# Inrush                                                               #
+# ------------------------------------------------------------------ #
+def _inrush_args(overrides: dict = None) -> dict:
+    """Battery and supply context for an inrush assessment."""
+    m = config.battery_model()
+    args = {"chemistry": m["chemistry"], "esr_mohm": m["esr_mohm"],
+            "brownout_mv": m["brownout_mv"]}
+    args.update({k: v for k, v in (overrides or {}).items() if v is not None})
+    return args
+
+
+@mcp.tool()
+def p1150_inrush_test(label: str = "inrush", voltage_mv: int = None,
+                      ovc_ma: int = 3200, timebase: str = "TBASE_SPAN_100MS",
+                      trigger_ma: float = 20.0,
+                      brownout_mv: int = None) -> dict:
+    """Measure the target's power-on inrush surge and say whether a real battery
+    could supply it.
+
+    THIS COVERS ONLY THE POWER-UP SURGE, WHICH IS THE LESS IMPORTANT KIND. In a
+    shipped product the battery is fitted once and left in, so a surge that only
+    happens when power is first applied happens once in the device's life, and
+    is usually acceptable. The kind that hurts is a rail switched while the
+    target runs -- an LDO or SMPS power-gated to save current, surging every
+    time firmware enables it, for the life of the product. To find that one,
+    capture the target doing its normal work with p1150_measure or
+    capture_start/capture_stop (every capture is screened automatically) and use
+    p1150_inrush_check. A clean result HERE says nothing about switched rails.
+
+    Run this one when the power-up surge itself is in question: the target
+    boot-loops or fails to start on a weak or cold cell, it trips the
+    over-current limit at power-on, the battery is user-replaceable, a charger
+    or dock can hot-plug the rail, or the cell is a coin cell.
+
+    THIS POWER-CYCLES THE TARGET. The probe is opened, the target's rails are
+    given a moment to discharge, and it is powered back up -- there is no way to
+    measure a power-on surge without a power-on. Say so before calling it if the
+    target is mid-workload, holding state, or connected to a debugger.
+
+    WHY INRUSH IS WORTH CHECKING EVEN WHEN NOTHING SEEMS WRONG. Most developers
+    have no instrument at the battery terminals, so an inrush problem is
+    invisible to them: charging bulk capacitance can pull amps for a millisecond
+    or two, and the only symptom is a device that occasionally fails to start.
+    The P1150 is a low-impedance supply, so it delivers that surge and shows it.
+    A battery cannot -- it sags by (surge current x internal resistance)
+    instead, and that sag is what resets the target. Because a cell's internal
+    resistance is at its highest when aged, cold, and at a low state of charge,
+    a board that boots perfectly on the bench can reset every time on a cold
+    morning at the end of the battery's life. Inrush is a common root cause of
+    exactly that class of field failure, and it is one of the few things
+    measurable here that is a reliability bug rather than a battery-life one.
+
+    HOW IT IS MEASURED: the acquisition is armed and triggered on current with
+    the probe still open, and only then is the relay closed. The instrument is
+    already waiting when the surge arrives. p1150_measure(connect_probe_during=
+    True) captures the boot sequence but re-arms between chunks, so a
+    millisecond-long surge at the very front of it can fall in a gap.
+
+    Returns the peak, how long it lasted, what the target settles at afterwards,
+    and the estimated terminal-voltage sag for a fresh cell, a part-aged one,
+    and an aged cold one near flat -- the last being where field failures
+    happen. If brownout_mv is known it says outright whether the target would
+    reset.
+
+    voltage_mv: supply voltage for the test. Defaults to whatever p1150_power_on
+        last set. THIS GOES STRAIGHT TO THE TARGET'S BATTERY TERMINALS --
+        confirm it with the developer if it has not already been agreed. Test at
+        the LOW end of the battery's range as well as at nominal: inrush is
+        worse where the battery is weakest, and that is the case that fails.
+
+    ovc_ma: over-current limit for the test, default 3200 mA, which is the
+        P1150's own default and about its ceiling. Leave it high: the point is
+        to measure the surge, and a low limit clips it -- the trace then shows
+        the instrument's limit rather than the target's demand, and the supply
+        cuts out mid-measurement. If it trips even at 3200 mA, that is itself
+        the finding.
+
+    timebase: capture window. 100 ms is a good default: long enough to show the
+        surge and what the target settles to afterwards. Use TBASE_SPAN_10MS or
+        20MS to resolve the shape of a very fast surge, or 500MS/1S to see the
+        whole boot after it. Spans above 1 s are decimated by the instrument and
+        blur a millisecond-scale event -- avoid them here.
+
+    trigger_ma: current level that starts the capture, default 20 mA. It only
+        needs to sit above the noise floor and below the surge, since the target
+        is drawing nothing at all when the capture is armed.
+
+    brownout_mv: the lowest terminal voltage the target still runs at, for this
+        test only. Better recorded once with p1150_set_battery.
+    """
+    try:
+        v = voltage_mv or SESSION.vout_mv
+        if not v:
+            return {"error": "No supply voltage set or given. Pass voltage_mv "
+                             "(confirm it with the developer first -- it goes "
+                             "directly to the target's battery terminals), or "
+                             "call p1150_power_on first."}
+        i, isnk, aux, fs, info = SESSION.inrush_capture(
+            v, ovc_ma, timebase, trigger_ma)
+        stored = _store(label, i, dict(info, capture_type="inrush"),
+                        isnk_ma=isnk, aux=aux, fs=fs)
+        if "error" in stored:
+            return stored
+
+        out = analysis.inrush_analysis(
+            i, fs, ovc_ma=info.get("ovc_ma"), supply_mv=v,
+            # The latched error is authoritative where the samples are only
+            # suggestive: a surge that ends just under the limit still tripped
+            # it if the device says so.
+            ovc_tripped=info.get("ovc_tripped"),
+            power_on_capture=True,
+            **_inrush_args({"brownout_mv": brownout_mv}))
+        out["run_id"] = stored.get("run_id")
+        out["label"] = label
+        out["voltage_mv"] = v
+        out["timebase"] = timebase
+        out["settled_ma"] = stored.get("median_ma")
+
+        if info.get("ovc_tripped"):
+            out["device_errors"] = info.get("device_errors")
+            out["action"] = (
+                f"The over-current limit of {ovc_ma} mA tripped, so the target "
+                f"is unpowered now and the peak shown is the instrument's "
+                f"limit, not the target's. Call p1150_clear_error and then "
+                f"p1150_power_on to restore power. The trip is the result: the "
+                f"target demands more than {ovc_ma} mA at power-up, which no "
+                f"small cell can deliver.")
+        elif not info.get("probe_was_connected"):
+            out["note_power"] = ("The target was unpowered before this test and "
+                                 "is powered now.")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_inrush_check(run_id: str, peak_ma: float = None,
+                       max_duration_ms: float = None,
+                       brownout_mv: int = None,
+                       supply_mv: int = None) -> dict:
+    """Look for inrush surges in a stored capture, and assess what a real
+    battery would do about them.
+
+    USE THIS ON ORDINARY CAPTURES, not just on one taken with p1150_inrush_test.
+    The most damaging kind of inrush is not at power-up at all: it is a rail
+    being switched while the target runs. Power-gating an LDO or SMPS to save
+    current is standard practice, and at the instant of enable the decoupling
+    capacitance downstream is discharged -- which is to say a short circuit --
+    so the current is limited only by resistance in the path. That repeats every
+    duty cycle for the life of the product, and it turns up in a capture taken
+    to measure battery life, where nobody is looking for it.
+
+    Also the tool to reach for when a capture came back with an inrush warning
+    attached, or when the target resets unpredictably, fails to start on a weak
+    battery, or trips the over-current limit.
+
+    It separates the two cases and says which it found, as `recurrence`:
+      WHILE_RUNNING     a switched rail. Reports how often it repeats, whether
+                        the timing is regular (a timer) or not (event-driven),
+                        the charge each switch-on costs, and what that adds up
+                        to as an average current -- which answers whether the
+                        power-gating is saving anything at all. The proper fix
+                        is a regulator with soft-start.
+      ONCE_AT_POWER_UP  the surge when power was applied. In a product whose
+                        battery is fitted once and left in, that happens once in
+                        the device's life, so it is ranked lower. It still
+                        matters for a user-replaceable battery, a pack
+                        protection FET that can re-connect under load, a
+                        hot-pluggable rail, or a coin cell.
+
+    A spike counts as an inrush when it is brief (under 4 ms at 10% of its own
+    peak) and stands well above the current the target settles at either side of
+    it -- the only fair reference, since 1.5 A into a device that then runs at
+    1.2 A is ordinary and 1.5 A into one that then runs at 3 mA is not. A single
+    spike must also reach 1 A; a REPEATING one counts from 250 mA, because
+    repetition is itself most of the evidence and a switched rail on a small
+    circuit need not reach an amp to be the same fault. Longer excursions are
+    reported as sustained load -- a radio waking, a sensor converting -- which
+    has a different cause and a different fix.
+
+    If the run was captured with the over-current limit set below the surge, the
+    detection threshold drops to just under that limit: the instrument clips
+    there, so a 2 A surge measured behind a 500 mA limit appears as a 500 mA
+    plateau and would otherwise read as clean. Any such event is reported with
+    its peak marked as a lower bound.
+
+    peak_ma: minimum peak for a SINGLE spike to count as an inrush, default
+        1000 mA. Lower it to investigate a target whose supply is smaller, or
+        whose brown-out threshold is close.
+
+    max_duration_ms: longest a spike may last and still be inrush, default 4 ms.
+
+    supply_mv / brownout_mv: override the run's recorded supply voltage and the
+        target's minimum operating voltage. Both are better recorded once --
+        the supply comes from p1150_power_on, the brown-out level from
+        p1150_set_battery(brownout_mv=...).
+    """
+    try:
+        i, meta = storage.load(run_id)
+        kw = {}
+        if peak_ma is not None:
+            kw["peak_ma"] = peak_ma
+        if max_duration_ms is not None:
+            kw["max_duration_ms"] = max_duration_ms
+        out = analysis.inrush_analysis(
+            i, _fs(meta), ovc_ma=meta.get("ovc_ma"),
+            supply_mv=supply_mv or meta.get("voltage_mv"),
+            power_on_capture=_powered_up_during(meta),
+            **_inrush_args({"brownout_mv": brownout_mv}), **kw)
+        out["run_id"] = run_id
+        out["label"] = meta.get("label")
+        out["settled_ma"] = meta.get("median_ma")
+        if not meta.get("ovc_ma"):
+            out["ovc_unknown"] = (
+                "The over-current limit in force during this run was not "
+                "recorded, so a surge clipped by it cannot be identified as "
+                "clipped. If this run predates that being stored, or the peak "
+                "sits suspiciously flat, re-measure with p1150_inrush_test.")
+        return out
     except Exception as e:
         return _fail(e)
 
@@ -868,7 +1234,7 @@ def p1150_summary(run_id: str) -> dict:
     """
     try:
         i, meta = storage.load(run_id)
-        out = analysis.summarize(i, SAMPLE_RATE, config.capacity_mah())
+        out = analysis.summarize(i, _fs(meta), config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
         return out
@@ -888,7 +1254,7 @@ def p1150_segment(run_id: str) -> dict:
     """
     try:
         i, meta = storage.load(run_id)
-        out = analysis.segment(i, SAMPLE_RATE, config.capacity_mah())
+        out = analysis.segment(i, _fs(meta), config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
         return out
@@ -915,7 +1281,7 @@ def p1150_events(run_id: str, threshold_ma: float = None,
     """
     try:
         i, meta = storage.load(run_id)
-        out = analysis.find_events(i, SAMPLE_RATE, threshold_ma,
+        out = analysis.find_events(i, _fs(meta), threshold_ma,
                                    min_duration_us, config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
@@ -965,7 +1331,7 @@ def p1150_marker_stats(run_id: str, channel: str = None,
     try:
         i, _, aux, meta = storage.load_all(run_id)
         ch, cfg, asserted = _resolve_marker(aux, channel, meta)
-        out = analysis.marker_analysis(i, asserted, SAMPLE_RATE,
+        out = analysis.marker_analysis(i, asserted, _fs(meta),
                                        config.capacity_mah(), min_duration_us)
         out["run_id"] = run_id
         out["label"] = meta.get("label")
@@ -1014,8 +1380,9 @@ def p1150_compare_marker(baseline_run_id: str, candidate_run_id: str,
                              f"({bch} vs {cch}). Pass channel= to pick one, or "
                              f"re-capture so both mark the same input."}
         out = analysis.compare_markers(bi, b_asserted, ci, c_asserted,
-                                       SAMPLE_RATE, threshold_pct,
-                                       config.capacity_mah(), min_duration_us)
+                                       _fs(bmeta), threshold_pct,
+                                       config.capacity_mah(), min_duration_us,
+                                       fs_cand=_fs(cmeta))
         out["marker_channel"] = bch
         out["marker_name"] = bcfg.get("name") or ccfg.get("name")
         out["baseline_run"] = {"run_id": baseline_run_id,
@@ -1059,8 +1426,8 @@ def p1150_compare(baseline_run_id: str, candidate_run_id: str,
     try:
         b, mb = storage.load(baseline_run_id)
         c, mc = storage.load(candidate_run_id)
-        out = analysis.compare(b, c, SAMPLE_RATE, threshold_pct,
-                               config.capacity_mah())
+        out = analysis.compare(b, c, _fs(mb), threshold_pct,
+                               config.capacity_mah(), fs_cand=_fs(mc))
         out["baseline_run"] = {"run_id": baseline_run_id,
                                "label": mb.get("label"),
                                "voltage_mv": mb.get("voltage_mv")}
@@ -1104,6 +1471,7 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
         import matplotlib.pyplot as plt
 
         i, _, aux, meta = storage.load_all(run_id)
+        fs = _fs(meta)
         n = i.size
         # Min/max decimation rather than striding: a 1 ms burst inside a 30 s
         # capture would fall between strided samples and vanish from the plot,
@@ -1116,9 +1484,9 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
             lo, hi = blocks.min(axis=1), blocks.max(axis=1)
             y = np.empty(lo.size * 2, dtype=np.float32)
             y[0::2], y[1::2] = lo, hi
-            x = np.linspace(0, trim / SAMPLE_RATE, y.size)
+            x = np.linspace(0, trim / fs, y.size)
         else:
-            y, x = i, np.arange(n) / SAMPLE_RATE
+            y, x = i, np.arange(n) / fs
 
         if log_scale:
             y = np.maximum(y, 1e-4)  # keep zeros off a log axis
@@ -1135,7 +1503,7 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
                 # and would ink the whole axis solid anyway.
                 if 0 < starts.size <= 400:
                     for a, b in zip(starts, ends):
-                        plt.axvspan(a / SAMPLE_RATE, b / SAMPLE_RATE,
+                        plt.axvspan(a / fs, b / fs,
                                     color="#f0a30a", alpha=0.20, linewidth=0)
                     marked = {"channel": ch, "name": cfg.get("name"),
                               "shaded": int(starts.size)}

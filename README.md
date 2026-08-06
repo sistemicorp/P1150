@@ -226,8 +226,10 @@ Ask the agent things like:
 * *"Battery life dropped — find out what changed."*
 * *"I've plugged in the USB charger — is it actually charging the battery?"*
 * *"Add a marker GPIO around `sensor_read()` and tell me what one call costs."*
+* *"This board sometimes won't start on a cold morning — is it inrush?"*
+* *"I power-gate the sensor rail — check what that costs when it switches on."*
 
-## Battery capacity
+## Battery settings
 
 The agent is told to ask you, once per project, what capacity battery the target
 runs on, and to record it with `p1150_set_battery`.  It persists in
@@ -238,6 +240,12 @@ current reading into something you can act on: projected battery life, the share
 of the pack one wake-up or one boot costs, how many times an operation can run
 before the battery is flat, and whether a measured charging current is a
 sensible C rate.
+
+Three optional settings go in the same place and matter only for the inrush
+assessment below: `chemistry`, the cell's internal resistance `esr_mohm` if you
+have measured it, and `brownout_mv` — the lowest terminal voltage the target
+still runs at, being the regulator's dropout or the MCU's brown-out reset level,
+whichever is higher.  Settings merge, so each can be added when it comes up.
 
 A typical session: `p1150_connect` → `p1150_power_on(3700, 500)` → the target
 stays powered while you edit and re-flash over JTAG →
@@ -272,6 +280,10 @@ edit-flash-run loop), `p1150_capture_single` (one triggered event)
 
 **Charging** — `p1150_verify_charging`, `p1150_charge_summary`
 
+**Inrush** — `p1150_inrush_check` (finds surges in any stored run, including the
+switched-rail kind that shows up in an ordinary capture), `p1150_inrush_test`
+(power-cycles the target to catch the power-up surge specifically)
+
 **Markers** — `p1150_set_aux`, `p1150_get_aux`, `p1150_clear_aux`,
 `p1150_aux_check` (wiring verification), `p1150_marker_stats`,
 `p1150_compare_marker`
@@ -282,10 +294,11 @@ band), `p1150_events` (wake-up rate, burst length, charge per wake),
 `p1150_list_runs`
 
 **Guidance** — `p1150_measurement_guide` returns the measurement know-how the
-agent needs: how to choose a voltage and over-current limit, the seven common
-current profiles and what capture length each needs, and the mistakes that
+agent needs: how to choose a voltage and over-current limit, the nine current
+profiles worth knowing and what capture length each needs, and the mistakes that
 produce measurements which look fine but mean nothing.
-`p1150_marker_guide` covers the GPIO-marker workflow below.
+`p1150_marker_guide` covers the GPIO-marker workflow below, and
+`p1150_inrush_guide` the inrush one.
 
 Charge is reported in mAh (µAh for a single wake-up event), matching how battery
 capacity is specified.
@@ -351,6 +364,97 @@ recorded only once `p1150_set_aux` has declared one.  The P1150 samples every
 8 µs, so hold a marker for at least ~50 µs; for faster work, mark a loop of N
 iterations and divide.
 
+## Inrush current
+
+A P1150 is a low-impedance supply.  Asked for 2 A for a millisecond while a
+target's bulk capacitance charges, it delivers 2 A and holds its output voltage —
+so the surge shows up on the trace and the target boots perfectly.
+
+A battery cannot do that.  It sags by
+
+    voltage lost = surge current × cell internal resistance
+
+and that sag is what resets the target.  Since a cell's internal resistance is at
+its highest when it is aged, cold, and at a low state of charge — three
+conditions that stack — a board with an inrush problem passes every bench test on
+a fresh cell and then fails on cold mornings, on old units, near the end of the
+battery.  Inrush is a common root cause of exactly that class of field return,
+and without an instrument at the battery terminals there is nothing to see but an
+intermittent reset that will not reproduce indoors.
+
+So the server flags it whether or not anyone asked.  **Every capture is
+screened**, whatever it was taken for, and one containing a surge comes back
+with a warning attached.
+
+### Two kinds, and they are not equally important
+
+**At power-up** — the surge when the battery is first connected.  In a real
+product that happens *once*, on the assembly line: the cell is fitted and stays
+there.  So it is usually acceptable, and the analysis ranks it low.  It still
+matters for a user-replaceable battery, a pack protection FET that can
+re-connect under load, a hot-pluggable rail, or a coin cell — and it matters if
+it trips protection.
+
+**While the target is running** — a rail being switched, and the one that hurts.
+Power-gating an LDO or SMPS to save current is standard practice in a battery
+product; at the instant firmware enables that regulator, the decoupling
+capacitance downstream of it is discharged, and a discharged capacitor is a
+short circuit.  The current is limited only by resistance in the path.  That
+repeats every duty cycle, for the life of the product, at every temperature and
+state of charge.
+
+The proper fix for the second is a regulator with **soft-start**, which ramps
+its output instead of stepping it.  Parts that have one cost the same as parts
+that do not — but it is a schematic decision, so finding this during firmware
+development is worth far more than finding it after the boards exist, and
+developers usually do not find out until then.
+
+```
+p1150_measure(30, "duty-cycle")   # ordinary capture — screened automatically
+p1150_inrush_check(run_id)        # full analysis of any stored capture
+p1150_inrush_test()               # power-cycles the target, catches power-up
+```
+
+For a switched rail, no special capture is needed: record the target doing its
+normal work and the screen finds it.  `p1150_inrush_check` then reports how
+often it repeats, whether the timing is regular (a timer) or event-driven, what
+each switch-on costs, and — usefully — what that adds up to as an average
+current, which answers whether the power-gating is saving anything at all.  A
+rail cycled 10 times a second whose capacitance takes 0.1 µAh to refill costs
+about 3.6 mA on average, which is more than many such rails draw when simply
+left on.
+
+`p1150_inrush_test` opens the probe relay, arms a current-triggered one-shot
+capture, and only then closes the relay — so the instrument is already waiting
+when the surge arrives.  This matters: `p1150_measure(connect_probe_during=True)`
+captures the boot sequence but re-arms between chunks, and a millisecond-long
+event at the front of it can land in a gap.  A clean result from this test says
+nothing about switched rails.
+
+Either way the result reports the peak, its width, what the target settles at
+either side of it, and the estimated terminal-voltage sag for a fresh cell, a
+part-aged one, and an aged cold one near flat.  With `brownout_mv` set it says
+outright whether the target would reset.  The charge in a surge is negligible —
+this is a reliability finding, not a battery-life one.
+
+A duty-cycled wake burst is not reported as inrush: a radio waking for 6 ms at
+300 mA is a load being driven, not capacitance charging, and the analysis
+separates them on width and on how far the peak stands above the settled
+current.
+
+**Set the over-current limit high for this.**  A limit below the surge silently
+clips it: a 2 A surge measured behind a 500 mA limit records as a 500 mA plateau
+and reads as clean.  The analysis lowers its own detection threshold to just
+under whatever limit was in force and marks such a peak as a lower bound, but the
+real number is not recoverable without re-measuring.  A trip during the test is
+not a failed measurement — it is the finding.
+
+`p1150_inrush_guide` is written for the agent and covers the causes, what to ask
+you for, how to judge the sag, the fixes in the order they are usually worth
+trying (staggering rails in firmware and slew-limiting a load switch come well
+before an NTC limiter), and the confounders that make a measured surge smaller
+than the real one.
+
 ## Verifying charging
 
 `p1150_verify_charging` checks that the target actually charges its battery.
@@ -388,6 +492,15 @@ measuring sleep current.
 Compare like with like: same voltage, same workload, same duration.  If two
 back-to-back baselines differ by more than your threshold, the workload is not
 repeatable and no single comparison is trustworthy.
+
+The P1150 is not a battery.  It holds its output voltage where a cell would sag,
+so a target that draws a large surge runs perfectly here and browns out in the
+field — see the inrush section above.
+
+Captures taken over a timebase longer than 1 s arrive decimated: the acquisition
+buffer holds 125,000 samples, which is one second at full rate.  The effective
+sample rate is recorded with each run and used when reporting durations, but a
+millisecond-scale event cannot be resolved in a 10 s window at all.
 
 
 # P1150 Official GUI
