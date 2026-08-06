@@ -2,7 +2,8 @@
 
 A Python class for controlling the P1150 hardware.
 
-The P1150 Driver here is the same one used for the P1150 GUI available at www.sistemi.ca/p1150.
+The P1150 Driver here is the same one used for the P1150 GUI, a web application that runs in
+the browser at https://sistemicorp.github.io/a73-PxxxxWASMGUI/ -- there is nothing to install.
 
 You should be familiar with the GUI and your DUT current profile before attempting to automate
 measurements.
@@ -480,8 +481,8 @@ terminals, and the agent chooses that value.  Confirm it before the first call
 in a session; too high will destroy the target and there is no undo.  Setting
 `P1150_SN` does not constrain voltage — nothing does.
 
-Only one program can own a P1150 at a time, so close the desktop GUI before
-using the MCP server, and call `p1150_disconnect` to hand it back.
+Only one program can own a P1150 at a time, so disconnect the P1150 from the web
+GUI before using the MCP server, and call `p1150_disconnect` to hand it back.
 
 ## Measurement caveats
 
@@ -505,11 +506,14 @@ millisecond-scale event cannot be resolved in a 10 s window at all.
 
 # P1150 Official GUI
 
-The P1150 GUI is built upon these technologies,
-* **[dearpygui](https://github.com/hoffstadt/DearPyGui)**
-* **[Nuitka](https://nuitka.net/)**
+The official GUI is a web application,
 
-Using the `PXXXX.py` driver you could make your own GUI.  The official GUI uses the same P1150 driver.
+**https://sistemicorp.github.io/a73-PxxxxWASMGUI/**
+
+It runs entirely in the browser -- there is nothing to download, install or update, and the
+P1150 is reached from the page itself.  Open the link and connect.
+
+Using the `PXXXX` driver you could make your own GUI.  The official GUI uses the same P1150 driver.
 
 The biggest hurdle in making a GUI is handling all the data in the plot.  Most plotting
 frameworks are limited to a few 100k points.  Whereas with P1150 you will want to plot
