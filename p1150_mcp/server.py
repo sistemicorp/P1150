@@ -33,17 +33,17 @@ try:
 except ImportError:                                  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as _Server
 
-from . import analysis, storage
+from . import analysis, storage, config
 from .device import SESSION, SAMPLE_RATE
 from .scenarios import GUIDE
 
 mcp = _Server("p1150")
 
-# Optional defaults so a developer can configure the bench once, in .mcp.json,
-# instead of restating it in every conversation.
+# Serial number default so a developer can configure the bench once, in
+# .mcp.json, instead of restating it in every conversation.  Battery capacity
+# lives in config.py instead: it is a property of the project being measured,
+# is asked for interactively, and persists once set.
 DEFAULT_SN = os.environ.get("P1150_SN") or None
-BATTERY_MAH = float(os.environ["P1150_BATTERY_MAH"]) \
-    if os.environ.get("P1150_BATTERY_MAH") else None
 
 
 def _fail(e: Exception) -> dict:
@@ -52,18 +52,25 @@ def _fail(e: Exception) -> dict:
     return {"error": str(e)}
 
 
-def _store(label: str, i_ma: np.ndarray, extra: dict = None) -> dict:
+def _store(label: str, i_ma: np.ndarray, extra: dict = None,
+           isnk_ma: np.ndarray = None) -> dict:
     """Persist a capture and return the summary the agent actually sees."""
     if i_ma.size == 0:
         return {"error": "Capture returned no samples."}
-    summary = analysis.summarize(i_ma, SAMPLE_RATE, BATTERY_MAH)
+    battery = config.capacity_mah()
+    summary = analysis.summarize(i_ma, SAMPLE_RATE, battery)
     meta = dict(summary)
     meta.update(extra or {})
     meta["voltage_mv"] = SESSION.vout_mv
-    run_id = storage.save(label, i_ma, meta)
+    run_id = storage.save(label, i_ma, meta, isnk_ma=isnk_ma)
     out = {"run_id": run_id, "label": label}
     out.update(summary)
     out.update(extra or {})
+    if not battery:
+        out["hint"] = ("Battery capacity is not configured, so battery life and "
+                       "percentage-of-battery figures are unavailable. Ask the "
+                       "developer for the pack's mAh rating and record it with "
+                       "p1150_set_battery.")
     return out
 
 
@@ -82,6 +89,61 @@ def p1150_measurement_guide() -> str:
     look fine but mean nothing.
     """
     return GUIDE
+
+
+# ------------------------------------------------------------------ #
+# Project setup                                                        #
+# ------------------------------------------------------------------ #
+@mcp.tool()
+def p1150_set_battery(capacity_mah: float, chemistry: str = None,
+                      nominal_mv: int = None) -> dict:
+    """Record the capacity of the battery this target runs on, in mAh.
+
+    ASK THE DEVELOPER FOR THIS at the start of a project, before the first
+    measurement -- it cannot be inferred from a current waveform or from the
+    code, and without it the measurements stay abstract. With it, every result
+    gains the numbers people actually act on: how long the device lasts, what
+    share of the battery one wake-up or one boot costs, how many times an
+    operation can run before the pack is flat, and whether a measured charging
+    current is a sensible C rate.
+
+    The setting persists across sessions, so it only needs asking once per
+    project. Call p1150_get_battery to see what is currently set.
+
+    capacity_mah: the pack's rated capacity, e.g. 220 for a small LiPo, 2000 for
+        an 18650, 3000 for a phone-sized cell, 225 for a CR2032 coin cell.
+    chemistry: optional, e.g. "Li-ion", "LiPo", "LiFePO4", "alkaline", "NiMH".
+    nominal_mv: optional nominal cell voltage, useful as a reminder of what to
+        pass to p1150_power_on.
+    """
+    try:
+        if capacity_mah <= 0:
+            return {"error": "capacity_mah must be greater than zero."}
+        cfg = config.set_battery(capacity_mah, chemistry, nominal_mv)
+        cfg["note"] = ("Recorded. Battery life, percentage-of-battery and C rate "
+                       "figures are now included in measurement results.")
+        return cfg
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_get_battery() -> dict:
+    """Show the battery capacity currently configured for this project.
+
+    If nothing is set, ask the developer for the pack's mAh rating and record it
+    with p1150_set_battery.
+    """
+    try:
+        cfg = config.get()
+        if not cfg.get("capacity_mah"):
+            return {"configured": False,
+                    "action": "Ask the developer what capacity battery (in mAh) "
+                              "the target runs on, then call p1150_set_battery."}
+        cfg["configured"] = True
+        return cfg
+    except Exception as e:
+        return _fail(e)
 
 
 # ------------------------------------------------------------------ #
@@ -305,8 +367,8 @@ def p1150_measure(duration_s: float, label: str,
     examine them further.
     """
     try:
-        i = SESSION.measure(duration_s, connect_probe_during)
-        return _store(label, i, {"capture_type": "timed"})
+        i, isnk = SESSION.measure(duration_s, connect_probe_during)
+        return _store(label, i, {"capture_type": "timed"}, isnk_ma=isnk)
     except Exception as e:
         return _fail(e)
 
@@ -357,8 +419,90 @@ def p1150_capture_stop() -> dict:
     a baseline, or to p1150_segment / p1150_events to see where the energy went.
     """
     try:
-        label, i = SESSION.capture_stop_raw()
-        return _store(label, i, {"capture_type": "background"})
+        label, i, isnk = SESSION.capture_stop_raw()
+        return _store(label, i, {"capture_type": "background"},
+                      isnk_ma=isnk)
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_verify_charging(duration_s: float = 10.0,
+                          label: str = "charge-test") -> dict:
+    """Verify that the target actually charges its battery, and at what rate.
+
+    SETUP: the P1150 must be connected at the battery terminals as usual (via
+    p1150_power_on, standing in for the battery), and the developer then applies
+    the target's own charging source -- USB, a wall adapter, wireless, solar.
+    Ask them to confirm the charger is attached and enabled before calling this.
+
+    Because the P1150 sits exactly where the battery would, what it measures IS
+    what the battery would see: the charger's output minus whatever the rest of
+    the target is drawing at that moment. That net is the only thing a single
+    pair of battery terminals can carry, so no separation of the two is needed
+    or possible.
+
+    Three outcomes:
+      CHARGING       current flows into the battery. Reports the net charge
+                     current, the C rate, and an estimated time to full.
+      NET_DISCHARGING a charger is present but the target consumes more than it
+                     delivers -- the battery drains slower but never fills.
+                     Common when measuring with the radio active, or with a
+                     charger current limit set too low.
+      NOT_CHARGING   no current flows in at all: charger not connected or not
+                     enabled, charger IC not running, or an open charge path.
+
+    Charge rate is reported as a C rate against the configured battery capacity:
+    1C fills the pack in about an hour and is what most designs aim for. Set the
+    capacity with p1150_set_battery first, or the C rate and time-to-full cannot
+    be computed.
+
+    Use at least 10 s; a charger that cycles on and off needs 30-60 s before the
+    intermittency is visible.
+    """
+    try:
+        i, isnk = SESSION.measure(duration_s)
+        battery = config.capacity_mah()
+        out = analysis.charge_test(i, isnk, SAMPLE_RATE, battery)
+        stored = _store(label, i, {"capture_type": "charge_test"}, isnk_ma=isnk)
+        out["run_id"] = stored.get("run_id")
+        out["label"] = label
+        # A sink over-current trip is latched on the device, not visible in the
+        # samples, and would silently truncate the charge current being measured.
+        try:
+            st = SESSION.status()
+            if st.get("errors"):
+                out["device_errors"] = st["errors"]
+                if "OVER_CURRENT_SINK" in st["errors"]:
+                    out["warning"] = (
+                        "The P1150's sink current limit tripped during this "
+                        "measurement, so the charge current shown is capped by "
+                        "the instrument, not by the target. Raise ovc_ma via "
+                        "p1150_power_on and re-run.")
+        except Exception:
+            pass
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_charge_summary(run_id: str) -> dict:
+    """Re-run the charging analysis on a stored capture.
+
+    Only works for runs recorded with the sink channel; a run captured before
+    that was retained reports an error rather than a misleading result.
+    """
+    try:
+        i, isnk, meta = storage.load_full(run_id)
+        if isnk is None:
+            return {"error": f"Run '{run_id}' has no sink-current channel, so "
+                             f"charging cannot be assessed. Re-capture with "
+                             f"p1150_verify_charging."}
+        out = analysis.charge_test(i, isnk, SAMPLE_RATE, config.capacity_mah())
+        out["run_id"] = run_id
+        out["label"] = meta.get("label")
+        return out
     except Exception as e:
         return _fail(e)
 
@@ -391,11 +535,11 @@ def p1150_capture_single(label: str, timebase: str = "TBASE_SPAN_100MS",
         which is what you want when diagnosing an unexpected current spike.
     """
     try:
-        i = SESSION.capture_single(timebase, trigger_ma, position, slope,
-                                   timeout_s)
+        i, isnk = SESSION.capture_single(timebase, trigger_ma, position,
+                                        slope, timeout_s)
         return _store(label, i, {"capture_type": "single",
                                  "timebase": timebase,
-                                 "trigger_ma": trigger_ma})
+                                 "trigger_ma": trigger_ma}, isnk_ma=isnk)
     except Exception as e:
         return _fail(e)
 
@@ -425,7 +569,7 @@ def p1150_summary(run_id: str) -> dict:
     """
     try:
         i, meta = storage.load(run_id)
-        out = analysis.summarize(i, SAMPLE_RATE, BATTERY_MAH)
+        out = analysis.summarize(i, SAMPLE_RATE, config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
         return out
@@ -445,7 +589,7 @@ def p1150_segment(run_id: str) -> dict:
     """
     try:
         i, meta = storage.load(run_id)
-        out = analysis.segment(i, SAMPLE_RATE)
+        out = analysis.segment(i, SAMPLE_RATE, config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
         return out
@@ -473,7 +617,7 @@ def p1150_events(run_id: str, threshold_ma: float = None,
     try:
         i, meta = storage.load(run_id)
         out = analysis.find_events(i, SAMPLE_RATE, threshold_ma,
-                                   min_duration_us)
+                                   min_duration_us, config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
         return out
@@ -504,7 +648,8 @@ def p1150_compare(baseline_run_id: str, candidate_run_id: str,
     try:
         b, mb = storage.load(baseline_run_id)
         c, mc = storage.load(candidate_run_id)
-        out = analysis.compare(b, c, SAMPLE_RATE, threshold_pct, BATTERY_MAH)
+        out = analysis.compare(b, c, SAMPLE_RATE, threshold_pct,
+                               config.capacity_mah())
         out["baseline_run"] = {"run_id": baseline_run_id,
                                "label": mb.get("label"),
                                "voltage_mv": mb.get("voltage_mv")}

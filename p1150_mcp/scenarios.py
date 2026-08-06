@@ -19,6 +19,15 @@ single wake-up event, microamp-hours (uAh).  Voltage is millivolts (mV).
 Battery capacity is quoted in mAh, so charge is reported the same way -- do not
 convert to Coulombs.
 
+## Ask for the battery capacity first
+At the start of a project, before measuring anything, ask the developer what
+capacity battery (in mAh) the target runs on, and record it with
+p1150_set_battery.  It cannot be inferred from a waveform or from the code, and
+it is what turns a current reading into something actionable: how long the
+device lasts, what share of the battery a single wake-up or boot costs, how many
+times an operation can run before the pack is flat, and whether a charging
+current is a sensible C rate.  It persists, so it is asked once per project.
+
 ## The normal working order
 1. p1150_connect(sn)                       -- ~15 s the first time (firmware +
                                               self-calibration), fast after
@@ -44,7 +53,7 @@ Set ovc_ma above the target's true peak, not above its average.  A radio TX or
 motor inrush can be 20x the average; an OVC set to the average trips instantly
 and the target browns out, which looks like a firmware bug and is not.
 
-## The five profiles worth knowing
+## The six profiles worth knowing
 
 ### 1. Sleep / quiescent floor
 What: the current when the target has nothing to do.  Usually microamps.
@@ -97,6 +106,36 @@ How: capture_start(label="baseline") -> run the workload -> capture_stop.
      comparison when the two durations differ by more than 5%, because
      accumulated mAh over a longer run is trivially larger and means nothing.
 Read: p1150_compare(baseline, candidate).
+
+### 6. Charging the battery
+What: confirming the target actually charges the pack, and how fast.
+Setup: the P1150 stays where the battery is (p1150_power_on as usual), and the
+     developer then applies the target's charging source -- USB, wall adapter,
+     wireless, solar.  Confirm with them that it is attached and enabled.
+How: p1150_verify_charging(duration_s=10..60).
+Read: the P1150 reports current flowing back into it as SINK current.  Because
+     it sits exactly where the battery would, what it measures is what the
+     battery would see: the charger's output minus whatever the rest of the
+     target draws at that moment.  A single pair of battery terminals only
+     carries that net, so the two cannot be separated -- and do not need to be.
+     Charge rate is reported as a C rate: 1C fills the pack in about an hour and
+     is what most designs aim for.
+Wrong looks like:
+     NOT_CHARGING    -- no sink current at all.  Charger not connected or not
+                        enabled, charger IC not running, or an open charge path
+                        to the battery terminals.
+     NET_DISCHARGING -- a charger is delivering, but the rest of the target
+                        consumes more than it supplies, so the battery never
+                        fills.  Usually means the measurement was taken with the
+                        radio or another high-power peripheral active, or the
+                        charger's current limit is set below the target's own
+                        consumption.  Re-measure with the target idle to
+                        separate the two cases.
+     INTERMITTENT    -- current flows only part of the time.  The charger is
+                        cycling: thermal foldback, an input supply sagging under
+                        load, or the charger repeatedly re-qualifying its input.
+     A C rate far below the design intent means the charger is programmed low,
+     or the target is eating most of what it delivers.
 
 ## Reading a regression
 p1150_compare reports a verdict against a percentage threshold on average

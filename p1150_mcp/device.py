@@ -33,13 +33,22 @@ STREAM_CHUNK_S = 0.200
 CONNECT_ATTEMPTS = 2
 CHUNK_TIMEOUT_S = 10.0
 
-# 125k samples/s * 4 bytes = 500 kB/s retained.  The cap stops an agent that
-# forgets to call capture_stop from consuming all memory on the machine.
+# Two channels at 125k samples/s * 4 bytes = 1 MB/s retained.  The cap stops an
+# agent that forgets to call capture_stop from consuming all memory: the 900 s
+# default is ~900 MB.  Lower P1150_MAX_CAPTURE_S on a memory-constrained bench.
 DEFAULT_MAX_CAPTURE_S = float(os.environ.get("P1150_MAX_CAPTURE_S") or 900)
 
 
 class DeviceError(RuntimeError):
     pass
+
+
+def _join(chunks: list) -> tuple:
+    """Concatenate a list of (i, isnk) chunks into one (i, isnk) pair."""
+    if not chunks:
+        return np.empty(0, np.float32), np.empty(0, np.float32)
+    return (np.concatenate([c[0] for c in chunks]),
+            np.concatenate([c[1] for c in chunks]))
 
 
 class Session:
@@ -66,11 +75,15 @@ class Session:
     def _cb_acq(self, data: dict) -> None:
         """DLL acquisition callback.  Must copy and return immediately.
 
-        Only 'i' is retained.  The other channels (isnk, a0, d0, d1) are ~6x the
-        memory for data this server does not report on, and a long capture is
-        already hundreds of megabytes.
+        Both current channels are retained.  They are independent and both
+        positive-only: 'i' is current the P1150 sources into the target, 'isnk'
+        is current flowing back into the P1150 -- which is what a target's
+        charging circuit produces when the P1150 stands in for the battery.
+        Net battery current is i - isnk.  The remaining channels (a0, d0, d1)
+        are dropped; they would triple the memory for data this server does not
+        report on, and a long capture is already hundreds of megabytes.
         """
-        self._acq_chunk = data["i"]
+        self._acq_chunk = (data["i"], data["isnk"])
         self._acq_event.set()
 
     def _cb_async(self, data: dict) -> None:
@@ -248,8 +261,8 @@ class Session:
 
     # ---- acquisition ----------------------------------------------- #
 
-    def _stream_chunk(self, dev) -> np.ndarray:
-        """Arm one logger-mode acquisition and wait for its chunk."""
+    def _stream_chunk(self, dev) -> tuple:
+        """Arm one logger-mode acquisition and wait for its (i, isnk) chunk."""
         self._acq_event.clear()
         ok, r = dev.acquisition_start(PxxxxAPI.ACQUIRE_MODE_LOGGER)
         if not ok:
@@ -279,8 +292,8 @@ class Session:
                 pass
 
     def measure(self, duration_s: float,
-                connect_probe_during: bool = False) -> np.ndarray:
-        """Blocking capture of duration_s seconds.  Returns current in mA.
+                connect_probe_during: bool = False) -> tuple:
+        """Blocking capture of duration_s seconds.  Returns (i, isnk) in mA.
 
         connect_probe_during closes the probe relay *after* streaming has begun,
         which is the only way to capture a target's power-on inrush and boot
@@ -304,13 +317,16 @@ class Session:
                 dev.acquisition_stop()
             except Exception:
                 pass
-        return np.concatenate(chunks) if chunks else np.empty(0, np.float32)
+        return _join(chunks)
 
     def capture_single(self, timebase: str, trigger_ma: float = None,
                        position: str = PxxxxAPI.TRIG_POS_LEFT,
                        slope: str = PxxxxAPI.TRIG_SLOPE_RISE,
-                       timeout_s: float = 30.0) -> np.ndarray:
-        """One-shot capture over a single timebase span, optionally triggered."""
+                       timeout_s: float = 30.0) -> tuple:
+        """One-shot capture over a timebase span, optionally triggered.
+
+        Returns (i, isnk) in mA.
+        """
         dev = self.require()
         if self._capture_thread is not None:
             raise DeviceError("A background capture is running; "
@@ -366,10 +382,10 @@ class Session:
             raise DeviceError("set_cal_sweep failed")
         try:
             time.sleep(0.05)   # let the first resistor settle
-            i = self.measure(1.0)
+            i, isnk = self.measure(1.0)
         finally:
             dev.set_cal_sweep(sweep=False)
-        return {"current_ma": i, "voltage_mv": self.vout_mv}
+        return {"current_ma": i, "sink_ma": isnk, "voltage_mv": self.vout_mv}
 
     # ---- background capture ---------------------------------------- #
 
@@ -400,7 +416,7 @@ class Session:
         if self._capture_thread is None:
             return {"capturing": False}
         c = self._capture
-        n = sum(len(x) for x in c["chunks"])
+        n = sum(len(x[0]) for x in c["chunks"])
         return {
             "capturing": self._capture_thread.is_alive(),
             "label": c["label"],
@@ -412,7 +428,7 @@ class Session:
         }
 
     def capture_stop_raw(self) -> tuple:
-        """Stop the background capture; returns (label, current array in mA)."""
+        """Stop the background capture; returns (label, i, isnk) in mA."""
         if self._capture_thread is None:
             raise DeviceError("No capture is running.")
         self._capture_stop.set()
@@ -421,9 +437,8 @@ class Session:
         c, self._capture = self._capture, None
         if self._capture_err:
             raise DeviceError(f"Capture failed: {self._capture_err}")
-        arr = np.concatenate(c["chunks"]) if c["chunks"] \
-            else np.empty(0, np.float32)
-        return c["label"], arr
+        i, isnk = _join(c["chunks"])
+        return c["label"], i, isnk
 
 
 SESSION = Session()

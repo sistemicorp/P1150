@@ -34,7 +34,8 @@ def runs_dir() -> str:
     return RUNS_DIR
 
 
-def save(label: str, i_ma: np.ndarray, meta: dict) -> str:
+def save(label: str, i_ma: np.ndarray, meta: dict,
+         isnk_ma: np.ndarray = None) -> str:
     """Store a capture, returning its run_id."""
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_id = f"{stamp}_{_slug(label)}"
@@ -42,23 +43,34 @@ def save(label: str, i_ma: np.ndarray, meta: dict) -> str:
     meta = dict(meta or {})
     meta.update({"run_id": run_id, "label": label,
                  "created": _dt.datetime.now().isoformat(timespec="seconds")})
+    arrays = {"i": i_ma.astype(np.float32, copy=False),
+              "meta": np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8)}
+    if isnk_ma is not None:
+        arrays["isnk"] = isnk_ma.astype(np.float32, copy=False)
     # Uncompressed: a several-minute capture is hundreds of MB of noisy float32
     # that barely compresses, and savez_compressed would stall the tool call
     # for many seconds to save little disk.
-    np.savez(path, i=i_ma.astype(np.float32, copy=False),
-             meta=np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8))
+    np.savez(path, **arrays)
     return run_id
 
 
 def load(run_id: str):
     """Return (current array in mA, metadata dict) for a stored run."""
+    i, _, meta = load_full(run_id)
+    return i, meta
+
+
+def load_full(run_id: str):
+    """Return (i, isnk, metadata).  isnk is None for runs stored before the
+    sink channel was retained, so charging analysis has to check for it."""
     path = os.path.join(runs_dir(), run_id + ".npz")
     if not os.path.isfile(path):
         raise FileNotFoundError(
             f"No run '{run_id}'. Use p1150_list_runs to see stored runs.")
     with np.load(path) as z:
         meta = json.loads(bytes(z["meta"]).decode()) if "meta" in z else {}
-        return z["i"], meta
+        isnk = z["isnk"] if "isnk" in z.files else None
+        return z["i"], isnk, meta
 
 
 def list_runs(limit: int = 25) -> list:

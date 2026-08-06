@@ -213,9 +213,9 @@ Optional environment settings:
 | Variable | Purpose |
 |---|---|
 | `P1150_SN` | Default serial number, so you need not repeat it |
-| `P1150_BATTERY_MAH` | Battery capacity, enables projected battery life |
+| `P1150_BATTERY_MAH` | Seeds the battery capacity (see below) |
 | `P1150_RUNS_DIR` | Where captures are stored (default `.p1150_runs/`) |
-| `P1150_MAX_CAPTURE_S` | Cap on a background capture (default 900 s) |
+| `P1150_MAX_CAPTURE_S` | Cap on a background capture (default 900 s ≈ 900 MB) |
 
 ## What it is for
 
@@ -224,6 +224,19 @@ Ask the agent things like:
 * *"Power the target at 3700 mV and measure its sleep current."*
 * *"Take a baseline, then I'll flash the new build and we'll compare."*
 * *"Battery life dropped — find out what changed."*
+* *"I've plugged in the USB charger — is it actually charging the battery?"*
+
+## Battery capacity
+
+The agent is told to ask you, once per project, what capacity battery the target
+runs on, and to record it with `p1150_set_battery`.  It persists in
+`.p1150_runs/battery.json`, so it is asked once and not again.
+
+It cannot be inferred from a waveform or from the code, and it is what turns a
+current reading into something you can act on: projected battery life, the share
+of the pack one wake-up or one boot costs, how many times an operation can run
+before the battery is flat, and whether a measured charging current is a
+sensible C rate.
 
 A typical session: `p1150_connect` → `p1150_power_on(3700, 500)` → the target
 stays powered while you edit and re-flash over JTAG →
@@ -245,6 +258,8 @@ open across tool calls so the target stays powered between measurements.
 
 ## Tools
 
+**Project** — `p1150_set_battery`, `p1150_get_battery`
+
 **Device** — `p1150_list_devices`, `p1150_connect`, `p1150_disconnect`,
 `p1150_status`, `p1150_clear_error`, `p1150_self_test`
 
@@ -253,6 +268,8 @@ open across tool calls so the target stays powered between measurements.
 **Capture** — `p1150_measure` (fixed duration), `p1150_capture_start` /
 `p1150_capture_status` / `p1150_capture_stop` (open-ended, for the
 edit-flash-run loop), `p1150_capture_single` (one triggered event)
+
+**Charging** — `p1150_verify_charging`, `p1150_charge_summary`
 
 **Analysis** — `p1150_summary`, `p1150_segment` (time and charge per current
 band), `p1150_events` (wake-up rate, burst length, charge per wake),
@@ -266,6 +283,24 @@ produce measurements which look fine but mean nothing.
 
 Charge is reported in mAh (µAh for a single wake-up event), matching how battery
 capacity is specified.
+
+## Verifying charging
+
+`p1150_verify_charging` checks that the target actually charges its battery.
+Leave the P1150 connected at the battery terminals as usual, apply the target's
+own charging source (USB, wall adapter, wireless, solar), and the P1150 reports
+the current flowing back into it as **sink** current.
+
+Because the P1150 sits exactly where the battery would, what it measures *is*
+what the battery sees: the charger's output minus whatever the rest of the target
+is drawing at that moment.  A single pair of battery terminals only carries that
+net, so the two never need separating.
+
+Three outcomes: `CHARGING` (with the C rate and an estimated time to full),
+`NET_DISCHARGING` (a charger is present but the target consumes more than it
+delivers, so the battery never fills), and `NOT_CHARGING` (no current flows in at
+all).  A charger that cycles on and off is reported as `INTERMITTENT`, which an
+average alone would hide.
 
 ## Safety
 

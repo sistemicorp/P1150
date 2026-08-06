@@ -15,6 +15,11 @@ import numpy as np
 
 SAMPLE_RATE = 125_000  # P1150 samples/second, fixed
 
+# The sink channel rests at a small non-zero floor (~110 nA measured) when the
+# P1150 is not actually sinking, so a bare "isnk > 0" test would call every
+# discharge measurement a charge.  Anything below this counts as not sinking.
+ISNK_FLOOR_MA = 0.001
+
 
 # ------------------------------------------------------------------ #
 # Current buckets                                                      #
@@ -79,10 +84,14 @@ def summarize(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
         out["battery_mah"] = battery_mah
         out["projected_hours"] = _f(battery_mah / avg, 2) if avg > 0 else None
         out["projected_days"] = _f(battery_mah / avg / 24, 2) if avg > 0 else None
+        # What this capture actually cost, as a share of the pack.  Turns an
+        # abstract mAh into "that boot sequence costs 0.002% of the battery".
+        out["battery_used_pct"] = _f(100.0 * q_mah / battery_mah, 6)
     return out
 
 
-def segment(i_ma: np.ndarray, fs: int = SAMPLE_RATE) -> dict:
+def segment(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
+            battery_mah: float = None) -> dict:
     """Time and charge spent in each current bucket.
 
     This is the "where did the energy go" view.  A rise in average current is
@@ -99,7 +108,7 @@ def segment(i_ma: np.ndarray, fs: int = SAMPLE_RATE) -> dict:
             continue
         sel = i64[m]
         q = float(sel.sum() / fs / 3600.0)
-        rows.append({
+        row = {
             "bucket":     key,
             "range":      label,
             "time_s":     _f(cnt / fs, 4),
@@ -107,7 +116,10 @@ def segment(i_ma: np.ndarray, fs: int = SAMPLE_RATE) -> dict:
             "charge_mah": _f(q),
             "charge_pct": _f(100.0 * q / total_q, 2) if total_q > 0 else 0.0,
             "mean_ma":    _f(float(sel.mean())),
-        })
+        }
+        if battery_mah:
+            row["battery_pct"] = _f(100.0 * q / battery_mah, 6)
+        rows.append(row)
     dominant = max(rows, key=lambda r: r["charge_mah"])["bucket"] if rows else None
     return {
         "total_charge_mah": _f(total_q),
@@ -118,7 +130,8 @@ def segment(i_ma: np.ndarray, fs: int = SAMPLE_RATE) -> dict:
 
 def find_events(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
                 threshold_ma: float = None,
-                min_duration_us: float = 100.0) -> dict:
+                min_duration_us: float = 100.0,
+                battery_mah: float = None) -> dict:
     """Detect bursts of activity above a floor, for duty-cycled profiles.
 
     A BLE advertiser or a periodic sensor poll is described by three numbers the
@@ -170,6 +183,13 @@ def find_events(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
         "max_peak_ma":       _f(float(peaks.max())),
         "total_event_charge_mah": _f(float(charges_uah.sum()) / 1000.0),
     }
+    if battery_mah:
+        per_event_mah = float(charges_uah.mean()) / 1000.0
+        out["battery_pct_per_event"] = _f(100.0 * per_event_mah / battery_mah, 8)
+        # The most tangible form of the number: how many times this operation
+        # can happen before the battery is flat, ignoring everything else.
+        out["events_per_battery"] = int(battery_mah / per_event_mah) \
+            if per_event_mah > 0 else None
     if starts.size >= 2:
         periods_s = np.diff(starts) / fs
         out["mean_period_s"] = _f(float(periods_s.mean()), 4)
@@ -180,6 +200,126 @@ def find_events(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
         # Duty cycle drives battery life more directly than peak current does.
         out["duty_cycle_pct"] = _f(
             100.0 * float(durations_s.mean()) / float(periods_s.mean()), 3)
+    return out
+
+
+# ------------------------------------------------------------------ #
+# Charging                                                             #
+# ------------------------------------------------------------------ #
+def charge_test(i_ma: np.ndarray, isnk_ma: np.ndarray,
+                fs: int = SAMPLE_RATE, battery_mah: float = None) -> dict:
+    """Assess a target's ability to charge the battery it is standing in for.
+
+    The P1150 sits at the battery terminals, so what it measures IS what the
+    battery would see: the charger's output minus whatever the rest of the
+    target is drawing at the same moment.  No arithmetic is needed to separate
+    them, and none is possible -- a single pair of terminals only carries the
+    net.
+
+    Sign convention: net = i - isnk.  Positive net means the target is still
+    consuming (the battery would be discharging); negative net means current is
+    flowing into the battery, i.e. charging.
+    """
+    if i_ma.size == 0:
+        return {"error": "capture contains no samples"}
+
+    i64 = i_ma.astype(np.float64, copy=False)
+    s64 = isnk_ma.astype(np.float64, copy=False)
+    n = min(i64.size, s64.size)
+    i64, s64 = i64[:n], s64[:n]
+
+    net = i64 - s64                      # + = discharging, - = charging
+    charge_ma = -net                     # + = charging, the friendlier sign
+    mean_charge = float(charge_ma.mean())
+    duration_s = n / fs
+    sinking = s64 > ISNK_FLOOR_MA
+    sink_pct = 100.0 * float(sinking.mean())
+
+    out = {
+        "duration_s":        _f(duration_s, 4),
+        "mean_source_ma":    _f(float(i64.mean())),
+        "mean_sink_ma":      _f(float(s64.mean())),
+        "net_charge_ma":     _f(mean_charge),
+        "peak_sink_ma":      _f(float(s64.max())),
+        "time_sinking_pct":  _f(sink_pct, 2),
+        # Net charge delivered over the capture. Negative means the battery lost
+        # charge despite a charger being attached.
+        "net_charge_mah":    _f(float(charge_ma.sum() / fs / 3600.0)),
+    }
+
+    if sink_pct < 1.0:
+        out["result"] = "NOT_CHARGING"
+        out["diagnosis"] = (
+            "No sink current was measured: nothing is pushing current back into "
+            "the battery terminals. Either the charging source is not connected "
+            "or not enabled, the target's charger IC is not running, or the "
+            "charge path to the battery terminals is open. The P1150 measured "
+            f"{out['mean_source_ma']} mA flowing OUT, so the target is running "
+            f"on the P1150 alone.")
+        return out
+
+    if mean_charge <= 0:
+        out["result"] = "NET_DISCHARGING"
+        out["diagnosis"] = (
+            f"A charging source is present (sink current seen for "
+            f"{out['time_sinking_pct']}% of the capture) but the target consumes "
+            f"more than it delivers: net {_f(-mean_charge)} mA still flowing "
+            f"OUT of the battery. The battery will drain more slowly but will "
+            f"never reach full. Typical cause: measuring while the radio or a "
+            f"high-power peripheral is active, or a charger current limit set "
+            f"below the target's own consumption.")
+        return out
+
+    out["result"] = "CHARGING"
+
+    # Stability: a charger cycling in and out reads the same on average as a
+    # steady one, but means something quite different is happening.
+    if sink_pct < 95.0:
+        out["stability"] = "INTERMITTENT"
+        out["stability_note"] = (
+            f"Current only flowed into the battery for {out['time_sinking_pct']}% "
+            f"of the capture. The charger is cycling rather than delivering "
+            f"steadily -- check for thermal foldback, an input supply sagging "
+            f"under load, or the charger re-qualifying its input.")
+    else:
+        out["stability"] = "STEADY"
+
+    if battery_mah:
+        # C rate: 1C charges a nominal capacity in one hour, which is the rate
+        # most targets are designed around.
+        c_rate = mean_charge / battery_mah
+        out["battery_mah"] = battery_mah
+        out["c_rate"] = _f(c_rate, 3)
+        out["time_to_full_hours_from_empty"] = _f(battery_mah / mean_charge, 2)
+        out["note_time_to_full"] = (
+            "Constant-current estimate. A real charger tapers in its "
+            "constant-voltage phase near full, so expect longer in practice.")
+        if c_rate < 0.02:
+            out["c_rate_assessment"] = (
+                f"{c_rate:.3f}C is very low -- barely a trickle. A "
+                f"{battery_mah:g} mAh battery would take "
+                f"{battery_mah / mean_charge:.0f} hours from empty. Check the "
+                f"charger's programmed current, and whether the target is "
+                f"drawing most of it.")
+        elif c_rate < 0.5:
+            out["c_rate_assessment"] = (
+                f"{c_rate:.2f}C is a conservative charge rate -- safe, and "
+                f"gentler on cell life, but slower than the ~1C most designs "
+                f"target.")
+        elif c_rate <= 1.5:
+            out["c_rate_assessment"] = (
+                f"{c_rate:.2f}C is the usual design point (1C charges a "
+                f"{battery_mah:g} mAh cell in about an hour).")
+        else:
+            out["c_rate_assessment"] = (
+                f"{c_rate:.2f}C is high. Confirm the cell is rated for it -- "
+                f"most Li-ion cells specify 1C or below for charging, and "
+                f"exceeding it shortens life or is unsafe.")
+    else:
+        out["battery_capacity_missing"] = (
+            "Set the battery capacity with p1150_set_battery to get the C rate "
+            "and a time-to-full estimate. Ask the developer for the pack's mAh "
+            "rating -- it cannot be inferred from the measurement.")
     return out
 
 
