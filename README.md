@@ -196,6 +196,98 @@ This script uses an external Keithley 2401 Source Meter controlled with PyVisa t
 use this script be sure to install `requirements_keithley2401.txt`.
 
 
+# MCP Server (for AI agents)
+
+`p1150_mcp/` is an [MCP](https://modelcontextprotocol.io) server that lets an AI
+coding agent drive a P1150 while you develop firmware: power the target, measure
+battery current, and tell you whether a code change made it worse.
+
+```commandline
+python -m pip install -r requirements_mcp.txt
+```
+
+`.mcp.json` in this repo registers the server with Claude Code.  Other MCP
+clients take the same command (`python -m p1150_mcp`, run from this folder).
+Optional environment settings:
+
+| Variable | Purpose |
+|---|---|
+| `P1150_SN` | Default serial number, so you need not repeat it |
+| `P1150_BATTERY_MAH` | Battery capacity, enables projected battery life |
+| `P1150_RUNS_DIR` | Where captures are stored (default `.p1150_runs/`) |
+| `P1150_MAX_CAPTURE_S` | Cap on a background capture (default 900 s) |
+
+## What it is for
+
+Ask the agent things like:
+
+* *"Power the target at 3700 mV and measure its sleep current."*
+* *"Take a baseline, then I'll flash the new build and we'll compare."*
+* *"Battery life dropped — find out what changed."*
+
+A typical session: `p1150_connect` → `p1150_power_on(3700, 500)` → the target
+stays powered while you edit and re-flash over JTAG →
+`p1150_capture_start("baseline")` … run the workload …  `p1150_capture_stop` →
+change code, repeat → `p1150_compare(baseline, candidate)`.
+
+## Why it is not a 1:1 wrapper of the driver
+
+The P1150 streams 125,000 samples/second.  Ten seconds is 1.25 million numbers,
+which cannot be handed to a language model.  So captures are written to disk and
+every tool returns a summary of at most a few hundred values; the agent passes a
+`run_id` around instead of the samples.
+
+For the same reason the tools are task-shaped, not register-shaped.  Sequences
+with a mandatory order — vout before probe, timebase before acquisition, stop
+before close — are collapsed into a single tool, so the agent chooses *what* to
+measure rather than re-deriving the driver's protocol.  The connection is held
+open across tool calls so the target stays powered between measurements.
+
+## Tools
+
+**Device** — `p1150_list_devices`, `p1150_connect`, `p1150_disconnect`,
+`p1150_status`, `p1150_clear_error`, `p1150_self_test`
+
+**Power** — `p1150_power_on`, `p1150_power_off`
+
+**Capture** — `p1150_measure` (fixed duration), `p1150_capture_start` /
+`p1150_capture_status` / `p1150_capture_stop` (open-ended, for the
+edit-flash-run loop), `p1150_capture_single` (one triggered event)
+
+**Analysis** — `p1150_summary`, `p1150_segment` (time and charge per current
+band), `p1150_events` (wake-up rate, burst length, charge per wake),
+`p1150_compare` (regression verdict plus a likely cause), `p1150_plot`,
+`p1150_list_runs`
+
+**Guidance** — `p1150_measurement_guide` returns the measurement know-how the
+agent needs: how to choose a voltage and over-current limit, the five common
+current profiles and what capture length each needs, and the mistakes that
+produce measurements which look fine but mean nothing.
+
+Charge is reported in mAh (µAh for a single wake-up event), matching how battery
+capacity is specified.
+
+## Safety
+
+`p1150_power_on` puts the requested voltage straight onto the target's battery
+terminals, and the agent chooses that value.  Confirm it before the first call
+in a session; too high will destroy the target and there is no undo.  Setting
+`P1150_SN` does not constrain voltage — nothing does.
+
+Only one program can own a P1150 at a time, so close the desktop GUI before
+using the MCP server, and call `p1150_disconnect` to hand it back.
+
+## Measurement caveats
+
+A JTAG debugger attached to the target draws current through its supply on many
+boards, and a halted core cannot enter sleep.  Detach the debugger before
+measuring sleep current.
+
+Compare like with like: same voltage, same workload, same duration.  If two
+back-to-back baselines differ by more than your threshold, the workload is not
+repeatable and no single comparison is trustworthy.
+
+
 # P1150 Official GUI
 
 The P1150 GUI is built upon these technologies,

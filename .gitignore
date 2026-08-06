@@ -7,6 +7,9 @@ __pycache__/
 
 p1150_out.csv
 
+# captures written by the MCP server (large, and specific to one bench)
+.p1150_runs/
+
 *.so
 # the pxxxx driver ships prebuilt shared libraries for each platform
 !pxxxx/libpxxxx.so

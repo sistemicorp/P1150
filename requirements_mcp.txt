@@ -1,0 +1,6 @@
+# Requirements for the P1150 MCP server (p1150_mcp/).
+# The driver itself needs none of these -- see requirements.txt.
+
+mcp          # Model Context Protocol SDK (provides FastMCP)
+numpy        # sample storage and statistics
+matplotlib   # p1150_plot only
