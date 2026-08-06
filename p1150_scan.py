@@ -20,47 +20,50 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-P1150 bootloader (a51) and application (a43) will respond to a 'ping'.
+Report what a P1150 is running without connecting to it fully.  Both the
+bootloader (a51) and the application (a43) will respond to a 'ping', so this is
+a quick way to check a P1150 is present and see whether the application has
+been loaded yet.
 
-NOTE: This script is deprecated since support to connect via serial number
-      is implemented.  This script will be removed in a future release.
+Unlike the other examples this script does not call ez_connect(), so the P1150
+is left exactly as it was found.
+
+NOTE: Always identify a P1150 by its serial number, found on the back of the
+      unit.  Connecting by port name is supported but will be deprecated.
 
 """
-import sys
-from p1150_driver import P1150
-import serial.tools.list_ports
+import argparse
+from pxxxx import PXXXX
 
-ports_to_search = P1150.get_port_from_sn(None, list_all=True)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sn", required=True, help="Serial Number for the P1150")
+    args = parser.parse_args()
 
-#print(f"ports_to_search {ports_to_search}")
-p1150s_found = {}
+    port = PXXXX.get_port_from_sn(args.sn)
+    if port is None:
+        print(f"No P1150 found with serial number {args.sn}")
+        exit(1)
 
-for port in ports_to_search:
+    p1150 = PXXXX(port=port)
 
-    try:
-        p1150 = P1150.P1150(port=port)
-
-    except Exception as e:
-        print(e)
-        print(f"{port} is not a P1150")
-        p1150s_found[port] = {"s": False}  # s(uccess)
-        continue
-
-    # check if the P1125 is reachable
+    # both a51 (bootloader) and a43 (application) answer a ping
     success, result = p1150.ping()
-    #print(f"Ping: {result}")
-    if success:
-        # attached device is a P1150, it responded to our PING, run some checks
-        p1150s_found[port] = result[-1]
+    if not success:
+        print(f"{port}: found, but did not respond to a ping")
+        p1150.close()
+        exit(1)
 
-    else:
-        #print(f"{port} is not a P1150")
-        p1150s_found[port] = {"s": False}  # s(uccess)
+    # command responses are a list, and almost always have only one item,
+    # however its possible more responses are present, always just take last
+    details = result[-1]
 
-    p1150.close()
+    print(f"P1150      : {port}, serial number {details['serial_hash']}")
+    print(f"model      : {details['model']}")
+    print(f"application: {details['app']}", end="")
+    print("  (bootloader, the application is not loaded yet)"
+          if details["app"] == "a51" else "")
+    print(f"version    : {details['version']}")
 
-# print out found P1150s
-for port, p1150 in p1150s_found.items():
-    if p1150["s"] is True:
-        msg = f"P1150      : {port}, serial number {p1150['serial_hash']}"
-        print(msg)
+    p1150.close()  # ALWAYS close
+    exit(0)

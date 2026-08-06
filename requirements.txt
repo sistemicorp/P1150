@@ -1,10 +1,6 @@
-# used by P1150
-cbor2==5.7.0
-pyserial==3.5
-setuptools
--e ./p1150_driver/cobs_c
--e ./p1150_driver/logdata_c
--e ./p1150_driver/mpserial
+# The pxxxx driver is a prebuilt shared library (pxxxx/pxxxx.dll on Windows,
+# pxxxx/libpxxxx.so on Linux) loaded with ctypes.  There is nothing to compile
+# and no serial stack to install, so it has no requirements of its own.
 
 # used by demo code only, you may not require
 matplotlib

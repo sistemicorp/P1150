@@ -5,26 +5,8 @@ __pycache__/
 
 *.pyd
 
-cobs/build/
-cobs/cobs.egg-info/
-
-logdata_c/build/
-logdata_c/logdata_ext.egg-info/
-
-mpserial/build/
-mpserial/mp_serial_ext.egg-info/
-
 p1150_out.csv
 
-p1150_driver/cobs_c/cobs.egg-info/
-
-p1150_driver/logdata_c/logdata_ext.egg-info/
-
-p1150_driver/mpserial/mp_serial_ext.egg-info/
-p1150_driver/mpserial/build/
-
 *.so
-
-p1150_driver/cobs_c/build/
-
-p1150_driver/logdata_c/build/
+# the pxxxx driver ships prebuilt shared libraries for each platform
+!pxxxx/libpxxxx.so

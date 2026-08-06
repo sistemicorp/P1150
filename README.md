@@ -49,7 +49,9 @@ Then install Python requirements.
 python -m pip install -r requirements.txt
 ```
 
-(Note: if you update (pull) this repo, re-run the above command to install the latest version of the drivers)
+The `pxxxx` driver itself is a prebuilt shared library loaded with ctypes, so there is
+nothing to compile.  `matplotlib` is the only requirement, and only the plotting examples
+need it.
 
 ## Run "hello, P1150"
 
@@ -75,40 +77,67 @@ can take ~10 seconds.  But this happens only the first time you connect.  Subseq
 connections will be faster.
 
 
+## Connecting by Serial Number
+
+Every example takes a required `--sn` argument, and identifies the P1150 with it,
+
+```python
+port = PXXXX.get_port_from_sn(args.sn)
+if port is None:
+    ...  # that P1150 is not attached
+p1150 = PXXXX(port=port)
+```
+
+This is the preferred way to connect, and the only one that behaves predictably when
+more than one P1150 is attached.  `PXXXX` does accept a port name (`COM7`,
+`/dev/ttyACM0`) directly, but support for connecting that way will be deprecated.
+
+
 # Support
 
 Send an email to info@sistemi.ca for support.  Include a full log along with a description of the problem.
-Confirm that you are using the latest version of the driver.  If you have cloned the repo, you
-will have to manually update the driver files.  Its not enough to copy the files, you must also
-rebuild them with the `pip` command shown above.
+Confirm that you are using the latest version of the driver.  Report the version printed by
+`PXXXX.version()`, which is the version of the shared library in the `pxxxx` folder.
 
 
 # P1150 Common API
 
+The driver is the `PXXXX` class in the `pxxxx` folder, and the API constants are in
+`PxxxxAPI`.
 
-    
-    ping(self) -> (bool, dict):
-    ez_connect(self, sn) -> (bool, dict):
-    status(self) -> (bool, dict):
+```python
+from pxxxx import PXXXX, PxxxxAPI
 
-    calibrate(self, force: bool=False, blocking: bool=True) -> (bool, dict):
-    cal_status(self) -> (bool, dict):
+port = PXXXX.get_port_from_sn("FE823374")
+p1150 = PXXXX(port=port, logger=logger, cb_acquisition_get_data=my_callback)
+success, details = p1150.ez_connect(calibrate=True)
+```
 
-    set_trigger(self, src: str=P1150API.TRIG_SRC_NONE, pos: str=P1150API.TRIG_POS_LEFT, slope: str=P1150API.TRIG_SLOPE_RISE, level: int=1) -> (bool, dict):
-    set_timebase(self, span: str) -> (bool, dict):
-    acquisition_start(self, mode: str) -> (bool, dict):
-    acquisition_complete(self) -> (bool, dict):
-    acquisition_stop(self) -> (bool, dict):
+    get_port_from_sn(sn: str) -> str | None:      # static, find the port for a serial number
+    list_ports(max_ports: int=16) -> list[str]:   # static, every attached P1150
+
+    ping(self) -> (bool, list[dict]):
+    ez_connect(self, calibrate: bool=True, progress_callback=None) -> (bool, dict):
+    status(self) -> (bool, list[dict]):
+
+    calibrate(self, force: bool=False, blocking: bool=True) -> (bool, list[dict]):
+    cal_status(self) -> (bool, list[dict]):
+
+    set_trigger(self, src: str=PxxxxAPI.TRIG_SRC_NONE, pos: str=PxxxxAPI.TRIG_POS_LEFT, slope: str=PxxxxAPI.TRIG_SLOPE_RISE, level: int=1) -> (bool, None):
+    set_timebase(self, span: str) -> (bool, None):
+    acquisition_start(self, mode: str) -> (bool, list[dict]):
+    acquisition_complete(self) -> (bool, list[dict]):
+    acquisition_stop(self) -> (bool, list[dict]):
     acquisition_get_data(self) -> (bool, dict):
 
-    set_ovc(self, value_ma: int) -> (bool, dict):
-    vout_metrics(self) -> (bool, dict):
-    set_vout(self, value_mv: int) -> (bool, dict):
-    probe(self, connect: bool=True, hard_connect: bool=False) -> (bool, dict):
+    set_ovc(self, value_ma: int) -> (bool, list[dict]):
+    vout_metrics(self) -> (bool, list[dict]):
+    set_vout(self, value_mv: int) -> (bool, list[dict]):
+    probe(self, connect: bool=True, hard_connect: bool=False, rs_comp: bool=False) -> (bool, list[dict]):
 
-    clear_error(self) -> (bool, dict):
-    temperature_update(self) -> (bool, dict):
-    set_cal_sweep(self, sweep: bool) -> (bool, dict):
+    clear_error(self) -> (bool, list[dict]):
+    temperature_update(self) -> (bool, list[dict]):
+    set_cal_sweep(self, sweep: bool) -> (bool, list[dict]):
 
 
 ## Usage
@@ -132,7 +161,15 @@ Error handling is not implemented in the examples.
 
 # Example Scripts
 
-The Python module `matplotlib` is required for the following scripts. 
+Every script takes a required `--sn` argument, the serial number on the back of the
+P1150.  The Python module `matplotlib` is required for the plotting scripts.
+
+
+## p1150_scan.py
+
+Reports whether a P1150 is attached and which firmware it is running, without
+connecting to it fully.  Useful as a first check, and the only script that leaves the
+P1150 in the state it found it.
 
 
 ## p1150_hello.py
@@ -165,7 +202,7 @@ The P1150 GUI is built upon these technologies,
 * **[dearpygui](https://github.com/hoffstadt/DearPyGui)**
 * **[Nuitka](https://nuitka.net/)**
 
-Using the `P1150.py` driver you could make your own GUI.  The official GUI uses the same P1150 driver.
+Using the `PXXXX.py` driver you could make your own GUI.  The official GUI uses the same P1150 driver.
 
 The biggest hurdle in making a GUI is handling all the data in the plot.  Most plotting
 frameworks are limited to a few 100k points.  Whereas with P1150 you will want to plot
@@ -191,7 +228,8 @@ The bootloader has the name "a51" (internal Sistemi project number).  The purpos
 is to load the "application" FW image (AFI) (project number a43).  The AFI needs to be loaded onto the STM32H750
 each time it is powered up or reset.
 
-Within the `../p1150_driver/firmware` folder the hex file of the AFI is called `a43_app.signed.ico`.
+The AFI is embedded in the `pxxxx` shared library, so there is no separate firmware file
+to manage; `ez_connect()` loads it automatically when the P1150 answers as "a51".
 
 The bootloader will only load signed images for security purposes.
 
@@ -203,12 +241,13 @@ alibration the P1150 will be ready to take measurements.  Calibration is only pe
 
 ### Updating This Repo
 
-There are some drivers that are built when this repo is installed the first time.  If you
-pull/update this repo, you should probably uninstall the drivers, and then re-install them.
-From your virtual environment, run the following commands,
+The driver is a prebuilt shared library, so a `git pull` is all that is needed to pick up
+a new version of it -- there is nothing to uninstall or rebuild.  Check which version you
+have with,
 
-```commandline
-python -m pip install -r requirements.txt
+```python
+from pxxxx import PXXXX
+print(PXXXX.version())
 ```
 
 > Portions  ©2026 Sistemi Corp - licensed under MIT
