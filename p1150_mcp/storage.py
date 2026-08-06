@@ -34,8 +34,11 @@ def runs_dir() -> str:
     return RUNS_DIR
 
 
+_AUX_PREFIX = "aux_"
+
+
 def save(label: str, i_ma: np.ndarray, meta: dict,
-         isnk_ma: np.ndarray = None) -> str:
+         isnk_ma: np.ndarray = None, aux: dict = None) -> str:
     """Store a capture, returning its run_id."""
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_id = f"{stamp}_{_slug(label)}"
@@ -47,6 +50,13 @@ def save(label: str, i_ma: np.ndarray, meta: dict,
               "meta": np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8)}
     if isnk_ma is not None:
         arrays["isnk"] = isnk_ma.astype(np.float32, copy=False)
+    # Aux channels are stored raw, not as the decoded logic. The threshold that
+    # turns millivolts into an assertion is a setting the developer may well get
+    # wrong on the first attempt, and keeping the samples means it can be
+    # corrected and the run re-analysed instead of re-captured.
+    for name, arr in (aux or {}).items():
+        if arr is not None:
+            arrays[_AUX_PREFIX + name] = arr.astype(np.float32, copy=False)
     # Uncompressed: a several-minute capture is hundreds of MB of noisy float32
     # that barely compresses, and savez_compressed would stall the tool call
     # for many seconds to save little disk.
@@ -56,13 +66,23 @@ def save(label: str, i_ma: np.ndarray, meta: dict,
 
 def load(run_id: str):
     """Return (current array in mA, metadata dict) for a stored run."""
-    i, _, meta = load_full(run_id)
+    i, _, _, meta = load_all(run_id)
     return i, meta
 
 
 def load_full(run_id: str):
     """Return (i, isnk, metadata).  isnk is None for runs stored before the
     sink channel was retained, so charging analysis has to check for it."""
+    i, isnk, _, meta = load_all(run_id)
+    return i, isnk, meta
+
+
+def load_all(run_id: str):
+    """Return (i, isnk, aux, metadata).
+
+    isnk is None, and aux empty, for runs stored before those channels were
+    retained -- so anything relying on them has to check rather than assume.
+    """
     path = os.path.join(runs_dir(), run_id + ".npz")
     if not os.path.isfile(path):
         raise FileNotFoundError(
@@ -70,7 +90,9 @@ def load_full(run_id: str):
     with np.load(path) as z:
         meta = json.loads(bytes(z["meta"]).decode()) if "meta" in z else {}
         isnk = z["isnk"] if "isnk" in z.files else None
-        return z["i"], isnk, meta
+        aux = {f[len(_AUX_PREFIX):]: z[f]
+               for f in z.files if f.startswith(_AUX_PREFIX)}
+        return z["i"], isnk, aux, meta
 
 
 def list_runs(limit: int = 25) -> list:

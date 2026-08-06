@@ -53,7 +53,16 @@ Set ovc_ma above the target's true peak, not above its average.  A radio TX or
 motor inrush can be 20x the average; an OVC set to the average trips instantly
 and the target browns out, which looks like a firmware bug and is not.
 
-## The six profiles worth knowing
+## Consider asking for a marker GPIO
+If the target has a spare GPIO -- and nearly every embedded target does -- one
+wire to the P1150's A0, D0 or D1 input, plus two lines of firmware around the
+code being measured, turns every question of the form "what does this feature
+cost" from an estimate into a measurement.  It is worth raising with the
+developer early, before a session is spent inferring boundaries from a current
+trace.  p1150_marker_guide has the firmware and wiring detail; profile 5 below
+is the short version.
+
+## The seven profiles worth knowing
 
 ### 1. Sleep / quiescent floor
 What: the current when the target has nothing to do.  Usually microamps.
@@ -98,7 +107,27 @@ How: p1150_capture_single(timebase=..., trigger_ma=<between floor and peak>).
 Wrong looks like: a trigger that never fires (level above the actual peak), or
      an event clipped at the edge of the window (timebase too short).
 
-### 5. Scripted regression run
+### 5. A specific piece of code, marked by the target itself
+What: current over exactly the region a GPIO on the target marks -- one
+     function, one driver, one feature -- rather than over whatever the trace
+     happens to show.
+How: ask the developer for a spare GPIO and a wire to A0, D0 or D1; have the
+     firmware raise it at the start of the work and lower it at the end.
+     p1150_set_aux declares it, p1150_aux_check confirms the wiring,
+     p1150_marker_stats reports per-invocation charge, and
+     p1150_compare_marker checks that region alone for regressions.  Read
+     p1150_marker_guide first -- it has the firmware and wiring details.
+Read: charge_uah and excess_uah per occurrence.  Excess is the cost
+     attributable to the marked code; raw charge also contains the idle floor
+     the target was drawing anyway.
+Why bother: profile 3 infers where an event starts from a current threshold,
+     which only works when the work stands out above the floor and shifts a
+     little between runs.  A marker states the boundaries, so quiet work is
+     measurable too and two builds are compared over provably the same path.
+Wrong looks like: zero occurrences -- the code did not run, the lead is on the
+     wrong pin, or the polarity is inverted.  p1150_aux_check says which.
+
+### 6. Scripted regression run
 What: the same fixed workload, before and after a code change.
 How: capture_start(label="baseline") -> run the workload -> capture_stop.
      Change code, flash, then repeat with label="candidate".  Keep the duration
@@ -107,7 +136,7 @@ How: capture_start(label="baseline") -> run the workload -> capture_stop.
      accumulated mAh over a longer run is trivially larger and means nothing.
 Read: p1150_compare(baseline, candidate).
 
-### 6. Charging the battery
+### 7. Charging the battery
 What: confirming the target actually charges the pack, and how fast.
 Setup: the P1150 stays where the battery is (p1150_power_on as usual), and the
      developer then applies the target's charging source -- USB, wall adapter,
@@ -177,4 +206,189 @@ current, and proposes a likely cause.  The causes map to distinct fixes:
 - Averages hide duty cycle.  1 mA average can be 1 mA constant, or 1 uA for
   999 ms and 1 A for 1 ms.  Those need completely different fixes; always look
   at p1150_segment or p1150_events before concluding anything.
+- A threshold-detected event is only as good as the threshold.  If the answer
+  matters, mark the region with a GPIO instead -- see p1150_marker_guide.
+"""
+
+
+MARKER_GUIDE = """\
+# Marking a code region with a GPIO
+
+## What this buys
+Current alone shows what the target drew, not which code drew it.  Everything
+else in this server infers the boundaries of an event from the current trace --
+which works when the work stands out clearly above the idle floor, and stops
+working when it does not.  A GPIO raised around the work being measured removes
+the inference: the firmware states where the region begins and ends, and the
+P1150 records that signal on an auxiliary input sample-for-sample alongside
+current.
+
+That gives three things a current threshold cannot:
+* Exact charge per invocation, for work of any size -- including work whose
+  current draw never rises far above the sleep floor.
+* Two builds compared over provably the same code path, instead of over two
+  threshold crossings that may not correspond.
+* Duration and current separated.  Code that got slower and code that started
+  drawing more look identical in average current and need different fixes.
+
+Nearly every embedded target has a pin free for this.  It is worth asking for.
+
+## What the developer has to do
+Two things, and both need agreeing before any of the aux tools are useful:
+
+1. Allow a few lines of instrumentation in the firmware (below).
+2. Connect a wire from that pin to the P1150's A0, D0 or D1 input, with the
+   grounds in common.
+
+Neither can be done from here.  Ask for both explicitly, and confirm the wire is
+on before measuring.
+
+## The firmware change
+Raise the pin as the last thing before the work, lower it as the first thing
+after.  Direct register access, not a HAL call that might block or log:
+
+    // Marker on the pin wired to the P1150 aux input.
+    #define MARK_HIGH()   (GPIOB->BSRR = (1u << 5))        // set PB5
+    #define MARK_LOW()    (GPIOB->BSRR = (1u << (5 + 16))) // clear PB5
+
+    void sensor_read(void) {
+        MARK_HIGH();
+        ... the work being measured ...
+        MARK_LOW();
+    }
+
+Vendor equivalents, all single-cycle and safe in an ISR:
+    STM32     GPIOx->BSRR = pin  /  GPIOx->BSRR = pin << 16
+    nRF5x     NRF_P0->OUTSET = (1<<n)  /  NRF_P0->OUTCLR = (1<<n)
+    ESP32     GPIO.out_w1ts = (1<<n)  /  GPIO.out_w1tc = (1<<n)
+    Zephyr    gpio_pin_set_dt(&mark, 1) / 0   (slower; fine for ms-scale work)
+
+Configure the pin as a push-pull output at startup, and set it low there so a
+capture that begins mid-boot starts from a known state.
+
+## Where to put the assertions
+* Around the whole operation, including any wait it does.  If the code sleeps
+  waiting for a sensor, that sleep is part of what the feature costs.
+* On every exit path.  An early `return` between MARK_HIGH and MARK_LOW leaves
+  the marker stuck high, and the assertion then runs until the next unrelated
+  MARK_LOW -- which reads as one enormous invocation rather than as an error.
+  A `goto done` / single-exit shape, or a small RAII-style wrapper in C++, is
+  worth it here.
+* Not around a region that can nest or recurse.  A second MARK_HIGH inside the
+  first is invisible, and the pair of MARK_LOWs ends the region early.  For a
+  region that nests, use a depth counter and only touch the pin at depth 0 --
+  or mark the inner region on the other digital input instead.
+* Not inside an interrupt that can pre-empt an already-marked region, unless it
+  is on its own pin.  Two unrelated things sharing one marker cannot be told
+  apart afterwards.
+
+Two markers are supported at once (D0 and D1, or one of those plus A0), so an
+outer and an inner region, or two independent features, can be measured in the
+same capture.
+
+## Keep the instrumentation in both builds
+Driving a pin costs a small amount of current itself, and the P1150's input
+presents a small load.  It is far below anything being measured, but it is not
+zero -- so leave the marker code in for BOTH the baseline and the candidate
+build, and it cancels exactly.  Removing it for the "clean" run introduces a
+difference that has nothing to do with the change under test.
+
+## Choosing the input -- and the voltage limits
+                 accepts          reported as
+    D0, D1       1.2 - 3.3 V      rescaled to fixed levels: under ~100 mV for a
+                                  low, over ~900 mV for a high, whatever the
+                                  target actually drives
+    A0           0 - 17 V         millivolts as measured
+
+FIRST, CHECK THE TARGET'S IO VOLTAGE against that table.  D0 and D1 tolerate
+3.3 V and no more; a 5 V or 12 V signal on either damages the P1150.  A0 takes
+up to 17 V, so it is the input for anything above 3.3 V -- and no divider is
+needed for a 5 V GPIO, a 12 V rail, or a relay drive.
+
+Otherwise prefer D0/D1.  Because the driver rescales them, a 1.8 V target and a
+3.3 V target produce exactly the same trace and neither needs a threshold: the
+marker just works.  Reach for A0 when both digital inputs are taken, when the
+signal exceeds 3.3 V, or when it is not a clean logic level.
+
+A0 does need a threshold, because it reports what it measures.  Use half the
+target's IO voltage:
+    5.0 V GPIO -> threshold_mv=2500
+    3.3 V GPIO -> threshold_mv=1650
+    1.8 V GPIO -> threshold_mv=900
+    1.2 V GPIO -> threshold_mv=600
+Hysteresis defaults to 10% of the threshold, which suits a short direct lead.
+Widen it if p1150_aux_check reports NOISY.
+
+The threshold always describes the SIGNAL, never the assertion.  A marker that
+idles high and is pulled low is still threshold_mv=1650 on a 3.3 V rail, with
+active_high=False.
+
+A target driving below 1.2 V may not register on D0/D1 at all.  Use A0, whose
+threshold can be set anywhere.
+
+## Wiring
+* Confirm the target's IO voltage against the table above BEFORE connecting
+  anything.  Above 3.3 V it goes to A0, never to D0 or D1.
+* One wire from the target GPIO to the aux input, and a common ground.  The
+  ground is usually already shared through the P1150's probe at the battery
+  terminals -- confirm it, because a marker referenced to a different ground
+  reads as noise.
+* Keep the lead short.  A long unshielded lead picks up the target's own
+  switching and blurs the edges.
+* Do not leave the aux input floating when nothing drives it.  A floating input
+  reads as NOISY and produces thousands of phantom assertions.
+
+## Timing resolution
+The P1150 samples every 8 us.  An assertion needs to be held for at least ~50 us
+(several samples) to be measured reliably; one shorter than 8 us can fall
+between samples and be missed entirely.  For work faster than that, mark a loop
+of N iterations and divide -- the per-invocation cost then comes out of the
+arithmetic rather than out of the sampling.
+
+## The working order
+1. Agree the pin and the wire with the developer; get the firmware instrumented.
+2. p1150_set_aux(channel="D0", name="sensor_read")     -- add threshold_mv for A0
+3. p1150_aux_check()  -- with the developer exercising the marked code.  Do not
+   skip this.  A marker that never asserts produces a capture that looks
+   entirely normal and contains nothing to analyse.
+4. Capture as usual: p1150_measure, or capture_start/capture_stop around the
+   workload.  The aux channel is recorded automatically once declared.
+5. p1150_marker_stats(run_id)     -- per-invocation duration, charge, excess.
+6. After a code change, capture again and p1150_compare_marker(baseline,
+   candidate).
+
+To look at one invocation in detail rather than the population, use
+p1150_capture_single(trigger_on="D0") -- the capture then starts on the marker's
+own edge, which is exact where a current trigger is a guess.
+
+## When the marker does not appear
+p1150_aux_check names which of these it is:
+  STUCK_LOW   The marked code did not run during the check, the GPIO was never
+              configured as an output, or the lead is on the wrong pad.  Ask the
+              developer to trigger the code and re-check before suspecting the
+              wiring.
+  STUCK_HIGH  Usually inverted polarity -- re-declare with active_high=False.
+              Otherwise a MARK_LOW is being missed on some exit path, or the pin
+              is left asserted at the end.
+  NOISY       A floating input, a missing common ground, or a threshold sitting
+              inside the noise.  Check the ground first, then widen
+              hysteresis_mv.
+  A0 only     If the configured threshold is not between the two levels the
+              signal actually reaches, the check says so and suggests one taken
+              from the levels it measured.  That is more reliable than assuming
+              the target's IO voltage.
+
+## Reading the result
+p1150_marker_stats reports both raw charge per invocation and EXCESS charge.
+Excess subtracts what the target was drawing outside the marker, and is the
+figure to attribute to the marked code -- raw charge also contains the idle
+floor, which makes a long-running marker look expensive when most of that time
+the target was doing nothing in particular.
+
+p1150_compare_marker judges on charge per invocation, so it is unaffected by how
+many times the workload happened to run.  When it reports a regression, look at
+which of duration and current moved: duration means the code got slower, current
+means it enables something different while it runs.  It also reports current
+outside the marker separately, so an unrelated change to the sleep floor is not
+misattributed to the feature.
 """

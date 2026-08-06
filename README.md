@@ -225,6 +225,7 @@ Ask the agent things like:
 * *"Take a baseline, then I'll flash the new build and we'll compare."*
 * *"Battery life dropped — find out what changed."*
 * *"I've plugged in the USB charger — is it actually charging the battery?"*
+* *"Add a marker GPIO around `sensor_read()` and tell me what one call costs."*
 
 ## Battery capacity
 
@@ -271,18 +272,84 @@ edit-flash-run loop), `p1150_capture_single` (one triggered event)
 
 **Charging** — `p1150_verify_charging`, `p1150_charge_summary`
 
+**Markers** — `p1150_set_aux`, `p1150_get_aux`, `p1150_clear_aux`,
+`p1150_aux_check` (wiring verification), `p1150_marker_stats`,
+`p1150_compare_marker`
+
 **Analysis** — `p1150_summary`, `p1150_segment` (time and charge per current
 band), `p1150_events` (wake-up rate, burst length, charge per wake),
 `p1150_compare` (regression verdict plus a likely cause), `p1150_plot`,
 `p1150_list_runs`
 
 **Guidance** — `p1150_measurement_guide` returns the measurement know-how the
-agent needs: how to choose a voltage and over-current limit, the five common
+agent needs: how to choose a voltage and over-current limit, the seven common
 current profiles and what capture length each needs, and the mistakes that
 produce measurements which look fine but mean nothing.
+`p1150_marker_guide` covers the GPIO-marker workflow below.
 
 Charge is reported in mAh (µAh for a single wake-up event), matching how battery
 capacity is specified.
+
+## Marking a code region with a GPIO
+
+The P1150's auxiliary inputs are recorded sample-for-sample alongside current:
+
+| Input | Accepts | Reported as |
+|---|---|---|
+| `D0`, `D1` | 1.2 – 3.3 V logic | rescaled to fixed levels (`<100 mV` low, `>900 mV` high) whatever the target drives — so no threshold is needed |
+| `A0` | 0 – 17 V analog | millivolts as measured — needs a `threshold_mv` |
+
+**D0 and D1 tolerate 3.3 V and no more.** A 5 V or 12 V signal goes to A0,
+which takes up to 17 V directly and needs no divider.
+
+Wire a spare target GPIO to one of them, raise it around the code you want to
+measure, and the boundaries of that region become a fact the firmware states
+rather than something inferred from a current threshold:
+
+```c
+#define MARK_HIGH()  (GPIOB->BSRR = (1u << 5))         // set PB5
+#define MARK_LOW()   (GPIOB->BSRR = (1u << (5 + 16)))  // clear PB5
+
+void sensor_read(void) {
+    MARK_HIGH();
+    ...                 // the work being measured
+    MARK_LOW();
+}
+```
+
+```
+p1150_set_aux(channel="D0", name="sensor_read")   # threshold_mv too, for A0
+p1150_aux_check()                                 # confirms the wiring first
+p1150_measure(30, "baseline")                     # aux recorded automatically
+p1150_marker_stats(run_id)                        # per-call charge and duration
+p1150_compare_marker(baseline, candidate)         # did this feature regress?
+```
+
+This is what `p1150_events` cannot do.  Threshold-detected bursts only work when
+the event stands out above the idle floor, and the detected boundaries shift
+between runs; a marker measures quiet work just as well and compares two builds
+over provably the same code path.  `p1150_marker_stats` reports duration, charge
+and *excess* charge per invocation — excess being the cost above what the target
+was drawing anyway, which is the part attributable to the marked code.
+`p1150_compare_marker` judges on charge per invocation, so it is unaffected by
+how many times the workload ran, and it separates the marked code getting
+*slower* from it *drawing more* while it runs — different symptoms, different
+fixes.
+
+`p1150_capture_single(trigger_on="D0")` triggers a one-shot capture from the
+marker's own edge, which is exact where a current trigger is a guess.
+
+Two things are needed from you and cannot be done from the agent side: the
+firmware instrumentation, and a wire from the pin to the aux input with grounds
+in common.  `p1150_marker_guide` is written for the agent and covers where to
+place the assertions (and where not — nesting, early returns, ISRs), choosing
+between A0 and D0/D1 against the target's IO voltage, thresholds, and the
+failure modes.
+
+Aux channels cost as much memory per capture as a current channel, so they are
+recorded only once `p1150_set_aux` has declared one.  The P1150 samples every
+8 µs, so hold a marker for at least ~50 µs; for faster work, mark a loop of N
+iterations and divide.
 
 ## Verifying charging
 

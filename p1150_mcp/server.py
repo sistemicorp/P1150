@@ -35,7 +35,7 @@ except ImportError:                                  # mcp < 2.0
 
 from . import analysis, storage, config
 from .device import SESSION, SAMPLE_RATE
-from .scenarios import GUIDE
+from .scenarios import GUIDE, MARKER_GUIDE
 
 mcp = _Server("p1150")
 
@@ -53,7 +53,7 @@ def _fail(e: Exception) -> dict:
 
 
 def _store(label: str, i_ma: np.ndarray, extra: dict = None,
-           isnk_ma: np.ndarray = None) -> dict:
+           isnk_ma: np.ndarray = None, aux: dict = None) -> dict:
     """Persist a capture and return the summary the agent actually sees."""
     if i_ma.size == 0:
         return {"error": "Capture returned no samples."}
@@ -62,15 +62,72 @@ def _store(label: str, i_ma: np.ndarray, extra: dict = None,
     meta = dict(summary)
     meta.update(extra or {})
     meta["voltage_mv"] = SESSION.vout_mv
-    run_id = storage.save(label, i_ma, meta, isnk_ma=isnk_ma)
+    if aux:
+        # Record the levels in force at capture time. They can be overridden
+        # later, but a run must still be readable after the project's aux setup
+        # has moved on.
+        meta["aux_channels"] = list(aux)
+        meta["aux_config"] = {c: config.aux_channel_cfg(c) for c in aux}
+        meta["marker_channel"] = config.aux_primary()
+    run_id = storage.save(label, i_ma, meta, isnk_ma=isnk_ma, aux=aux)
     out = {"run_id": run_id, "label": label}
     out.update(summary)
     out.update(extra or {})
+    if aux:
+        out.update(_marker_headline(aux, meta, run_id))
     if not battery:
         out["hint"] = ("Battery capacity is not configured, so battery life and "
                        "percentage-of-battery figures are unavailable. Ask the "
                        "developer for the pack's mAh rating and record it with "
                        "p1150_set_battery.")
+    return out
+
+
+# ------------------------------------------------------------------ #
+# Marker helpers                                                       #
+# ------------------------------------------------------------------ #
+def _resolve_marker(aux: dict, channel: str = None, meta: dict = None):
+    """Choose an aux channel and decode it to a per-sample assertion mask.
+
+    The current project configuration wins over whatever was in force when the
+    run was captured, because the usual reason to re-analyse a run is that the
+    threshold or the polarity was wrong the first time.
+    """
+    meta = meta or {}
+    if not aux:
+        raise ValueError(
+            "This run has no auxiliary channel recorded. Declare one with "
+            "p1150_set_aux and capture again -- aux channels are only retained "
+            "when the project has asked for them.")
+    ch = (channel or meta.get("marker_channel") or config.aux_primary()
+          or next(iter(aux))).upper()
+    if ch not in aux:
+        raise ValueError(
+            f"Run has no '{ch}' channel. Recorded: {', '.join(aux) or 'none'}.")
+    cfg = config.aux_channel_cfg(ch) or (meta.get("aux_config") or {}).get(ch) or {}
+    return ch, cfg, analysis.to_logic(aux[ch], cfg)
+
+
+def _marker_headline(aux: dict, meta: dict = None, run_id: str = None) -> dict:
+    """The one line about markers that belongs on every capture result."""
+    try:
+        ch, cfg, asserted = _resolve_marker(aux, None, meta)
+    except Exception:
+        return {"aux_channels": list(aux)}
+    n = analysis.assertion_count(asserted)
+    out = {"aux_channels": list(aux), "marker_channel": ch,
+           "marker_name": cfg.get("name"), "marker_occurrences": n}
+    if n:
+        out["marker_hint"] = (
+            f"p1150_marker_stats('{run_id}') gives current, charge and duration "
+            f"for each of the {n} assertions." if run_id else
+            "Call p1150_marker_stats(run_id) for per-assertion statistics.")
+    else:
+        out["marker_warning"] = (
+            f"{ch} never asserted during this capture, so no marked region was "
+            f"recorded. The instrumented code may not have run, the lead may be "
+            f"on the wrong pin, or the polarity may be inverted. Run "
+            f"p1150_aux_check to see what the input is doing.")
     return out
 
 
@@ -89,6 +146,30 @@ def p1150_measurement_guide() -> str:
     look fine but mean nothing.
     """
     return GUIDE
+
+
+@mcp.tool()
+def p1150_marker_guide() -> str:
+    """How to mark a code region with a GPIO so its current can be measured
+    exactly.
+
+    Read this before using p1150_set_aux, p1150_marker_stats or
+    p1150_compare_marker, and whenever asked what a particular function,
+    driver or feature costs the battery.
+
+    The P1150 has three auxiliary inputs (A0, D0, D1) that record alongside
+    current. Wiring a spare target GPIO to one of them, and raising it around
+    the work being measured, is the difference between inferring an event's
+    boundaries from a current threshold and knowing them. This covers the
+    firmware change, with example code; where to place the assertions and where
+    not to; the wiring and its constraints; how to choose between A0, D0 and D1
+    and what voltage levels to set; and the failure modes to check for first.
+
+    It needs the developer's involvement: they make the physical connection, and
+    they have to be willing to carry a few lines of instrumentation in the
+    build. Both are worth asking for.
+    """
+    return MARKER_GUIDE
 
 
 # ------------------------------------------------------------------ #
@@ -142,6 +223,201 @@ def p1150_get_battery() -> dict:
                               "the target runs on, then call p1150_set_battery."}
         cfg["configured"] = True
         return cfg
+    except Exception as e:
+        return _fail(e)
+
+
+# ------------------------------------------------------------------ #
+# Auxiliary marker inputs                                              #
+# ------------------------------------------------------------------ #
+@mcp.tool()
+def p1150_set_aux(channel: str, name: str = None, active_high: bool = True,
+                  threshold_mv: float = None, hysteresis_mv: float = None,
+                  primary: bool = True) -> dict:
+    """Declare a signal the target drives into a P1150 auxiliary input, so that
+    current can be measured over exactly the code region the firmware marks.
+
+    THIS REQUIRES TWO THINGS OF THE DEVELOPER, so read p1150_marker_guide and
+    agree both with them before calling: a spare GPIO on the target driven high
+    at the start of the work being measured and low at the end, and a wire from
+    that pin to the P1150's A0, D0 or D1 input with grounds in common. Almost
+    every embedded target has a pin free for this, and it is the single change
+    that turns "roughly what does this feature cost" into an exact answer.
+
+    Why it is worth the wiring: without a marker, the boundaries of an event
+    have to be inferred from a current threshold, which fails whenever the work
+    does not stand out clearly above the idle floor, and shifts between runs so
+    two measurements are never quite of the same thing. A GPIO marker makes the
+    boundaries a fact the firmware states, so charge per invocation is exact and
+    two builds are compared over provably the same code path.
+
+    Once declared, the channel is recorded alongside current in every capture,
+    p1150_marker_stats reports per-assertion statistics, p1150_compare_marker
+    checks that region for regressions, and p1150_capture_single can trigger
+    from it.
+
+    channel: "D0" or "D1" for a logic input. Prefer these: they accept a
+        1.2-3.3 V signal and the driver rescales them to fixed levels, so no
+        threshold is needed whatever IO voltage the target uses.
+        "A0" is analog, accepts 0-17 V and reports millivolts as measured. Use
+        it when both digital inputs are taken, when the signal is not a clean
+        logic level, or -- importantly -- WHEN THE TARGET DRIVES ABOVE 3.3 V.
+        A 5 V or 12 V signal must go to A0; connecting it to D0/D1 exceeds
+        their 3.3 V limit and damages the P1150.
+
+    name: what the marked region is, e.g. "ble_tx", "sensor_read",
+        "crypto_sign". It appears in the results and is what makes them
+        readable weeks later.
+
+    active_high: True when the firmware raises the pin for the duration of the
+        work (the usual convention). False when the pin idles high and is pulled
+        low instead.
+
+    threshold_mv: REQUIRED for A0, and rejected for D0/D1 which have fixed
+        levels already. It is the millivolt level separating low from high on
+        the signal itself; half the target's IO voltage is the standard choice:
+        1650 for a 3.3 V GPIO, 900 for 1.8 V, 2500 for 5 V. It always describes
+        the signal, never the assertion, so an active-low marker on a 3.3 V rail
+        is still 1650 with active_high=False. A0 accepts up to 17000 mV.
+
+    hysteresis_mv: half-width of the band around the threshold, defaulting to
+        10% of it (minimum 50 mV). An edge seen through a probe lead has finite
+        slew and some ringing, and without a band one crossing can be counted as
+        several assertions. Widen it if p1150_aux_check reports NOISY.
+
+    primary: make this the channel the analysis tools use by default. Set False
+        when adding a second marker alongside an established one.
+
+    AFTER CALLING THIS, run p1150_aux_check before a long measurement. It
+    confirms the target is really driving the pin and that the threshold sits
+    between the two levels -- a marker that never asserts produces a capture
+    that looks fine and yields nothing.
+    """
+    try:
+        cfg = config.set_aux(channel, name, active_high,
+                             threshold_mv, hysteresis_mv, primary)
+        ch = channel.upper()
+        cfg["configured"] = ch
+        cfg["note"] = (
+            f"{ch} will now be recorded alongside current in every capture. "
+            f"Run p1150_aux_check to confirm the target actually drives it "
+            f"before taking a measurement that matters.")
+        return cfg
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_get_aux() -> dict:
+    """Show which auxiliary inputs are set up as markers for this project.
+
+    Returns each channel's name, polarity and thresholds, and which one the
+    analysis tools use by default. Nothing configured means captures record
+    current only.
+    """
+    try:
+        cfg = config.get_aux()
+        if not cfg.get("channels"):
+            return {"configured": False,
+                    "channels": {},
+                    "note": "No auxiliary input is set up, so captures record "
+                            "current only. If the target has a spare GPIO, "
+                            "read p1150_marker_guide -- marking a code region "
+                            "with it gives exact per-invocation charge instead "
+                            "of a figure inferred from a current threshold."}
+        cfg["configured"] = True
+        return cfg
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_clear_aux(channel: str = None) -> dict:
+    """Stop recording an auxiliary input, or all of them.
+
+    Use when the marker wire comes off, or to save memory on a long capture --
+    each retained aux channel costs as much as a current channel.
+    """
+    try:
+        cfg = config.clear_aux(channel)
+        cfg["note"] = (f"{channel.upper()} is no longer recorded."
+                       if channel else
+                       "Auxiliary inputs are off; captures record current only.")
+        return cfg
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_aux_check(duration_s: float = 2.0) -> dict:
+    """Check that the target really drives the auxiliary inputs, before relying
+    on them.
+
+    ASK THE DEVELOPER TO EXERCISE THE INSTRUMENTED CODE while this runs -- the
+    marker only appears if the code being marked actually executes. For a marker
+    on something periodic, use a duration covering several repetitions.
+
+    This is the step that catches the failures which otherwise waste a whole
+    measurement: a lead on the wrong pin, a GPIO never configured as an output,
+    an inverted polarity, or an A0 threshold sitting outside the two levels the
+    signal actually reaches. Each of those produces a capture that looks
+    perfectly normal and contains no usable marker.
+
+    For every configured channel it reports the levels seen, how many assertions
+    were detected, and a verdict:
+      TOGGLING    the signal moves as a marker should. Good to measure.
+      STUCK_LOW   never left its low level -- the code did not run, the pin is
+                  not driven, or the wire is on the wrong pad.
+      STUCK_HIGH  never left its high level -- often an inverted polarity
+                  (retry with active_high=False), or a pin left asserted.
+      NOISY       transitions far too often to be a GPIO marking work. Usually a
+                  floating input, or a threshold sitting in the middle of noise
+                  -- widen hysteresis_mv, or check the ground connection.
+
+    For A0 it also suggests a threshold and hysteresis from the two levels it
+    actually observed, which is more reliable than assuming the target's IO
+    voltage.
+    """
+    try:
+        channels = config.aux_channels()
+        if not channels:
+            return {"error": "No auxiliary input is configured. Call "
+                             "p1150_set_aux first (p1150_marker_guide explains "
+                             "the firmware and wiring side)."}
+        i, _, aux = SESSION.measure(duration_s)
+        out = {"duration_s": duration_s, "channels": {}}
+        for ch in channels:
+            if ch not in aux:
+                continue
+            cfg = config.aux_channel_cfg(ch)
+            r = analysis.marker_survey(aux[ch], cfg, SAMPLE_RATE, ch)
+            r["name"] = cfg.get("name")
+            r["units"] = ("mV as measured at the input" if ch == "A0" else
+                          "mV, rescaled by the driver to fixed logic levels "
+                          "(~100 low, ~900 high) whatever the target drives")
+            r["active_high"] = cfg.get("active_high", True)
+            if ch == "A0" and cfg.get("threshold_mv") is not None:
+                lo, hi = r.get("low_level"), r.get("high_level")
+                thr = cfg["threshold_mv"]
+                if lo is not None and hi is not None and not (lo < thr < hi):
+                    r["threshold_warning"] = (
+                        f"The configured threshold of {thr} mV is not between "
+                        f"the levels actually seen ({lo} to {hi} mV), so the "
+                        f"signal never crosses it. Re-run p1150_set_aux with "
+                        f"threshold_mv={r.get('suggested_threshold_mv')}.")
+            out["channels"][ch] = r
+        verdicts = {c: v.get("verdict") for c, v in out["channels"].items()}
+        out["ready"] = all(v == "TOGGLING" for v in verdicts.values()) \
+            and bool(verdicts)
+        if not out["ready"]:
+            out["action"] = (
+                "Fix the wiring or the firmware before measuring. If the code "
+                "being marked simply did not run during these "
+                f"{duration_s} s, ask the developer to trigger it and re-check.")
+        # A quiet target with a working marker still needs the current side to
+        # be sane, so the reading that would otherwise prompt a second call.
+        out["mean_current_ma"] = round(float(i.mean()), 6) if i.size else None
+        return out
     except Exception as e:
         return _fail(e)
 
@@ -367,8 +643,9 @@ def p1150_measure(duration_s: float, label: str,
     examine them further.
     """
     try:
-        i, isnk = SESSION.measure(duration_s, connect_probe_during)
-        return _store(label, i, {"capture_type": "timed"}, isnk_ma=isnk)
+        i, isnk, aux = SESSION.measure(duration_s, connect_probe_during)
+        return _store(label, i, {"capture_type": "timed"},
+                      isnk_ma=isnk, aux=aux)
     except Exception as e:
         return _fail(e)
 
@@ -419,9 +696,9 @@ def p1150_capture_stop() -> dict:
     a baseline, or to p1150_segment / p1150_events to see where the energy went.
     """
     try:
-        label, i, isnk = SESSION.capture_stop_raw()
+        label, i, isnk, aux = SESSION.capture_stop_raw()
         return _store(label, i, {"capture_type": "background"},
-                      isnk_ma=isnk)
+                      isnk_ma=isnk, aux=aux)
     except Exception as e:
         return _fail(e)
 
@@ -461,10 +738,11 @@ def p1150_verify_charging(duration_s: float = 10.0,
     intermittency is visible.
     """
     try:
-        i, isnk = SESSION.measure(duration_s)
+        i, isnk, aux = SESSION.measure(duration_s)
         battery = config.capacity_mah()
         out = analysis.charge_test(i, isnk, SAMPLE_RATE, battery)
-        stored = _store(label, i, {"capture_type": "charge_test"}, isnk_ma=isnk)
+        stored = _store(label, i, {"capture_type": "charge_test"},
+                        isnk_ma=isnk, aux=aux)
         out["run_id"] = stored.get("run_id")
         out["label"] = label
         # A sink over-current trip is latched on the device, not visible in the
@@ -512,8 +790,10 @@ def p1150_capture_single(label: str, timebase: str = "TBASE_SPAN_100MS",
                          trigger_ma: float = None,
                          position: str = "TRIG_POS_LEFT",
                          slope: str = "TRIG_SLOPE_RISE",
-                         timeout_s: float = 30.0) -> dict:
-    """Capture a single event, optionally waiting for a current threshold.
+                         timeout_s: float = 30.0,
+                         trigger_on: str = None,
+                         trigger_level: float = None) -> dict:
+    """Capture a single event, optionally waiting for a trigger.
 
     Use this to look closely at one thing -- a radio transmit, a flash write, a
     sensor read, a wake-up burst -- rather than to characterise a workload.
@@ -530,16 +810,35 @@ def p1150_capture_single(label: str, timebase: str = "TBASE_SPAN_100MS",
         starts immediately. If the trigger never fires within timeout_s, the
         level is above the actual peak.
 
+    trigger_on: trigger from an auxiliary input the target itself drives --
+        "A0", "D0" or "D1" -- instead of from a current level. This is the
+        precise option and the one to prefer when the target has a spare GPIO:
+        the firmware raises the pin exactly where the event begins, so the
+        capture starts at the right instant even for work whose current draw
+        never rises far enough above the idle floor for a current trigger to
+        catch it. Declare the channel first with p1150_set_aux; see
+        p1150_marker_guide for the firmware and wiring side.
+
+    trigger_level: overrides the aux threshold for this capture only, in the
+        channel's own units (millivolts for A0). Rarely needed -- the level from
+        p1150_set_aux is used by default.
+
     position: where the trigger sits in the window. TRIG_POS_LEFT records mostly
         after the event starts; TRIG_POS_CENTER also shows what led up to it,
         which is what you want when diagnosing an unexpected current spike.
+
+    slope: TRIG_SLOPE_RISE fires on the asserting edge of an active-high marker,
+        TRIG_SLOPE_FALL on an active-low one.
     """
     try:
-        i, isnk = SESSION.capture_single(timebase, trigger_ma, position,
-                                        slope, timeout_s)
+        i, isnk, aux = SESSION.capture_single(timebase, trigger_ma, position,
+                                              slope, timeout_s,
+                                              trigger_on, trigger_level)
         return _store(label, i, {"capture_type": "single",
                                  "timebase": timebase,
-                                 "trigger_ma": trigger_ma}, isnk_ma=isnk)
+                                 "trigger_ma": trigger_ma,
+                                 "trigger_on": trigger_on},
+                      isnk_ma=isnk, aux=aux)
     except Exception as e:
         return _fail(e)
 
@@ -626,6 +925,118 @@ def p1150_events(run_id: str, threshold_ma: float = None,
 
 
 @mcp.tool()
+def p1150_marker_stats(run_id: str, channel: str = None,
+                       min_duration_us: float = 0.0) -> dict:
+    """Current statistics for the regions where the target's marker GPIO was
+    asserted -- the exact answer to "what does this piece of code cost".
+
+    Requires a run captured while an auxiliary input was configured
+    (p1150_set_aux). The firmware states where the work starts and stops, so
+    unlike p1150_events -- which infers bursts from a current threshold -- the
+    boundaries are exact, and work that never rises far above the idle floor is
+    measured just as well as work that does.
+
+    Reports, for each assertion and in aggregate:
+      duration        how long the marked code ran. A change here is the code
+                      getting slower, not drawing more.
+      charge_uah      what one invocation costs the battery.
+      excess_uah      that cost minus what the target was drawing anyway
+                      outside the marker. This is the figure to attribute to
+                      the feature; the raw charge also contains the idle floor,
+                      which makes a long marker look expensive when it is not.
+      mean/peak mA    current while it runs. A change here is the code enabling
+                      something different, not taking longer.
+      deasserted      the same figures for everything outside the markers, so
+                      the marked region can be put in proportion.
+      worst_occurrence  the single most expensive and the single longest
+                      invocation. A mean hides the one iteration that hit a
+                      retry path, and that outlier is usually the interesting
+                      one.
+      repetition      rate, period jitter and duty cycle when the marker fires
+                      more than once.
+
+    channel: which aux input to read. Defaults to the project's primary one.
+
+    min_duration_us: discard assertions shorter than this. Use it if the GPIO
+        glitches; note the P1150 samples every 8 us, so an assertion shorter
+        than about 50 us is not reliably resolved and one shorter than 8 us can
+        be missed entirely.
+    """
+    try:
+        i, _, aux, meta = storage.load_all(run_id)
+        ch, cfg, asserted = _resolve_marker(aux, channel, meta)
+        out = analysis.marker_analysis(i, asserted, SAMPLE_RATE,
+                                       config.capacity_mah(), min_duration_us)
+        out["run_id"] = run_id
+        out["label"] = meta.get("label")
+        out["marker_channel"] = ch
+        out["marker_name"] = cfg.get("name")
+        out["marker_polarity"] = "active_high" if cfg.get("active_high", True) \
+            else "active_low"
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_compare_marker(baseline_run_id: str, candidate_run_id: str,
+                         channel: str = None, threshold_pct: float = 5.0,
+                         min_duration_us: float = 0.0) -> dict:
+    """Compare two runs over just the marked code region: did this feature get
+    more expensive?
+
+    The strictest regression check available here, and the one to use whenever
+    the target has a marker GPIO wired up. p1150_compare weighs a whole capture,
+    so it answers only "did the device get worse" and dilutes a real change to
+    one feature with everything else the target was doing. This compares the
+    marked region alone, and judges on CHARGE PER INVOCATION -- which does not
+    move just because the workload ran a different number of times, and does not
+    require the two captures to be the same length.
+
+    Both runs must have been captured with the same aux channel configured and
+    the same firmware marker in the same place; otherwise the comparison is
+    between two different code regions and means nothing.
+
+    Beyond the verdict it separates the two causes that a single number cannot:
+    the marked code taking LONGER (added work, retries, a busy-wait, a slower
+    clock) versus DRAWING MORE while it runs (a peripheral left on, radio TX
+    power, a regulator mode). Those lead to completely different fixes. It also
+    reports current outside the marker separately, so a change there is not
+    misattributed to the marked feature.
+    """
+    try:
+        bi, _, baux, bmeta = storage.load_all(baseline_run_id)
+        ci, _, caux, cmeta = storage.load_all(candidate_run_id)
+        bch, bcfg, b_asserted = _resolve_marker(baux, channel, bmeta)
+        cch, ccfg, c_asserted = _resolve_marker(caux, channel, cmeta)
+        if bch != cch:
+            return {"error": f"The runs used different aux channels "
+                             f"({bch} vs {cch}). Pass channel= to pick one, or "
+                             f"re-capture so both mark the same input."}
+        out = analysis.compare_markers(bi, b_asserted, ci, c_asserted,
+                                       SAMPLE_RATE, threshold_pct,
+                                       config.capacity_mah(), min_duration_us)
+        out["marker_channel"] = bch
+        out["marker_name"] = bcfg.get("name") or ccfg.get("name")
+        out["baseline_run"] = {"run_id": baseline_run_id,
+                               "label": bmeta.get("label"),
+                               "voltage_mv": bmeta.get("voltage_mv")}
+        out["candidate_run"] = {"run_id": candidate_run_id,
+                                "label": cmeta.get("label"),
+                                "voltage_mv": cmeta.get("voltage_mv")}
+        if bmeta.get("voltage_mv") and cmeta.get("voltage_mv") and \
+                bmeta["voltage_mv"] != cmeta["voltage_mv"]:
+            out["warning"] = (
+                f"Runs used different supply voltages "
+                f"({bmeta['voltage_mv']} mV vs {cmeta['voltage_mv']} mV). "
+                f"Current draw depends on supply voltage, so this comparison "
+                f"is not valid. Re-run both at the same voltage.")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
 def p1150_compare(baseline_run_id: str, candidate_run_id: str,
                   threshold_pct: float = 5.0) -> dict:
     """Compare two runs and report whether battery current has regressed.
@@ -669,13 +1080,20 @@ def p1150_compare(baseline_run_id: str, candidate_run_id: str,
 
 
 @mcp.tool()
-def p1150_plot(run_id: str, path: str = None, log_scale: bool = True) -> dict:
+def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
+               show_marker: bool = True) -> dict:
     """Render a run as a PNG current-vs-time plot and return the file path.
 
     Useful when the numbers are ambiguous and the shape of the waveform settles
     it -- read the image back to see the profile directly. Log scale is the
     default because a battery profile spans microamps to milliamps, and a linear
     axis flattens the sleep floor into the baseline.
+
+    show_marker shades the regions where the target's marker GPIO was asserted,
+    when the run has an auxiliary channel recorded. Seeing the current alongside
+    the code region that produced it is usually what settles an ambiguous
+    result: it shows immediately whether the cost sits inside the marked work or
+    just outside it, which the numbers alone cannot.
 
     Waveforms are decimated to a few thousand points for the plot; the stored
     samples are untouched.
@@ -685,7 +1103,7 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True) -> dict:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        i, meta = storage.load(run_id)
+        i, _, aux, meta = storage.load_all(run_id)
         n = i.size
         # Min/max decimation rather than striding: a 1 ms burst inside a 30 s
         # capture would fall between strided samples and vanish from the plot,
@@ -706,20 +1124,49 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True) -> dict:
             y = np.maximum(y, 1e-4)  # keep zeros off a log axis
 
         plt.figure(figsize=(11, 4.5))
+
+        marked = None
+        if show_marker and aux:
+            try:
+                ch, cfg, asserted = _resolve_marker(aux, None, meta)
+                starts, ends = analysis.intervals(asserted)
+                # Shading is one patch per assertion, so a capture holding
+                # thousands of them would take longer to draw than to measure --
+                # and would ink the whole axis solid anyway.
+                if 0 < starts.size <= 400:
+                    for a, b in zip(starts, ends):
+                        plt.axvspan(a / SAMPLE_RATE, b / SAMPLE_RATE,
+                                    color="#f0a30a", alpha=0.20, linewidth=0)
+                    marked = {"channel": ch, "name": cfg.get("name"),
+                              "shaded": int(starts.size)}
+                elif starts.size:
+                    marked = {"channel": ch, "name": cfg.get("name"),
+                              "shaded": 0,
+                              "note": f"{starts.size} assertions is too many to "
+                                      f"shade legibly; left unmarked."}
+            except Exception:
+                pass
+
         plt.plot(x, y, linewidth=0.6)
         if log_scale:
             plt.yscale("log")
         plt.xlabel("Time (s)")
         plt.ylabel("Current (mA)")
-        plt.title(f"{meta.get('label', run_id)}  --  "
-                  f"avg {meta.get('avg_ma')} mA, {meta.get('charge_mah')} mAh")
+        title = (f"{meta.get('label', run_id)}  --  "
+                 f"avg {meta.get('avg_ma')} mA, {meta.get('charge_mah')} mAh")
+        if marked and marked.get("shaded"):
+            title += f"   (shaded: {marked.get('name') or marked['channel']})"
+        plt.title(title)
         plt.grid(True, "both", color="#ddddee")
         plt.tight_layout()
 
         out = path or os.path.join(storage.runs_dir(), run_id + ".png")
         plt.savefig(out, dpi=110)
         plt.close()
-        return {"run_id": run_id, "path": out}
+        res = {"run_id": run_id, "path": out}
+        if marked:
+            res["marker"] = marked
+        return res
     except Exception as e:
         return _fail(e)
 

@@ -22,7 +22,25 @@ import numpy as np
 
 from pxxxx import PXXXX, PxxxxAPI, ACQ_FORMAT_NUMPY
 
+from . import config, analysis
+
 SAMPLE_RATE = 125_000
+
+# MCP-facing aux channel name -> key in the driver's acquisition dict.
+AUX_KEYS = {"A0": "a0", "D0": "d0", "D1": "d1"}
+
+# Trigger sources for the aux inputs.  A0A is the analog input; D0/D1 are the
+# digital ones.  TRIG_SRC_D0S (the serial decode on D0) is deliberately absent:
+# nothing in this server configures or reports that stream.
+AUX_TRIG_SRC = {
+    "A0": PxxxxAPI.TRIG_SRC_A0A,
+    "D0": PxxxxAPI.TRIG_SRC_D0,
+    "D1": PxxxxAPI.TRIG_SRC_D1,
+}
+
+# Trigger levels are in the units the channel reports, which for D0/D1 is the
+# driver's rescaled millivolts (~100 low, ~900 high) and NOT 0/1 -- a level of
+# 0.5 would sit below the low rail and fire immediately, every time.
 
 # Chunk length for streaming captures.  200 ms is the value the P1150 examples
 # use for ACQUIRE_MODE_LOGGER: long enough that the per-chunk overhead is small,
@@ -44,11 +62,17 @@ class DeviceError(RuntimeError):
 
 
 def _join(chunks: list) -> tuple:
-    """Concatenate a list of (i, isnk) chunks into one (i, isnk) pair."""
+    """Concatenate chunk dicts into one (i, isnk, aux) triple.
+
+    aux is {"D0": array, ...} holding whichever auxiliary channels were armed
+    for this capture, and is empty when none were.
+    """
     if not chunks:
-        return np.empty(0, np.float32), np.empty(0, np.float32)
-    return (np.concatenate([c[0] for c in chunks]),
-            np.concatenate([c[1] for c in chunks]))
+        return np.empty(0, np.float32), np.empty(0, np.float32), {}
+    aux_keys = [k for k in chunks[0] if k not in ("i", "isnk")]
+    return (np.concatenate([c["i"] for c in chunks]),
+            np.concatenate([c["isnk"] for c in chunks]),
+            {k: np.concatenate([c[k] for c in chunks]) for k in aux_keys})
 
 
 class Session:
@@ -64,6 +88,10 @@ class Session:
 
         self._acq_event = threading.Event()
         self._acq_chunk = None
+        # Auxiliary channels to retain, snapshotted when a capture is armed so
+        # that editing the config mid-capture cannot produce chunks of
+        # different shapes that then fail to concatenate.
+        self._aux = []
 
         self._capture_thread = None
         self._capture_stop = threading.Event()
@@ -79,12 +107,24 @@ class Session:
         positive-only: 'i' is current the P1150 sources into the target, 'isnk'
         is current flowing back into the P1150 -- which is what a target's
         charging circuit produces when the P1150 stands in for the battery.
-        Net battery current is i - isnk.  The remaining channels (a0, d0, d1)
-        are dropped; they would triple the memory for data this server does not
-        report on, and a long capture is already hundreds of megabytes.
+        Net battery current is i - isnk.
+
+        The auxiliary channels (a0, d0, d1) are retained only when the project
+        has declared one, because each costs as much memory as a current
+        channel and a long capture is already hundreds of megabytes.  Keeping
+        all three unconditionally would triple that for data most sessions
+        never look at.
         """
-        self._acq_chunk = (data["i"], data["isnk"])
+        chunk = {"i": data["i"], "isnk": data["isnk"]}
+        for ch in self._aux:
+            chunk[ch] = data[AUX_KEYS[ch]]
+        self._acq_chunk = chunk
         self._acq_event.set()
+
+    def _arm_aux(self) -> list:
+        """Snapshot which aux channels this capture will retain."""
+        self._aux = [c for c in config.aux_channels() if c in AUX_KEYS]
+        return self._aux
 
     def _cb_async(self, data: dict) -> None:
         pass  # periodic ammeter/temperature chatter; nothing to do with it here
@@ -293,7 +333,9 @@ class Session:
 
     def measure(self, duration_s: float,
                 connect_probe_during: bool = False) -> tuple:
-        """Blocking capture of duration_s seconds.  Returns (i, isnk) in mA.
+        """Blocking capture of duration_s seconds.
+
+        Returns (i, isnk, aux); currents in mA, aux keyed by channel name.
 
         connect_probe_during closes the probe relay *after* streaming has begun,
         which is the only way to capture a target's power-on inrush and boot
@@ -303,6 +345,7 @@ class Session:
         if self._capture_thread is not None:
             raise DeviceError("A background capture is running; "
                               "call p1150_capture_stop first.")
+        self._arm_aux()
         chunks = []
         dev.set_timebase(STREAM_TIMEBASE)
         n_chunks = max(1, int(round(duration_s / STREAM_CHUNK_S)))
@@ -319,13 +362,33 @@ class Session:
                 pass
         return _join(chunks)
 
+    def _aux_trigger_level(self, channel: str) -> float:
+        """Level to trigger an aux channel at, in that channel's own units."""
+        cfg = config.aux_channel_cfg(channel)
+        thr = cfg.get("threshold_mv")
+        if thr is not None:
+            return float(thr)
+        if channel == "A0":
+            raise DeviceError(
+                "A0 is analog, so triggering on it needs a level in millivolts. "
+                "Declare it with p1150_set_aux(channel='A0', threshold_mv=...), "
+                "or pass trigger_level explicitly.")
+        return analysis.digital_threshold()[0]
+
     def capture_single(self, timebase: str, trigger_ma: float = None,
                        position: str = PxxxxAPI.TRIG_POS_LEFT,
                        slope: str = PxxxxAPI.TRIG_SLOPE_RISE,
-                       timeout_s: float = 30.0) -> tuple:
+                       timeout_s: float = 30.0,
+                       trigger_on: str = None,
+                       trigger_level: float = None) -> tuple:
         """One-shot capture over a timebase span, optionally triggered.
 
-        Returns (i, isnk) in mA.
+        The trigger source is a current level (trigger_ma) or an auxiliary input
+        (trigger_on, one of A0/D0/D1).  An aux trigger is the exact one: the
+        target says when its own work begins, instead of the capture guessing
+        from a current threshold that a quiet feature may never cross.
+
+        Returns (i, isnk, aux); currents in mA.
         """
         dev = self.require()
         if self._capture_thread is not None:
@@ -335,12 +398,23 @@ class Session:
         if not ok:
             raise DeviceError(f"Unknown timebase {timebase}")
 
-        if trigger_ma is None:
+        if trigger_on:
+            channel = trigger_on.upper()
+            if channel not in AUX_TRIG_SRC:
+                raise DeviceError(
+                    f"trigger_on must be one of "
+                    f"{', '.join(AUX_TRIG_SRC)}, got '{trigger_on}'.")
+            level = float(trigger_level) if trigger_level is not None \
+                else self._aux_trigger_level(channel)
+            dev.set_trigger(src=AUX_TRIG_SRC[channel], pos=position,
+                            slope=slope, level=level)
+        elif trigger_ma is None:
             dev.set_trigger(src=PxxxxAPI.TRIG_SRC_NONE)
         else:
             dev.set_trigger(src=PxxxxAPI.TRIG_SRC_CUR, pos=position,
                             slope=slope, level=float(trigger_ma))
 
+        self._arm_aux()
         self._acq_event.clear()
         ok, r = dev.acquisition_start(PxxxxAPI.ACQUIRE_MODE_SINGLE)
         if not ok:
@@ -350,6 +424,13 @@ class Session:
             while not self._acq_event.is_set():
                 if timer() - start > timeout_s:
                     raise DeviceError(
+                        f"Trigger did not fire within {timeout_s}s on "
+                        f"{channel} at {level}. Check that the target really "
+                        f"drives that pin, that the lead is on the right one, "
+                        f"and that the slope matches the edge the firmware "
+                        f"produces. p1150_aux_check shows what the input is "
+                        f"actually doing."
+                        if trigger_on else
                         f"Trigger did not fire within {timeout_s}s at "
                         f"{trigger_ma} mA. Check the level is above the "
                         f"resting current but below the event peak.")
@@ -359,7 +440,7 @@ class Session:
                 dev.acquisition_stop()
             except Exception:
                 pass
-        return self._acq_chunk
+        return _join([self._acq_chunk] if self._acq_chunk else [])
 
     def self_test(self) -> dict:
         """Measure the P1150's own calibration resistors as a known load.
@@ -382,7 +463,7 @@ class Session:
             raise DeviceError("set_cal_sweep failed")
         try:
             time.sleep(0.05)   # let the first resistor settle
-            i, isnk = self.measure(1.0)
+            i, isnk, _ = self.measure(1.0)
         finally:
             dev.set_cal_sweep(sweep=False)
         return {"current_ma": i, "sink_ma": isnk, "voltage_mv": self.vout_mv}
@@ -396,9 +477,10 @@ class Session:
                 f"A capture ({self._capture['label']}) is already running.")
 
         max_s = float(max_s or DEFAULT_MAX_CAPTURE_S)
+        aux = self._arm_aux()
         chunks = []
         self._capture = {"label": label, "chunks": chunks,
-                         "started": timer(), "max_s": max_s}
+                         "started": timer(), "max_s": max_s, "aux": aux}
         self._capture_err = None
         self._capture_stop.clear()
 
@@ -410,13 +492,14 @@ class Session:
 
         self._capture_thread = threading.Thread(target=run, daemon=True)
         self._capture_thread.start()
-        return {"capturing": True, "label": label, "max_duration_s": max_s}
+        return {"capturing": True, "label": label, "max_duration_s": max_s,
+                "aux_channels": aux or None}
 
     def capture_status(self) -> dict:
         if self._capture_thread is None:
             return {"capturing": False}
         c = self._capture
-        n = sum(len(x[0]) for x in c["chunks"])
+        n = sum(len(x["i"]) for x in c["chunks"])
         return {
             "capturing": self._capture_thread.is_alive(),
             "label": c["label"],
@@ -424,11 +507,12 @@ class Session:
             "samples": n,
             "captured_s": round(n / SAMPLE_RATE, 3),
             "max_duration_s": c["max_s"],
+            "aux_channels": c.get("aux") or None,
             "error": self._capture_err,
         }
 
     def capture_stop_raw(self) -> tuple:
-        """Stop the background capture; returns (label, i, isnk) in mA."""
+        """Stop the background capture; returns (label, i, isnk, aux)."""
         if self._capture_thread is None:
             raise DeviceError("No capture is running.")
         self._capture_stop.set()
@@ -437,8 +521,8 @@ class Session:
         c, self._capture = self._capture, None
         if self._capture_err:
             raise DeviceError(f"Capture failed: {self._capture_err}")
-        i, isnk = _join(c["chunks"])
-        return c["label"], i, isnk
+        i, isnk, aux = _join(c["chunks"])
+        return c["label"], i, isnk, aux
 
 
 SESSION = Session()
