@@ -28,7 +28,7 @@ import time
 import argparse
 from threading import Event
 from timeit import default_timer as timer
-from p1150_driver import P1150
+from pxxxx import PXXXX, PxxxxAPI
 import matplotlib.pyplot as plt
 import logging
 
@@ -83,7 +83,10 @@ if __name__ == '__main__':
     parser.add_argument("--sn", required=True, help="Serial Number for the P1150")
     args = parser.parse_args()
 
-    P1150_PORT = P1150.get_port_from_sn(args.sn)
+    P1150_PORT = PXXXX.get_port_from_sn(args.sn)
+    if P1150_PORT is None:
+        logger.error(f"No P1150 found with serial number {args.sn}")
+        exit(1)
 
     logger.info(f"attempting connect on {P1150_PORT}...")
     connect_attempts = 2
@@ -94,16 +97,16 @@ if __name__ == '__main__':
         # connections are fast.
 
         try:
-            p1150 = P1150.P1150(port=P1150_PORT,
-                                logger=logger,
-                                cb_uclog_async=_cb_p1150_async,
-                                cb_acquisition_get_data=_cb_p1150_acqcomplete)
+            p1150 = PXXXX(port=P1150_PORT,
+                          logger=logger,
+                          cb_uclog_async=_cb_p1150_async,
+                          cb_acquisition_get_data=_cb_p1150_acqcomplete)
 
         except Exception as e:
             logger.info(e)
             exit(1)
 
-        success, p1150_details = p1150.ez_connect(args.sn)
+        success, p1150_details = p1150.ez_connect(calibrate=True)
         if not success:
             logger.error(f"ez_connect {P1150_PORT}: {p1150_details}")
             p1150.close()
@@ -112,9 +115,11 @@ if __name__ == '__main__':
         if p1150_details["app"] == "a43":
             break
 
+        # still in the bootloader, release the port before retrying
+        p1150.close()
         connect_attempts -= 1
 
-    if connect_attempts < 0:
+    if connect_attempts < 1:
         logger.error(f"ez_connect {P1150_PORT}: exceeded connect attempts")
         exit(1)
 
@@ -138,13 +143,13 @@ if __name__ == '__main__':
 
     time.sleep(WAIT_BEFORE_SAMPLE_S)  # wait for load to settle
 
-    success, response = p1150.set_timebase(P1150.P1150API.TBASE_SPAN_100MS)
+    success, response = p1150.set_timebase(PxxxxAPI.TBASE_SPAN_100MS)
     if not success:
         logger.error(f"set_timebase: {response}")
         p1150.close()
         exit(1)
 
-    success, response = p1150.acquisition_start(P1150.P1150API.ACQUIRE_MODE_SINGLE)
+    success, response = p1150.acquisition_start(PxxxxAPI.ACQUIRE_MODE_SINGLE)
     if not success:
         logger.error(f"acquisition_start: {response}")
         p1150.close()

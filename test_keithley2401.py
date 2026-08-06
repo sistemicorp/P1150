@@ -39,7 +39,7 @@ import math
 from threading import Event
 from timeit import default_timer as timer
 import pyvisa
-import P1150
+from pxxxx import PXXXX, PxxxxAPI
 import matplotlib.pyplot as plt
 import logging
 logger = logging.getLogger()
@@ -88,17 +88,14 @@ TEST_CURRENTS_MA_LIST = [-0.00001, -0.000013, -0.00002, -0.00003, -0.00005, -0.0
 # Its important to set the Keithley range correctly, else it has significant error
 TEST_CURRENTS_RANGE_MA_LIST = [10.0 ** int(math.log10(abs(i))) for i in TEST_CURRENTS_MA_LIST]
 
-DEFAULT_TBASE = P1150.P1150API.TBASE_SPAN_100MS
-DEFAULT_TRIG_SRC = P1150.P1150API.TRIG_SRC_NONE
-DEFAULT_TRIG_SLOPE = P1150.P1150API.TRIG_SLOPE_RISE
-DEFAULT_TRIG_POSITION = P1150.P1150API.TRIG_POS_CENTER
+DEFAULT_TBASE = PxxxxAPI.TBASE_SPAN_100MS
+DEFAULT_TRIG_SRC = PxxxxAPI.TRIG_SRC_NONE
+DEFAULT_TRIG_SLOPE = PxxxxAPI.TRIG_SLOPE_RISE
+DEFAULT_TRIG_POSITION = PxxxxAPI.TRIG_POS_CENTER
 DEFAULT_TRIG_LEVEL = 1
 DEFAULT_ACQ_TIMEOUT = 10.0
 DEFAULT_ACQ_HOLDOFF = 0.0
 DEFAULT_OUTPUT_FILE = "export.csv"
-
-STM32_APP_a43_FILE = "a43_app.signed.ico"  # P1150 normal application
-TIME_RECONNECT_AFTER_FWLOAD_S = 5.0
 
 # global context
 G = {"p1150": None,
@@ -142,7 +139,7 @@ def p1150_acquire_single(timeout: float=DEFAULT_ACQ_TIMEOUT, holdoff: float=DEFA
 
     logger.info("acquisition_start")
 
-    success, response = G["p1150"].acquisition_start(P1150.P1150API.ACQUIRE_MODE_SINGLE)
+    success, response = G["p1150"].acquisition_start(PxxxxAPI.ACQUIRE_MODE_SINGLE)
     if not success:
         logger.error(f"acquisition_start: {response}")
         all_close()
@@ -189,7 +186,10 @@ if __name__ == '__main__':
     parser.add_argument("--sn", required=True, help="Serial Number for the P1150")
     args = parser.parse_args()
 
-    P1150_PORT = P1150.get_port_from_sn(args.sn)
+    P1150_PORT = PXXXX.get_port_from_sn(args.sn)
+    if P1150_PORT is None:
+        logger.error(f"No P1150 found with serial number {args.sn}")
+        exit(1)
 
     logger.info(f"attempting connect on {P1150_PORT}...")
 
@@ -201,15 +201,15 @@ if __name__ == '__main__':
         # connections are fast.
 
         try:
-            G["p1150"] = P1150.P1150(port=P1150_PORT,
-                                     logger=logger,
-                                     cb_acquisition_get_data=_p1150_acqcomplete)
+            G["p1150"] = PXXXX(port=P1150_PORT,
+                               logger=logger,
+                               cb_acquisition_get_data=_p1150_acqcomplete)
 
         except Exception as e:
             logger.info(e)
             exit(1)
 
-        success, p1150_details = G["p1150"].ez_connect(args.sn)
+        success, p1150_details = G["p1150"].ez_connect(calibrate=True)
         if not success:
             logger.error(f"ez_connect {P1150_PORT}: {p1150_details}")
             G["p1150"].close()
@@ -218,9 +218,11 @@ if __name__ == '__main__':
         if p1150_details["app"] == "a43":
             break
 
+        # still in the bootloader, release the port before retrying
+        G["p1150"].close()
         connect_attempts -= 1
 
-    if connect_attempts < 0:
+    if connect_attempts < 1:
         logger.error(f"ez_connect {P1150_PORT}: exceeded connect attempts")
         exit(1)
 
