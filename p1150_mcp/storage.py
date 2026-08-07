@@ -19,8 +19,15 @@ import numpy as np
 # An MCP client config that declares the variable but leaves it blank yields
 # "", which os.environ.get would hand back in place of the default -- so treat
 # empty as unset throughout.
+#
+# The fallback anchors on the project root rather than the working directory.
+# Claude Code sets CLAUDE_PROJECT_DIR in the server's environment; a client
+# started from a subdirectory would otherwise scatter runs across the disk, and
+# put them outside the .p1150_runs/ line in .gitignore that keeps hundreds of
+# megabytes of samples out of the repository.
+_ROOT = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
 RUNS_DIR = os.environ.get("P1150_RUNS_DIR") or \
-    os.path.join(os.getcwd(), ".p1150_runs")
+    os.path.join(_ROOT, ".p1150_runs")
 
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 

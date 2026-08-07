@@ -1,6 +1,11 @@
 
 .idea/
 
+# a venv created by the venv module ignores itself, but not every tool that
+# builds one writes that file, and this repo is cloned onto benches
+.venv/
+venv/
+
 __pycache__/
 
 *.pyd

@@ -1,13 +1,15 @@
 {
   "mcpServers": {
     "p1150": {
-      "command": "./venv/Scripts/python.exe",
+      "type": "stdio",
+      "command": "${CLAUDE_PROJECT_DIR:-.}/.venv/Scripts/python.exe",
       "args": ["-m", "p1150_mcp"],
       "env": {
-        "P1150_SN": "",
-        "P1150_BATTERY_MAH": "",
-        "P1150_RUNS_DIR": "",
-        "P1150_MAX_CAPTURE_S": "900"
+        "PYTHONPATH": "${CLAUDE_PROJECT_DIR:-.}",
+        "P1150_SN": "${P1150_SN:-}",
+        "P1150_BATTERY_MAH": "${P1150_BATTERY_MAH:-}",
+        "P1150_RUNS_DIR": "${P1150_RUNS_DIR:-}",
+        "P1150_MAX_CAPTURE_S": "${P1150_MAX_CAPTURE_S:-900}"
       }
     }
   }

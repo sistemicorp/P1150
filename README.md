@@ -207,9 +207,26 @@ battery current, and tell you whether a code change made it worse.
 python -m pip install -r requirements_mcp.txt
 ```
 
-`.mcp.json` in this repo registers the server with Claude Code.  Other MCP
-clients take the same command (`python -m p1150_mcp`, run from this folder).
-Optional environment settings:
+`.mcp.json` in this repo registers the server with Claude Code, which asks once
+to approve it.  That file is a Claude Code convention rather than part of MCP
+itself, so Claude Desktop, VS Code and Cursor each want the same command
+(`python -m p1150_mcp`) written into their own config instead.
+
+The committed entry runs `.venv/Scripts/python.exe`, so name the virtual
+environment `.venv` as above.  On Linux and macOS the interpreter is
+`.venv/bin/python` instead.  Register that as a personal entry rather than
+editing the tracked file — a local-scope server overrides the project one and is
+stored outside the repo, so it survives every `git pull`:
+
+```commandline
+claude mcp add --env PYTHONPATH="$PWD" --transport stdio p1150 \
+  -- "$PWD/.venv/bin/python" -m p1150_mcp
+```
+
+The settings below are declared in `.mcp.json` as `${VAR:-}`, so exporting one
+in your shell is enough to reach the server.  Set the serial number for your own
+bench that way rather than editing the tracked file.  Optional environment
+settings:
 
 | Variable | Purpose |
 |---|---|

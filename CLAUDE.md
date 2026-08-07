@@ -1,0 +1,95 @@
+# P1150
+
+Two things live here, for two audiences:
+
+* `pxxxx/` and the `p1150_*.py` scripts — the ctypes driver for the P1150
+  battery-current measurement instrument, plus worked examples.  This is what
+  customers of the hardware clone the repo for.
+* `p1150_mcp/` — an MCP server that lets an agent drive the instrument while a
+  developer works on target firmware.  Registered by `.mcp.json`.
+
+## This drives real hardware and can destroy the user's board
+
+`p1150_power_on` puts the voltage you choose straight onto the target's battery
+terminals.  Nothing clamps it — not `P1150_SN`, not the driver.  Too high kills
+the target and there is no undo.
+
+**Ask the developer for the voltage and confirm it before the first
+`p1150_power_on` of a session.  Never infer it from context, from the firmware
+source, or from what a previous project used.**
+
+Only one program can own a P1150 at a time.  The user must disconnect the
+instrument in the web GUI before the server can take it, and `p1150_disconnect`
+hands it back.  For the same reason, never run `p1150_hello.py` or the other
+demo scripts while the MCP server holds the device.
+
+## Read the guide tools before measuring
+
+`p1150_measurement_guide`, `p1150_inrush_guide` and `p1150_marker_guide` are
+written for you rather than for the user.  They carry the method — window
+lengths, what a sleep measurement actually requires, how to judge a voltage sag
+— none of which is derivable from the tool signatures.  Getting it wrong
+produces a capture that looks fine and means nothing: a 100 ms window that
+misses the wake burst, or a "sleep" figure taken while the target was still
+booting.  Call the relevant guide before the first measurement of a kind, not
+after a result looks strange.
+
+Ask for the battery capacity once per project and record it with
+`p1150_set_battery`.  It cannot be inferred from a waveform, it is what turns
+milliamps into battery life, and it persists in `.p1150_runs/battery.json`, so
+it is asked once and not re-asked each session.
+
+## Captures are large
+
+Sampling is 125 kSa/s per channel — about a megabyte per second, so the 900 s
+default cap is roughly 900 MB (`device.py:80`).  Captures are written to
+`.p1150_runs/`, which is gitignored.  Never commit one, and never read a `.npz`
+from there directly; that is what `p1150_summary`, `p1150_segment`,
+`p1150_events` and `p1150_compare` are for.  The samples stay on disk precisely
+so they never have to pass through a context window.
+
+## Environment
+
+The virtual environment is `.venv/` at the repo root, and `.mcp.json` runs
+`.venv/Scripts/python.exe`.  On Linux and macOS the path is `.venv/bin/python`
+— register a local-scope server rather than editing the tracked file; the
+README gives the command.
+
+Three requirement sets, split because most users need only the first:
+
+| File | For |
+|---|---|
+| `requirements.txt` | driver and demo plotting |
+| `requirements_mcp.txt` | the MCP server |
+| `requirements_keithley2401.txt` | calibration harness, needs a bench SMU |
+
+Nothing is version-pinned, and `server.py` deliberately accepts both `mcp` 1.x
+and 2.0 — keep that fallback when touching the import.
+
+The driver is a prebuilt shared library loaded with ctypes (`pxxxx/pxxxx.dll`,
+`pxxxx/libpxxxx.so`).  There is nothing to compile.  The `*.so` line in
+`.gitignore` carries a deliberate `!pxxxx/libpxxxx.so` exception — do not drop
+it, or Linux customers get a repo with no driver in it.
+
+## Conventions
+
+Every file opens with the MIT header block.  Keep it.
+
+Comments here explain *why*, at length, and that is the house style — see
+`storage.py` on why runs persist between sessions, or `device.py` on why one
+connection is held open for the life of the process.  Match it when editing.  A
+comment restating what the line does is worse than no comment.
+
+The tool docstrings in `server.py` are the agent-facing documentation and are
+written to be read mid-task, not skimmed once.  When you change what a tool
+does, change its docstring in the same edit.
+
+## There is no test suite, and most of this needs the bench
+
+There is no `tests/` directory.  `test_keithley2401.py` is a calibration
+procedure requiring a Keithley 2401 SMU, not a unit test.
+
+Without a P1150 attached you can verify that the modules import and that
+`python -m p1150_mcp` answers an MCP `initialize` and lists its tools.  Anything
+that touches `SESSION` — connect, power, measure, capture — needs the
+instrument.  Report that work as untested rather than as verified.
