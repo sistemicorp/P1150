@@ -16,6 +16,8 @@ import datetime as _dt
 
 import numpy as np
 
+from . import analysis
+
 # An MCP client config that declares the variable but leaves it blank yields
 # "", which os.environ.get would hand back in place of the default -- so treat
 # empty as unset throughout.
@@ -164,6 +166,81 @@ def load_all(run_id: str):
         return z["i"], isnk, aux, meta
 
 
+# ------------------------------------------------------------------ #
+# Band-limited views                                                   #
+# ------------------------------------------------------------------ #
+# A 300 s capture is 37.5 million samples, and the percentile, bucket and
+# threshold passes over it cost seconds -- per tool call.  Band-limited to
+# 1 kHz it is 300,000, and the same analysis is a fiftieth of the work.  That
+# reduction is worth doing once rather than on every call, so the averaged copy
+# is written beside the run and re-read afterwards: 1/factor of the size, so a
+# 150 MB run gains a 1.2 MB sidecar.
+#
+# It can never go stale.  A run is written once under a timestamped id and is
+# never modified -- re-measuring makes a new run -- so a view is a pure function
+# of a file that does not change.  No mtime check, no invalidation.
+#
+# Deliberately .npy and not .npz, because _run_ids() picks up *.npz and a view
+# must never be mistaken for a run of its own.
+_VIEW_FMT = "{run_id}.bw{factor}.npy"
+
+
+def view_path(run_id: str, factor: int) -> str:
+    return os.path.join(runs_dir(), _VIEW_FMT.format(run_id=run_id,
+                                                     factor=int(factor)))
+
+
+def load_view(run_id: str, bandwidth_hz: float, i_ma: np.ndarray = None):
+    """Return (samples, sample rate, plan, metadata) for a run, band-limited.
+
+    The whole point is the path where the view already exists: the metadata is
+    a few hundred bytes and the view is small, so the run's hundreds of
+    megabytes of samples are never read at all.  Pass i_ma if the caller has
+    already loaded them anyway -- p1150_plot needs the raw trace regardless --
+    and the raw file is not read a second time to build the view.
+    """
+    meta = load_meta(run_id)
+    fs = float(meta.get("sample_rate") or 125_000)
+    n = int(meta.get("samples") or 0)
+    if not n and i_ma is None:
+        # Runs stored before the sample count was in the metadata: the only way
+        # to plan is to look, which costs the full read this exists to avoid.
+        # It happens once per old run, and then the view is on disk.
+        i_ma, _, _, meta = load_all(run_id)
+        n = int(i_ma.size)
+    plan = analysis.downsample_plan(n if n else int(i_ma.size), fs,
+                                    bandwidth_hz)
+
+    if not plan or not plan.get("applied"):
+        if i_ma is None:
+            i_ma, _, _, meta = load_all(run_id)
+        return i_ma, fs, plan, meta
+
+    path = view_path(run_id, plan["factor"])
+    try:
+        return np.load(path), fs / plan["factor"], plan, meta
+    except Exception:
+        # Missing, truncated by a kill mid-write, or written by an older numpy.
+        # All three are fixed the same way: build it again.
+        pass
+
+    if i_ma is None:
+        i_ma, _, _, meta = load_all(run_id)
+    y = analysis.apply_plan(i_ma, plan)
+    try:
+        # Written via a temporary and renamed, so a second tool call reading
+        # this path can only ever see a whole file or none.  The temporary ends
+        # in .npy as well: np.save appends the extension to any name that lacks
+        # it, and would then leave the real file unwritten and a stray one
+        # behind.
+        tmp = path + f".{os.getpid()}.tmp.npy"
+        np.save(tmp, y)
+        os.replace(tmp, path)
+    except Exception:
+        pass                      # a cache that cannot be written still works
+    return y, fs / plan["factor"], plan, meta
+
+
 def list_runs(limit: int = 25) -> list:
     out = []
     for run_id in _run_ids(limit):
@@ -190,6 +267,15 @@ def list_runs(limit: int = 25) -> list:
 
 def delete(run_id: str) -> bool:
     path = os.path.join(runs_dir(), run_id + ".npz")
+    # Band-limited views go with it, or they outlive the samples they were
+    # derived from and the directory fills with orphans.
+    prefix = run_id + ".bw"
+    for f in os.listdir(runs_dir()):
+        if f.startswith(prefix) and f.endswith(".npy"):
+            try:
+                os.remove(os.path.join(runs_dir(), f))
+            except OSError:
+                pass
     if os.path.isfile(path):
         os.remove(path)
         return True

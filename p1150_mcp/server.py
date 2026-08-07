@@ -146,6 +146,58 @@ def _fs(meta: dict) -> int:
     return int((meta or {}).get("sample_rate") or SAMPLE_RATE)
 
 
+# What the read-only analysis tools say about their bandwidth_hz argument.
+# One text, because the argument means exactly the same thing in each of them
+# and an agent that has read it once should not have to re-read a variant.
+_BANDWIDTH_DOC = """\
+    bandwidth_hz: read the run block-averaged down to this rate first. 5000 and
+        1000 are the useful values. Use it when the target has a switching
+        regulator (SMPS/buck) between the battery and the load: the P1150 sits
+        at the battery terminals and so measures the regulator's PULSED input
+        current, which arrives as a wide noisy band whose peak is a switching
+        pulse rather than anything the load did. Averaging it reports what the
+        load actually costs, which is the question being asked. Average current
+        and charge are unchanged by this -- only the peaks, percentiles and
+        shape are. Captures flagged with switching_ripple are the ones that
+        need it. Do not use it on inrush work: a surge one to two milliseconds
+        wide averages away to nothing and the peak then looks safe.
+
+        It is also how a LONG capture is made quick to read. Every pass here is
+        proportional to sample count, and a 300 s run is 37.5 million samples:
+        seconds per call raw, milliseconds at 1 kHz. The band-limited copy is
+        built once and cached beside the run, so after the first call every
+        other tool reading it at the same bandwidth is effectively free. Reach
+        for this rather than for a shorter capture -- a measurement cut short to
+        keep the tools responsive is the wrong trade, and duration is what a
+        duty-cycled average needs most."""
+
+
+def _bandwidth_doc(fn):
+    """Append the shared bandwidth_hz paragraph to a tool's docstring.
+
+    Applied UNDER @mcp.tool(), so the text is in place before the SDK reads the
+    docstring to build the tool schema the agent sees.  The alternative was the
+    same paragraph copied into four docstrings, which is how three of them end
+    up subtly disagreeing about what the argument does a year from now.
+    """
+    fn.__doc__ = (fn.__doc__ or "").rstrip() + "\n\n" + _BANDWIDTH_DOC + "\n"
+    return fn
+
+
+def _read(run_id: str, bandwidth_hz: float = None):
+    """(samples, sample rate, bandwidth plan, metadata) for a stored run.
+
+    Every read-only analysis tool loads through here, so "at 1 kHz" means the
+    same thing in all of them -- and so a band-limited read of a long capture
+    goes to the small cached copy rather than to the hundreds of megabytes of
+    raw samples behind it.
+    """
+    if bandwidth_hz:
+        return storage.load_view(run_id, bandwidth_hz)
+    i, meta = storage.load(run_id)
+    return i, float(_fs(meta)), None, meta
+
+
 def _store(label: str, i_ma: np.ndarray, extra: dict = None,
            isnk_ma: np.ndarray = None, aux: dict = None,
            fs: int = SAMPLE_RATE) -> dict:
@@ -195,6 +247,16 @@ def _store(label: str, i_ma: np.ndarray, extra: dict = None,
                 f"estimates whether a real battery would sag far enough to "
                 f"reset the target. p1150_inrush_guide explains why it matters.")
             out.update(warn)
+    except Exception:
+        pass
+    # And screened for switching ripple, for the same reason: a developer whose
+    # target has a buck converter after the battery sees a band of noise 20x
+    # wider than the current they expected, and nothing in the capture says that
+    # it is an artefact of measuring at the battery rather than at the load.
+    # Said once here, with the option that fixes it, rather than waiting to be
+    # asked -- because the question it usually prompts is "is my board broken".
+    try:
+        out.update(analysis.ripple_screen(i_ma, fs))
     except Exception:
         pass
     if not battery:
@@ -2433,16 +2495,19 @@ def p1150_list_runs(limit: int = 25) -> dict:
 
 
 @mcp.tool()
-def p1150_summary(run_id: str) -> dict:
+@_bandwidth_doc
+def p1150_summary(run_id: str, bandwidth_hz: float = None) -> dict:
     """Headline metrics for a stored run: average current (mA), accumulated
     charge (mAh), resting floor, peak, percentiles, and -- if a battery capacity
     is configured -- projected battery life.
     """
     try:
-        i, meta = storage.load(run_id)
-        out = analysis.summarize(i, _fs(meta), config.capacity_mah())
+        i, fs, band, meta = _read(run_id, bandwidth_hz)
+        out = analysis.summarize(i, fs, config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
+        if band:
+            out["bandwidth"] = band
         return out
     except Exception as e:
         return _fail(e)
@@ -2639,7 +2704,8 @@ def p1150_battery_life(target_days: float = None) -> dict:
 
 
 @mcp.tool()
-def p1150_segment(run_id: str) -> dict:
+@_bandwidth_doc
+def p1150_segment(run_id: str, bandwidth_hz: float = None) -> dict:
     """Break a run down by current level: how much TIME and how much CHARGE was
     spent in each band, from deep sleep (<10 uA) up to peak (>100 mA).
 
@@ -2647,20 +2713,30 @@ def p1150_segment(run_id: str) -> dict:
     thing to look at. A target can spend 99% of its time asleep and still burn
     most of its battery in 1% of the time spent transmitting -- average current
     alone cannot show that, and it changes which code is worth optimising.
+
+    Switching ripple wrecks this view in particular: an SMPS drawing pulses
+    between 0 and 200 mA to deliver a steady 20 mA load spreads its samples
+    across every bucket from deep_sleep to peak, and the breakdown then
+    describes the regulator rather than the firmware. Band-limit it and the
+    same run resolves into the states the target was actually in.
     """
     try:
-        i, meta = storage.load(run_id)
-        out = analysis.segment(i, _fs(meta), config.capacity_mah())
+        i, fs, band, meta = _read(run_id, bandwidth_hz)
+        out = analysis.segment(i, fs, config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
+        if band:
+            out["bandwidth"] = band
         return out
     except Exception as e:
         return _fail(e)
 
 
 @mcp.tool()
+@_bandwidth_doc
 def p1150_events(run_id: str, threshold_ma: float = None,
-                 min_duration_us: float = 100.0) -> dict:
+                 min_duration_us: float = 100.0,
+                 bandwidth_hz: float = None) -> dict:
     """Find the wake-up bursts in a duty-cycled run and characterise them.
 
     Reports how often the target wakes, how long it stays awake, the charge each
@@ -2674,13 +2750,36 @@ def p1150_events(run_id: str, threshold_ma: float = None,
         target is known to be duty-cycled, or if it reports implausibly many.
 
     min_duration_us: bursts shorter than this are ignored as noise.
+
+    On a target fed through a switching regulator, run this band-limited. The
+    detector separates two populations with a threshold, and switching ripple
+    crosses any threshold thousands of times a second -- so the raw trace
+    reports a torrent of microsecond "events" that are pulses of the regulator,
+    and the real wake-ups are lost among them.
     """
     try:
-        i, meta = storage.load(run_id)
-        out = analysis.find_events(i, _fs(meta), threshold_ma,
+        i, fs, band, meta = _read(run_id, bandwidth_hz)
+        out = analysis.find_events(i, fs, threshold_ma,
                                    min_duration_us, config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
+        if band:
+            out["bandwidth"] = band
+            # Averaging sets a floor on what a duration can be: one output
+            # sample.  Below it min_duration_us is not being applied as asked,
+            # and a burst narrower than the block averages down into the floor
+            # and stops being detected at all -- which would otherwise read as
+            # "the wake-ups went away" after a change of bandwidth.
+            if band.get("applied"):
+                period_us = 1e6 / band["effective_hz"]
+                if period_us > min_duration_us:
+                    out["resolution_note"] = (
+                        f"At {band['effective_hz']:g} Hz one sample is "
+                        f"{period_us:.0f} us, so min_duration_us={min_duration_us:g} "
+                        f"cannot be honoured and the shortest detectable burst is "
+                        f"{period_us:.0f} us. Bursts shorter than that are averaged "
+                        f"into the floor and will not appear. Raise the bandwidth "
+                        f"or drop it entirely if the bursts are that fast.")
         return out
     except Exception as e:
         return _fail(e)
@@ -2842,9 +2941,41 @@ def p1150_compare(baseline_run_id: str, candidate_run_id: str,
         return _fail(e)
 
 
+PLOT_POINTS = 4000       # points the rendered trace is reduced to
+
+
+def _plot_envelope(a: np.ndarray, fs: float, target: int = PLOT_POINTS):
+    """(x, lo, hi) for a raw trace, min/max reduced to about `target` blocks.
+
+    Min/max rather than striding: a 1 ms burst inside a 30 s capture would fall
+    between strided samples and vanish from the plot, which is exactly the
+    feature the developer is looking for.  Every block contributes both its
+    extremes, so the band drawn between them is the true excursion of the
+    samples behind it and no spike can hide between two plotted points.
+
+    hi is None when the capture is short enough to draw sample for sample.
+
+    Returned as two edges rather than as one zigzag line because of what they
+    are then drawn with.  A polyline alternating min, max, min, max spans the
+    full height of the axis 4000 times, and rasterising that across the five or
+    six decades of a log axis costs the best part of a second -- on precisely
+    the long, noisy captures this exists to make viewable.  Filling between two
+    edges is the same picture for a third of the time.
+    """
+    n = int(a.size)
+    step = max(1, n // target)
+    if step <= 1:
+        return np.arange(n) / fs, a, None
+    trim = (n // step) * step
+    blocks = a[:trim].reshape(-1, step)
+    return (np.linspace(0, trim / fs, blocks.shape[0]),
+            blocks.min(axis=1), blocks.max(axis=1))
+
+
 @mcp.tool()
+@_bandwidth_doc
 def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
-               show_marker: bool = True) -> dict:
+               show_marker: bool = True, bandwidth_hz: float = None) -> dict:
     """Render a run as a PNG current-vs-time plot and return the file path.
 
     Useful when the numbers are ambiguous and the shape of the waveform settles
@@ -2858,6 +2989,12 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
     result: it shows immediately whether the cost sits inside the marked work or
     just outside it, which the numbers alone cannot.
 
+    With bandwidth_hz the plot gets both traces: the raw envelope in grey behind
+    the averaged line. That is the useful picture on a switching target -- the
+    grey band is what the instrument measured, the line is what the load drew,
+    and having them on one axis is what makes the band legible as ripple rather
+    than as the target misbehaving.
+
     Waveforms are decimated to a few thousand points for the plot; the stored
     samples are untouched.
     """
@@ -2868,24 +3005,35 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
 
         i, _, aux, meta = storage.load_all(run_id)
         fs = _fs(meta)
-        n = i.size
-        # Min/max decimation rather than striding: a 1 ms burst inside a 30 s
-        # capture would fall between strided samples and vanish from the plot,
-        # which is exactly the feature the developer is looking for.
-        target = 4000
-        step = max(1, n // target)
-        if step > 1:
-            trim = (n // step) * step
-            blocks = i[:trim].reshape(-1, step)
-            lo, hi = blocks.min(axis=1), blocks.max(axis=1)
-            y = np.empty(lo.size * 2, dtype=np.float32)
-            y[0::2], y[1::2] = lo, hi
-            x = np.linspace(0, trim / fs, y.size)
-        else:
-            y, x = i, np.arange(n) / fs
+
+        band, filt = None, None
+        if bandwidth_hz:
+            # Through the cache, passing the samples that are already in hand:
+            # the view gets built for the tools that follow this one without
+            # reading the run a second time to do it.
+            y_f, fs_f, band, _ = storage.load_view(run_id, bandwidth_hz, i)
+            if band.get("applied"):
+                # A long capture band-limited to 1 kHz is still far more points
+                # than the figure has pixels, so it gets averaged again -- by
+                # averaging and not by min/max, because the whole point of this
+                # trace is that it is a line. The rate it ends up at is reported
+                # rather than left implied: it is the bandwidth actually on
+                # screen, and below the one that was asked for.
+                if y_f.size > PLOT_POINTS:
+                    y_f, fs_f, more = analysis.downsample(
+                        y_f, fs_f, fs_f * PLOT_POINTS / y_f.size)
+                    if more.get("applied"):
+                        band["display_hz"] = more["effective_hz"]
+                filt = (np.arange(y_f.size) / fs_f, y_f)
+
+        x, lo, hi = _plot_envelope(i, fs)
 
         if log_scale:
-            y = np.maximum(y, 1e-4)  # keep zeros off a log axis
+            lo = np.maximum(lo, 1e-4)  # keep zeros off a log axis
+            if hi is not None:
+                hi = np.maximum(hi, 1e-4)
+            if filt:
+                filt = (filt[0], np.maximum(filt[1], 1e-4))
 
         plt.figure(figsize=(11, 4.5))
 
@@ -2911,7 +3059,29 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
             except Exception:
                 pass
 
-        plt.plot(x, y, linewidth=0.6)
+        # Grey behind the averaged line when there is one, so the eye reads the
+        # band as context and the line as the measurement; the ordinary colour
+        # when the band is all there is.
+        raw_colour = "#b4b4c4" if filt else "#1f77b4"
+        raw_label = f"raw ({fs / 1000.0:g} kSa/s envelope)" if filt else None
+        if hi is None:
+            plt.plot(x, lo, linewidth=0.6, color=raw_colour, label=raw_label)
+        else:
+            # step: a block covers an interval of time and its bounds hold
+            # across the whole of it, so the band is a run of rectangles.
+            # Interpolating between block centres would instead draw an
+            # isolated 1 ms burst as a triangle two blocks wide.
+            #
+            # An edge as well as a fill: where the target held a steady current
+            # the two bounds coincide, and a fill with no height would draw
+            # nothing at all.
+            plt.fill_between(x, lo, hi, step="mid", color=raw_colour,
+                             edgecolor=raw_colour, linewidth=0.5,
+                             alpha=0.6 if filt else 1.0, label=raw_label)
+        if filt:
+            plt.plot(filt[0], filt[1], linewidth=1.0, color="#1f5fa8",
+                     label=f"averaged to {band['effective_hz']:g} Hz")
+            plt.legend(loc="best", fontsize=8, framealpha=0.85)
         if log_scale:
             plt.yscale("log")
         plt.xlabel("Time (s)")
@@ -2924,12 +3094,18 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
         plt.grid(True, "both", color="#ddddee")
         plt.tight_layout()
 
-        out = path or os.path.join(storage.runs_dir(), run_id + ".png")
+        # A band-limited plot gets its own filename, so it does not overwrite
+        # the raw one: the two side by side are how a developer sees that the
+        # band really was ripple.
+        name = run_id + (f"_{band['effective_hz']:.0f}hz" if filt else "")
+        out = path or os.path.join(storage.runs_dir(), name + ".png")
         plt.savefig(out, dpi=110)
         plt.close()
         res = {"run_id": run_id, "path": out}
         if marked:
             res["marker"] = marked
+        if band:
+            res["bandwidth"] = band
         return res
     except Exception as e:
         return _fail(e)

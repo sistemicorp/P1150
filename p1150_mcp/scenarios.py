@@ -269,6 +269,86 @@ Wrong looks like:
      A C rate far below the design intent means the charger is programmed low,
      or the target is eating most of what it delivers.
 
+## Switching regulators, and the noise that is not noise
+
+Most battery targets put a buck converter (SMPS) between the cell and the load,
+because dropping 3.7 V to 1.8 V through an LDO throws away half the charge.  The
+P1150 sits at the battery terminals, so what it measures is the converter's
+INPUT current -- and a converter does not draw its input smoothly.  It draws it
+in pulses at its switching frequency, whose width is modulated to deliver
+whatever the output needs.
+
+So a target drawing a rock-steady 20 mA at the load reads as a band swinging
+between roughly zero and a couple of hundred milliamps.  The band is real
+current and the instrument is right; it is just not the quantity anyone wants.
+The load current is the AVERAGE of the band.
+
+The switching frequency is usually well above the 125 kSps sample rate, so what
+comes back is aliased and no capture can show the switching waveform.  It does
+not need to: averaging recovers the load current exactly, because averaging is
+what an anti-alias filter would have done.
+
+  Symptom      A capture reports switching_ripple, or peak_ma is ten to a
+               hundred times avg_ma with the trace looking like a solid band
+               rather than distinct bursts, and p1150_segment spreads the run
+               across every bucket from deep_sleep to peak at once.
+
+  Fix          Pass bandwidth_hz to p1150_plot, p1150_summary, p1150_segment or
+               p1150_events.  1000 gives a trace that reads like DC current;
+               5000 keeps millisecond features (a radio burst, a wake) visible
+               while still collapsing the ripple.  Start at 5000, drop to 1000
+               if it is still a band.
+
+  What changes avg_ma and charge_mah do not move at all -- block averaging
+               preserves the integral, which is why it is the filter used.
+               peak_ma, the percentiles and the bucket breakdown all change,
+               and the band-limited ones are the figures to quote: a peak at
+               1 kHz is a peak in what the LOAD demanded, where the raw peak is
+               one switching pulse.
+
+  Do not       Never band-limit inrush work.  An inrush surge is one to two
+               milliseconds wide, and averaging to 1 kHz smears it into the
+               settled current -- which makes a target that browns out in the
+               field look clean.  p1150_inrush_check and p1150_inrush_test have
+               no bandwidth option for exactly that reason.  Likewise, a burst
+               shorter than one output sample averages into the floor and stops
+               being detected: if p1150_events reports fewer wake-ups
+               band-limited than raw, raise the bandwidth rather than believing
+               the smaller number.
+
+## Long captures, and why they stay cheap to look at
+
+Sampling is 125,000 per second per channel, so a 300 s capture is 37.5 million
+samples and a 900 s one is 112 million.  Capture that long when the measurement
+needs it -- a duty-cycled average is only as good as the number of periods in
+the window, and a sleep state that steps down over minutes cannot be measured in
+thirty seconds.
+
+What that costs is not the capture, which is a file on disk, but the reading of
+it.  p1150_plot never draws more than a few thousand points regardless (the
+trace is reduced to min/max blocks, so no spike is lost between plotted points),
+but p1150_summary, p1150_segment and p1150_events each pass over every sample:
+seconds per call on a 300 s run.
+
+bandwidth_hz is the answer to that as well as to switching ripple.  At 1 kHz the
+same run is 300,000 points, the same calls answer in milliseconds, and the
+averaged copy is cached beside the run so every tool after the first reads it
+directly.  Nothing that matters is lost: average, charge and the shape of
+anything slower than a millisecond are all still there.
+
+So: do not shorten a capture to keep the tools responsive.  Capture for as long
+as the measurement wants and read it band-limited.  The exception is anything
+living on a fast edge -- inrush, a burst under a millisecond -- which needs the
+full rate and should be captured over a short timebase instead.
+
+Two other things follow from measuring at the battery.  A converter's input
+current rises as the cell discharges, since it draws constant power rather than
+constant current -- so a comparison is only valid at the same voltage, which is
+already the rule.  And the converter's own quiescent draw is in every reading,
+including sleep: a sleep floor that will not go below a few hundred microamps,
+however much the firmware shuts down, is often the regulator rather than the
+target, and that is a schematic finding.
+
 ## Reading a regression
 p1150_compare reports a verdict against a percentage threshold on average
 current, and proposes a likely cause.  The causes map to distinct fixes:

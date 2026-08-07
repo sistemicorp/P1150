@@ -51,6 +51,204 @@ def charge_mah(i_ma: np.ndarray, fs: int = SAMPLE_RATE) -> float:
     return float(i_ma.sum(dtype=np.float64) / fs / 3600.0)
 
 
+# ------------------------------------------------------------------ #
+# Bandwidth reduction                                                  #
+# ------------------------------------------------------------------ #
+# Most battery-powered targets put a switching regulator between the cell and
+# the load, because dropping 3.7 V to 1.8 V through an LDO throws away half the
+# charge.  An SMPS does not draw its input current smoothly: it draws it in
+# pulses at the switching frequency, whose width is modulated to deliver
+# whatever the output needs.  At the battery terminals -- which is exactly where
+# the P1150 sits -- that reads as a broad noisy band rather than a line, and the
+# quantity the developer actually wants (what the load costs) is the *average*
+# of the band, not any sample in it.
+#
+# Worse, the switching frequency is normally above the 125 kSps sampling rate,
+# so the band that comes back is already aliased.  Nothing in the capture can
+# recover the switching waveform, and nothing needs to: the average survives
+# aliasing intact, because averaging is what an anti-alias filter would have
+# done in the first place.
+#
+# Hence block averaging: chop the samples into blocks of `factor` and take the
+# mean of each.  Two properties make it the right filter here rather than a
+# neater IIR one.
+#
+#   It preserves charge exactly.  sum(y)/fs_out == sum(x)/fs_in for whole
+#   blocks, so a downsampled capture reports the same mAh and the same average
+#   current as the raw one.  A filter that rang, or that had a settling
+#   transient, would quietly change the number the whole instrument exists to
+#   measure.
+#
+#   Its response has its first null exactly at the output rate.  Ripple at the
+#   switching frequency lands in the stopband rather than folding back down to
+#   DC, which is the failure a bare stride (take every Nth sample) has: striding
+#   at 1 kHz through a 100 kHz PWM band returns 1000 arbitrary points off the
+#   pulse edges and looks like noise at a different rate.
+#
+# It is a boxcar, so it is not brick-wall: the -3 dB point sits at about
+# 0.443 x the output rate, and there is sinc leakage past the first null.  For
+# looking at an SMPS input current as though it were DC that is entirely
+# adequate, and reported as minus3db_hz so it is never overstated.
+#
+# What must NOT be downsampled is anything measuring a fast edge: inrush
+# analysis lives on a surge one to two milliseconds wide, and averaging to
+# 1 kHz smears it into nothing while making the peak look safe.  The inrush
+# tools deliberately have no bandwidth option for that reason.
+
+
+def downsample_plan(n: int, fs: int = SAMPLE_RATE,
+                    bandwidth_hz: float = None) -> dict:
+    """What downsampling n samples at fs to bandwidth_hz would do, without
+    doing it -- and without the samples being in memory.
+
+    Separate from the work because the block factor is also the cache key for a
+    stored band-limited view (storage.load_view), and a cache whose key is
+    derived by different arithmetic than the data it names is a bug waiting for
+    a rounding difference.  It is also what lets a 450 MB run be skipped
+    entirely when its band-limited copy is already on disk: the plan comes from
+    the metadata, which is a few hundred bytes.
+
+    Returns None when no bandwidth was asked for, and otherwise a dict whose
+    "applied" says whether it will actually do anything -- because "you asked
+    for 200 kHz on a 125 kHz capture" has to be reported, not silently ignored.
+    """
+    if not bandwidth_hz or bandwidth_hz <= 0:
+        return None
+
+    fs = float(fs)
+    bw = float(bandwidth_hz)
+    n = int(n)
+    factor = int(round(fs / bw))
+    if factor <= 1:
+        return {"requested_hz": bw, "applied": False, "factor": 1,
+                "note": (f"Capture is sampled at {fs:g} Hz, which is at or "
+                         f"below the {bw:g} Hz asked for; returned unfiltered.")}
+    # Two output points is not a waveform.  Refusing is better than returning a
+    # plot with a single step in it and letting it be read as a measurement.
+    if n // factor < 2:
+        return {"requested_hz": bw, "applied": False, "factor": factor,
+                "note": (f"{n} samples at {fs:g} Hz is too short to resolve "
+                         f"{bw:g} Hz; returned unfiltered.")}
+
+    blocks = n // factor
+    fs_out = fs / factor
+    plan = {
+        "requested_hz":  bw,
+        "effective_hz":  round(fs_out, 4),
+        "minus3db_hz":   round(0.443 * fs_out, 4),
+        "factor":        factor,
+        "applied":       True,
+        "samples":       blocks,
+        "input_samples": n,
+        "note": (f"Block-averaged {factor}:1, {n} samples at {fs:g} Hz -> "
+                 f"{blocks} at {fs_out:g} Hz. Average current and charge are "
+                 f"unchanged; peaks and percentiles are of the averaged "
+                 f"waveform, so a peak here is a peak in DEMAND, not the "
+                 f"instantaneous current the wiring actually carried."),
+    }
+    if blocks * factor != n:
+        # A partial trailing block is dropped rather than averaged over fewer
+        # samples, because a short block carrying a full block's weight would
+        # bias the charge -- and charge staying exact is the whole reason for
+        # choosing this filter.
+        plan["dropped_samples"] = n - blocks * factor
+    return plan
+
+
+def apply_plan(x: np.ndarray, plan: dict) -> np.ndarray:
+    """Carry out a plan from downsample_plan on the samples themselves."""
+    if not plan or not plan.get("applied"):
+        return x
+    factor = int(plan["factor"])
+    trim = int(plan["samples"]) * factor
+    # dtype= accumulates in float64 without materialising a float64 copy of the
+    # input, which for a 900 s capture would be most of a gigabyte.
+    return np.asarray(x)[:trim].reshape(-1, factor).mean(axis=1,
+                                                         dtype=np.float64)
+
+
+def downsample(x: np.ndarray, fs: int = SAMPLE_RATE,
+               bandwidth_hz: float = None):
+    """Block-average x down to bandwidth_hz.  Returns (y, fs_out, info)."""
+    plan = downsample_plan(np.asarray(x).size, fs, bandwidth_hz)
+    if not plan or not plan.get("applied"):
+        return x, float(fs), plan
+    return apply_plan(x, plan), float(fs) / plan["factor"], plan
+
+
+# Ripple has to be this much of the waveform before the screen says anything.
+# Deliberately blunt: the cost of a false positive is a suggestion the agent
+# ignores, and the cost of a false negative is a session spent interpreting
+# switching noise as though it were load current.
+RIPPLE_HF_OVER_LF = 1.5      # variance above the cut, over variance below it
+RIPPLE_HF_OVER_MEAN = 0.25   # ripple this large relative to the average
+RIPPLE_MIN_HF_MA = 0.5       # ...and this large absolutely, so ADC noise on a
+RIPPLE_MIN_MEAN_MA = 1.0     #    microamp sleep trace cannot trip it
+
+
+def ripple_screen(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
+                  bandwidth_hz: float = 1000.0, window_s: float = 2.0) -> dict:
+    """Does this capture look like switching ripple rather than load current?
+
+    Returns an empty dict when there is nothing to say.  Same reasoning as
+    inrush_screen: a developer looking at their first P1150 capture of an
+    SMPS-powered target sees a band 20x wider than the current they expected and
+    has no way to know it is an artefact of where the instrument sits.  So the
+    capture says so unprompted, and names the option that fixes it.
+
+    The test is a variance decomposition against the cut: total variance splits
+    exactly into within-block (everything above bandwidth_hz) and between-block
+    (everything below).  Ripple puts nearly all of it above; a duty-cycled
+    target -- bursts milliseconds wide -- puts nearly all of it below, which is
+    what stops a BLE advertiser being reported as a switcher.
+    """
+    x = np.asarray(i_ma)
+    n = int(x.size)
+    if n == 0:
+        return {}
+    # A window, not the whole capture: var(axis=1) materialises a temporary the
+    # size of its input, and this runs on every capture stored.  Taken from the
+    # middle, where a capture that opens with a boot transient is past it.
+    w = min(n, max(int(window_s * fs), 1))
+    lo = (n - w) // 2
+    x = x[lo:lo + w]
+
+    factor = int(round(float(fs) / float(bandwidth_hz)))
+    blocks = x.size // factor if factor > 1 else 0
+    if blocks < 4:
+        return {}
+    b = np.asarray(x)[:blocks * factor].reshape(blocks, factor)
+    mu = b.mean(axis=1, dtype=np.float64)
+    hf = float(np.sqrt(b.var(axis=1, dtype=np.float64).mean()))
+    lf = float(mu.std())
+    mean = float(mu.mean())
+
+    if mean < RIPPLE_MIN_MEAN_MA or hf < RIPPLE_MIN_HF_MA:
+        return {}
+    if hf < RIPPLE_HF_OVER_LF * lf or hf < RIPPLE_HF_OVER_MEAN * mean:
+        return {}
+
+    raw_peak = float(np.asarray(x, dtype=np.float64).max())
+    return {
+        "switching_ripple": True,
+        "ripple_rms_ma": _f(hf, 4),
+        "raw_peak_ma": _f(raw_peak, 4),
+        "filtered_peak_ma": _f(float(mu.max()), 4),
+        "switching_ripple_note": (
+            f"Most of the variation in this capture is above "
+            f"{float(bandwidth_hz):g} Hz ({_f(hf, 3)} mA rms, against "
+            f"{_f(lf, 3)} mA below it), which is what a switching regulator "
+            f"between the battery and the load looks like from the battery "
+            f"terminals: current drawn in pulses whose average is the real "
+            f"load. The peak of {_f(raw_peak, 3)} mA is a switching pulse, not "
+            f"a load event -- averaged to {float(bandwidth_hz):g} Hz the same "
+            f"capture peaks at {_f(float(mu.max()), 3)} mA. Average current and "
+            f"charge are unaffected either way. Pass bandwidth_hz=1000 (or "
+            f"5000) to p1150_plot, p1150_summary, p1150_segment or p1150_events "
+            f"to read this run as the load sees it."),
+    }
+
+
 def summarize(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
               battery_mah: float = None) -> dict:
     """Headline metrics for one capture."""

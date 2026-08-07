@@ -452,6 +452,67 @@ band), `p1150_events` (wake-up rate, burst length, charge per wake),
 `p1150_compare` (regression verdict plus a likely cause), `p1150_plot`,
 `p1150_list_runs`
 
+All four of `p1150_summary`, `p1150_segment`, `p1150_events` and `p1150_plot`
+take a `bandwidth_hz` — see below.
+
+### Switching regulators: `bandwidth_hz`
+
+If the target has a buck converter between the cell and the load, the P1150 sits
+at the battery terminals and therefore measures the converter's *input* current
+— drawn in pulses at the switching frequency, not smoothly.  A target pulling a
+steady 20 mA at the load comes back as a band swinging between zero and a couple
+of hundred milliamps.  The band is real, and the load current is its average.
+
+`bandwidth_hz=5000` or `1000` block-averages the run to that rate first.  1 kHz
+reads like DC current; 5 kHz keeps millisecond features visible while still
+collapsing the ripple.  200 ms — 25,000 samples, the usual window — becomes 200
+points at 1 kHz.
+
+```
+p1150_plot(run_id, bandwidth_hz=1000)     # raw envelope in grey, average on top
+p1150_summary(run_id, bandwidth_hz=1000)  # peak of the load, not of a pulse
+```
+
+Averaging is exact where it matters: `avg_ma` and `charge_mah` are identical
+band-limited and raw, because the mean of a block is the block's contribution to
+the integral.  What changes is `peak_ma`, the percentiles and the bucket
+breakdown — and those are the figures worth quoting, since a raw peak on a
+switching target is one pulse of the regulator.  It is a boxcar filter, so the
+−3 dB point is about 0.44 × the rate asked for; every result reports the
+`effective_hz` and `minus3db_hz` it actually used.
+
+Captures are screened for this automatically and report `switching_ripple` when
+most of their variation sits above 1 kHz, because the first question it otherwise
+prompts is *"is my board broken?"*.  Duty-cycled targets — whose variation is at
+burst rate, well below the cut — are not flagged.
+
+Inrush is the exception: `p1150_inrush_check` and `p1150_inrush_test` have no
+bandwidth option, because a surge one to two milliseconds wide averages away to
+nothing and a target that browns out in the field would then look clean.
+
+### It is also how long captures stay quick to read
+
+125 kSa/s is 1.25 million points for ten seconds, and a 300 s capture is 37.5
+million.  `p1150_plot` is unaffected — it reduces the trace to a few thousand
+min/max blocks, so it draws the same number of points whatever the length, and
+no spike is lost between them.  The analysis tools do scale, because each one
+passes over every sample.
+
+Band-limiting fixes that too, and the averaged copy is cached beside the run
+(`<run_id>.bw<factor>.npy`, 1/factor of the size) so only the first call pays
+for it.  Measured on a 300 s capture, 37.5 M samples:
+
+| | raw | `bandwidth_hz=1000` first call | cached |
+|---|---|---|---|
+| `p1150_summary` | 795 ms | 137 ms | 8 ms |
+| `p1150_segment` | 1145 ms | — | 5 ms |
+| `p1150_events` | 2984 ms | — | 6 ms |
+
+So capture for as long as the measurement actually needs — a duty-cycled average
+is only as good as the number of periods in the window — and read it
+band-limited, rather than cutting the capture short to keep the tools
+responsive.
+
 **Guidance** — `p1150_measurement_guide` returns the measurement know-how the
 agent needs: how to choose a voltage and over-current limit, the ten current
 profiles worth knowing and what capture length each needs, and the mistakes that
