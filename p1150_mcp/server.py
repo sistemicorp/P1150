@@ -23,18 +23,21 @@ Design notes, since this is not a 1:1 wrapper of the driver:
   cycling in between.
 """
 import os
+import queue
+import threading
 
+import anyio
 import numpy as np
 
-# The SDK renamed FastMCP to MCPServer in mcp 2.0; the decorator and run()
-# surface used here is identical, so accept either.
+# The SDK renamed FastMCP to MCPServer in mcp 2.0; the decorator, Context and
+# run() surface used here is identical, so accept either.
 try:
-    from mcp.server.mcpserver import MCPServer as _Server
+    from mcp.server.mcpserver import MCPServer as _Server, Context
 except ImportError:                                  # mcp < 2.0
-    from mcp.server.fastmcp import FastMCP as _Server
+    from mcp.server.fastmcp import FastMCP as _Server, Context
 
 from . import analysis, storage, config
-from .device import SESSION, SAMPLE_RATE
+from .device import SESSION, SAMPLE_RATE, scan
 from .scenarios import GUIDE, MARKER_GUIDE, INRUSH_GUIDE
 
 mcp = _Server("p1150")
@@ -46,10 +49,76 @@ mcp = _Server("p1150")
 DEFAULT_SN = os.environ.get("P1150_SN") or None
 
 
+# How often the event loop looks for a progress message from the worker
+# thread.  Fast enough that a bar looks live, slow enough to cost nothing over
+# the fifteen seconds it runs for.
+PROGRESS_POLL_S = 0.05
+
+
 def _fail(e: Exception) -> dict:
     """Errors come back as data, not exceptions: the agent should read the
     message and correct itself rather than see an opaque tool failure."""
     return {"error": str(e)}
+
+
+async def _report(ctx, pct: int, message: str) -> None:
+    """Send one progress notification, tolerating whatever is at the far end.
+
+    Progress is decoration.  It must not be able to fail a connection, so every
+    way it can go wrong ends here: a client that never asked for progress (the
+    SDK makes it a no-op), one that has gone away mid-call, or an installed
+    mcp older than the message argument, which is why a TypeError falls back to
+    the bare two-argument form rather than giving up.
+    """
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(pct, 100, message)
+    except TypeError:
+        try:
+            await ctx.report_progress(pct, 100)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+async def _with_progress(ctx, work):
+    """Run a blocking device call on a worker thread, relaying its progress.
+
+    The driver reports progress by calling back from inside the ctypes call, on
+    whatever thread made it, and that call does not return for fifteen seconds
+    on a P1150 that is still in its bootloader.  Left on the event loop it would
+    block the very notifications it is producing, so it goes to a thread and
+    hands (percent, message) pairs back over a queue.  Only this coroutine
+    talks to the MCP session; the worker only ever touches the instrument.
+    """
+    q = queue.Queue()
+    out = {}
+
+    def runner():
+        try:
+            out["result"] = work(lambda pct, msg: q.put((pct, msg)))
+        except Exception as e:
+            out["error"] = e
+        finally:
+            q.put(None)      # sentinel: the work is over, stop draining
+
+    thread = threading.Thread(target=runner, daemon=True, name="p1150-progress")
+    thread.start()
+    while True:
+        try:
+            item = q.get_nowait()
+        except queue.Empty:
+            await anyio.sleep(PROGRESS_POLL_S)
+            continue
+        if item is None:
+            break
+        await _report(ctx, *item)
+    thread.join()
+    if "error" in out:
+        raise out["error"]
+    return out["result"]
 
 
 def _powered_up_during(meta: dict) -> bool:
@@ -560,25 +629,16 @@ def p1150_list_devices() -> dict:
     Safe to call at any time: it does not connect, power anything, or change the
     state of a P1150 that is already in use. Use it to discover a serial number
     for p1150_connect.
+
+    p1150_connect scans for itself, so this is not a required first step -- it
+    is for when you need to see what is attached before choosing.
     """
     try:
-        from pxxxx import PXXXX
-        ports = PXXXX.list_ports()
-        devices = []
-        for port in ports:
-            d = PXXXX(port=port)
-            ok, r = d.ping()
-            if ok:
-                p = r[-1]
-                devices.append({
-                    "serial": p["serial_hash"], "port": port,
-                    "model": p["model"], "firmware": p["version"],
-                    "application": p["app"],
-                    "note": "in bootloader; p1150_connect will load the "
-                            "application firmware (~15 s)"
-                            if p["app"] == "a51" else None,
-                })
-            d.close()
+        devices = scan()
+        for d in devices:
+            if d.pop("bootloader", False):
+                d["note"] = ("in bootloader; p1150_connect will load the "
+                             "application firmware (~15 s)")
         return {"count": len(devices), "devices": devices,
                 "default_sn": DEFAULT_SN}
     except Exception as e:
@@ -586,27 +646,27 @@ def p1150_list_devices() -> dict:
 
 
 @mcp.tool()
-def p1150_connect(sn: str = None) -> dict:
+async def p1150_connect(sn: str = None, ctx: Context = None) -> dict:
     """Connect to a P1150 by serial number and prepare it for measurement.
 
     The serial number is printed on the back of the unit; p1150_list_devices
-    reports it too. Omit sn to use the P1150_SN environment default if one is
-    configured.
+    reports it too. Omit sn to use the P1150_SN environment default, or, if
+    that is not set either, to use the only P1150 attached -- when there is
+    more than one, the serial number has to be given.
 
     The first connection after the P1150 is plugged in takes about 15 seconds:
     the application firmware is loaded and the unit self-calibrates. This is
-    normal, not a hang. Later connections are fast.
+    normal, not a hang. Later connections are fast. Progress is reported to the
+    developer as it goes, so do not narrate it yourself or poll for it.
 
     The connection stays open for the rest of the session, so the target can
     stay powered across many measurements while firmware is edited and
     re-flashed. Nothing is powered until p1150_power_on is called.
     """
     try:
-        target = sn or DEFAULT_SN
-        if not target:
-            return {"error": "No serial number given and P1150_SN is not set. "
-                             "Call p1150_list_devices to find one."}
-        return SESSION.connect(target)
+        return await _with_progress(
+            ctx, lambda report: SESSION.connect(sn or DEFAULT_SN,
+                                                progress=report))
     except Exception as e:
         return _fail(e)
 

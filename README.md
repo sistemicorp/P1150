@@ -230,7 +230,7 @@ settings:
 
 | Variable | Purpose |
 |---|---|
-| `P1150_SN` | Default serial number, so you need not repeat it |
+| `P1150_SN` | Default serial number, so you need not repeat it.  Optional: with a single P1150 attached, `p1150_connect` finds it |
 | `P1150_BATTERY_MAH` | Seeds the battery capacity (see below) |
 | `P1150_RUNS_DIR` | Where captures are stored (default `.p1150_runs/`) |
 | `P1150_MAX_CAPTURE_S` | Cap on a background capture (default 900 s ≈ 900 MB) |
@@ -289,6 +289,12 @@ open across tool calls so the target stays powered between measurements.
 
 **Device** — `p1150_list_devices`, `p1150_connect`, `p1150_disconnect`,
 `p1150_status`, `p1150_clear_error`, `p1150_self_test`
+
+`p1150_connect` scans USB, names the unit it found, and then reports its own
+progress as MCP progress notifications — firmware download and self-calibration
+each as a percentage — so the fifteen seconds a cold connect takes reads as work
+rather than as a hang.  Clients that display tool progress show it live; ones
+that do not simply ignore the notifications.
 
 **Power** — `p1150_power_on`, `p1150_power_off`
 

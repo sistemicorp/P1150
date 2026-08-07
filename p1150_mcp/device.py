@@ -85,6 +85,144 @@ class DeviceError(RuntimeError):
     pass
 
 
+def scan() -> list:
+    """Every P1150 attached to this machine, identified by serial number.
+
+    A serial number is the only durable way to address a P1150: COM port names
+    are assigned by the OS and move when the unit is re-plugged or a second one
+    is added, so a port that worked yesterday can be a different instrument
+    today.  The whole sweep costs tens of milliseconds -- enumeration is a USB
+    descriptor read and the ping is one short exchange -- so connect() runs it
+    to name the device it is about to open rather than trusting a port.
+
+    The port this session already holds is reported from the details captured
+    at connect time instead of being re-opened.  A serial port has exactly one
+    owner, so pinging it here would fail and the connected instrument would
+    disappear from its own device list.
+    """
+    devices = []
+    for port in PXXXX.list_ports():
+        if SESSION.is_connected() and port == SESSION.port:
+            d = SESSION.details
+            devices.append({
+                "serial": d.get("serial_hash"), "port": port,
+                "model": d.get("model"), "firmware": d.get("version"),
+                "application": d.get("app"),
+                "bootloader": d.get("app") == "a51",
+                "in_use_by_this_server": True,
+            })
+            continue
+
+        dev = PXXXX(port=port)
+        try:
+            ok, r = dev.ping()
+        finally:
+            dev.close()
+        if not ok:
+            continue
+        p = r[-1]
+        devices.append({
+            "serial": p["serial_hash"], "port": port,
+            "model": p["model"], "firmware": p["version"],
+            "application": p["app"],
+            # Both the bootloader (a51) and the application (a43) answer a
+            # ping, so the answer alone does not mean the unit is ready; this
+            # is what makes the difference between a connect that takes 20 ms
+            # and one that takes 15 seconds.
+            "bootloader": p["app"] == "a51",
+        })
+    return devices
+
+
+def _describe(found: list) -> str:
+    """One-line rendering of scan() output, for an error message."""
+    return ", ".join(f"{d['serial']} on {d['port']}" for d in found) or "none"
+
+
+class _ConnectProgress:
+    """Turns the driver's per-phase progress into one monotonic 0-100 bar.
+
+    ez_connect reports (percent, phase) with the percent restarting at zero for
+    every phase it enters -- 'Writing firmware' 0..100, then 'Calibrating'
+    0..100 -- and skips whatever is not needed, so a warm connect goes straight
+    from 'Start' to 'Connected' to 'Done' in twenty milliseconds while a cold
+    one walks the full sequence over fifteen seconds.  A progress bar has to
+    rise once towards one total, so each phase gets a band of the overall range
+    and the value is clamped so it can never go backwards.
+
+    The bands are sized by how long each phase takes on a cold unit, not by how
+    much work it represents: calibration is two thirds of the wait, so it gets
+    two thirds of the bar.  A phase the driver adds later that is not listed
+    here still relays its message, holding the bar where it was -- an unknown
+    name is not a reason to go quiet.
+    """
+
+    # phase (lower case) -> (start, end) of its slice of the overall bar
+    BANDS = {
+        "start":            (2, 5),
+        "writing firmware": (5, 45),
+        "rebooting":        (45, 52),
+        "connected":        (52, 55),
+        "calibrating":      (55, 99),
+    }
+
+    # The driver's closing phase is dropped: connect() ends with a line naming
+    # the instrument, its firmware and its temperature, which is the same "it
+    # worked" said usefully. Two of them in the same millisecond is noise.
+    SILENT = {"done"}
+
+    # The driver's phase names are terse and assume you know the instrument.
+    # These are for a developer watching a tool call, who wants to know why it
+    # is taking fifteen seconds, not which DLL routine is running.
+    LABELS = {
+        "start":            "Opening the connection",
+        "writing firmware": "Loading application firmware",
+        "rebooting":        "Rebooting the P1150",
+        "connected":        "Link established",
+        "calibrating":      "Self-calibrating",
+    }
+
+    def __init__(self, callback=None):
+        self._cb = callback
+        self._pct = 0.0
+
+    def emit(self, pct: float, message: str) -> None:
+        self._pct = max(self._pct, float(pct))
+        if self._cb is None:
+            return
+        try:
+            self._cb(int(round(self._pct)), message)
+        except Exception:
+            # from_device() runs inside the ctypes callback, on the driver's
+            # own stack. An exception raised there cannot propagate to the
+            # caller and would be printed and swallowed by ctypes; losing a
+            # progress line is not worth risking the state of a connect that
+            # is halfway through writing firmware.
+            pass
+
+    def hold(self, message: str) -> None:
+        """Say something without moving the bar."""
+        self.emit(self._pct, message)
+
+    def from_device(self, pct: int, phase: str) -> None:
+        """Callback handed to ez_connect: (percent, phase-name)."""
+        key = (phase or "").strip().lower()
+        if key in self.SILENT:
+            return
+        label = self.LABELS.get(key) or (phase or "").strip() or "Working"
+        band = self.BANDS.get(key)
+        if band is None:
+            self.hold(label)
+            return
+        pct = min(max(int(pct), 0), 100)
+        lo, hi = band
+        # The percent is only worth showing while it is actually moving: at 0
+        # the phase has just started and at 100 it is over, and both read
+        # better as a plain statement of what is happening.
+        self.emit(lo + (hi - lo) * pct / 100.0,
+                  f"{label} {pct}%" if 0 < pct < 100 else label)
+
+
 def _join(chunks: list) -> tuple:
     """Concatenate chunk dicts into one (i, isnk, aux) triple.
 
@@ -163,18 +301,74 @@ class Session:
                 "(p1150_list_devices shows what is attached).")
         return self.dev
 
-    def connect(self, sn: str, calibrate: bool = True) -> dict:
+    def _find(self, sn: str, prog: "_ConnectProgress") -> tuple:
+        """Resolve a serial number to a port, or pick the only unit attached.
+
+        The scan happens even when the serial number is known, because it is
+        what turns fifteen silent seconds into a sequence someone can follow:
+        it names the instrument before the slow part starts and, crucially,
+        says whether the unit is in its bootloader -- which is the difference
+        between a connect that returns instantly and one that writes firmware
+        and calibrates first.
+        """
+        prog.emit(1, "Scanning USB for attached P1150 units")
+        found = scan()
+
+        if sn:
+            match = next((d for d in found
+                          if (d["serial"] or "").upper() == sn.upper()), None)
+            if match is None:
+                # The scan matches on the short serial hash, which is what is
+                # printed on the unit. The driver's own lookup also accepts the
+                # long MCU serial, so fall back to it before giving up.
+                port = PXXXX.get_port_from_sn(sn)
+                if port is None:
+                    raise DeviceError(
+                        f"No P1150 with serial number {sn}. "
+                        f"Attached: {_describe(found)}")
+                return port, None
+            return match["port"], match
+
+        if not found:
+            raise DeviceError(
+                "No P1150 is attached to this machine. Check the USB cable, "
+                "and that the unit is not already open in the desktop GUI -- "
+                "only one program can own a P1150 at a time.")
+        if len(found) > 1:
+            raise DeviceError(
+                f"{len(found)} P1150 units are attached, so which one to use "
+                f"has to be said: {_describe(found)}. Pass the serial number "
+                f"to p1150_connect, or set P1150_SN.")
+        return found[0]["port"], found[0]
+
+    def connect(self, sn: str = None, calibrate: bool = True,
+                progress=None) -> dict:
+        """Connect to a P1150 and leave it ready to measure.
+
+        sn is the serial number printed on the back of the unit.  Omit it when
+        exactly one P1150 is attached and it will be discovered; with more than
+        one attached the choice has to be made by the caller, not guessed.
+
+        progress, when supplied, is called as progress(percent, message) as the
+        connection proceeds -- percent rising once from 0 to 100 over the whole
+        operation.  It exists because a cold connect takes about fifteen
+        seconds of firmware download and self-calibration, and a developer
+        watching an agent work has no way to tell that from a hang.
+        """
         if self.is_connected():
             raise DeviceError(
                 f"Already connected to {self.details.get('serial_hash')}. "
                 f"Call p1150_disconnect first.")
 
-        port = PXXXX.get_port_from_sn(sn)
-        if port is None:
-            attached = PXXXX.list_ports()
-            raise DeviceError(
-                f"No P1150 with serial number {sn}. "
-                f"Ports with a P1150 attached: {attached or 'none'}")
+        prog = _ConnectProgress(progress)
+        port, found = self._find(sn, prog)
+        if found is not None:
+            prog.emit(4, f"Found P1150 {found['serial']} on {port}" + (
+                " -- in the bootloader, so the application firmware has to be "
+                "loaded and the unit calibrated first (about 15 s)"
+                if found["bootloader"] else ""))
+        else:
+            prog.emit(4, f"Connecting to P1150 {sn} on {port}")
 
         # From a cold boot the P1150 answers as its bootloader 'a51'; ez_connect
         # pushes the application image and it comes back as 'a43'.  One retry
@@ -186,7 +380,8 @@ class Session:
                         cb_uclog_async=self._cb_async,
                         cb_acquisition_get_data=self._cb_acq,
                         acq_format=ACQ_FORMAT_NUMPY)
-            ok, details = dev.ez_connect(calibrate=calibrate)
+            ok, details = dev.ez_connect(calibrate=calibrate,
+                                         progress_callback=prog.from_device)
             if not ok:
                 dev.close()
                 raise DeviceError(f"ez_connect failed on {port}: {details}")
@@ -195,6 +390,8 @@ class Session:
                 break
             dev.close()          # still the bootloader; release the port
             attempts -= 1
+            if attempts >= 1:
+                prog.hold("Still in the bootloader; trying once more")
 
         if self.dev is None:
             raise DeviceError(
@@ -203,6 +400,9 @@ class Session:
 
         self.port = port
         self.details = details
+        prog.emit(100, f"P1150 {details.get('serial_hash')} ready on {port} "
+                       f"-- firmware {details.get('version')}, "
+                       f"{float(details.get('t_degc', 0.0)):.0f} C")
         return {
             "connected": True,
             "port": port,
