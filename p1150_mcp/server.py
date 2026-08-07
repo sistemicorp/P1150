@@ -37,9 +37,9 @@ except ImportError:                                  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as _Server, Context
 
 from . import analysis, storage, config
-from .device import SESSION, SAMPLE_RATE, scan
+from .device import SESSION, SAMPLE_RATE, D0S_KEY, scan
 from .scenarios import (GUIDE, MARKER_GUIDE, INRUSH_GUIDE, BATTERY_LIFE_GUIDE,
-                        STATE_SIGNAL_GUIDE)
+                        STATE_SIGNAL_GUIDE, STATE_MARK_GUIDE)
 
 mcp = _Server("p1150")
 
@@ -200,7 +200,7 @@ def _read(run_id: str, bandwidth_hz: float = None):
 
 def _store(label: str, i_ma: np.ndarray, extra: dict = None,
            isnk_ma: np.ndarray = None, aux: dict = None,
-           fs: int = SAMPLE_RATE) -> dict:
+           fs: int = SAMPLE_RATE, marks: tuple = None) -> dict:
     """Persist a capture and return the summary the agent actually sees."""
     if i_ma.size == 0:
         return {"error": "Capture returned no samples."}
@@ -222,10 +222,22 @@ def _store(label: str, i_ma: np.ndarray, extra: dict = None,
         signal = config.get_state_signal()
         if signal.get("channels") and all(c in aux for c in signal["channels"]):
             meta["state_signal"] = signal
-    run_id = storage.save(label, i_ma, meta, isnk_ma=isnk_ma, aux=aux)
+    if marks is not None:
+        # The symbol-to-state map in force at capture time, on the same
+        # argument as the pin assignment above: renaming a state afterwards
+        # must not silently retitle the regions in a run already taken.
+        meta["marks_recorded"] = int(len(marks[0]))
+        symbols = config.mark_symbols()
+        if symbols:
+            meta["state_marks"] = {"symbols": symbols,
+                                   "baud": analysis.D0S_BAUD}
+    run_id = storage.save(label, i_ma, meta, isnk_ma=isnk_ma, aux=aux,
+                          marks=marks)
     out = {"run_id": run_id, "label": label}
     out.update(summary)
     out.update(extra or {})
+    if marks is not None and len(marks[0]):
+        out.update(_state_mark_headline(marks, meta, run_id, i_ma.size))
     if aux:
         if meta.get("state_signal"):
             out.update(_state_headline(aux, meta, run_id))
@@ -319,11 +331,13 @@ def _state_codes(aux: dict, meta: dict = None):
     channels = list(sig.get("channels") or [])
     if not channels:
         raise ValueError(
-            "No state signal is declared, so a capture cannot be split by "
-            "state. If the firmware can drive two spare GPIOs, "
-            "p1150_state_signal_guide has the fifteen lines it takes -- it "
-            "makes every state measurement exact instead of resting on someone "
-            "confirming the target was in the right mode.")
+            "This run carries neither serial marks nor a state code, so it "
+            "cannot be split by state. Making it possible is a firmware "
+            "change of a few lines, and it makes every state measurement "
+            "exact instead of resting on someone confirming the target was in "
+            "the right mode: p1150_state_mark_guide if the MCU has a UART to "
+            "spare, p1150_state_signal_guide if it does not. Either way the "
+            "run has to be captured AFTER the change, not analysed under it.")
     codes = analysis.decode_state_codes(aux, channels)
     names = {int(c): n for n, c in (sig.get("codes") or {}).items()}
     return codes, names
@@ -347,6 +361,102 @@ def _state_headline(aux: dict, meta: dict = None, run_id: str = None) -> dict:
             f"each of these states." if len(seen) > 1 else
             f"The target stayed in one state for this whole capture.")
     return out
+
+
+def _mark_names(meta: dict = None) -> dict:
+    """{symbol: state name} for a run, the run's own map winning.
+
+    Same rule as the pin codes: a capture is read under the naming it was taken
+    with, so reusing 'B' for something else next week cannot retitle a region
+    in a run recorded last week.
+    """
+    m = (meta or {}).get("state_marks")
+    if m:
+        return {s: n for n, s in (m.get("symbols") or {}).items()}
+    return config.mark_names()
+
+
+def _run_marks(run_id: str, meta: dict = None):
+    """The serial marks of a stored run, or None when it has none.
+
+    Older runs predate the stream being recorded and simply have none; that is
+    not an error, it is a run captured before the instrumentation existed.
+    """
+    try:
+        return storage.load_marks(run_id)
+    except Exception:
+        return None
+
+
+def _mark_split(i_ma: np.ndarray, marks, meta: dict = None,
+                fs: int = SAMPLE_RATE) -> dict:
+    """Decode a run's marks and split its current between the regions."""
+    decoded = analysis.decode_marks(marks[0], marks[1], int(i_ma.size))
+    return analysis.mark_breakdown(i_ma, decoded, _mark_names(meta), fs,
+                                   config.capacity_mah())
+
+
+def _state_mark_headline(marks, meta: dict = None, run_id: str = None,
+                         n: int = 0) -> dict:
+    """The one line about serial marks that belongs on a capture carrying any.
+
+    Decoded against a zero trace: this is about which regions the capture
+    contains, and the currents are what p1150_state_split is for.
+    """
+    try:
+        decoded = analysis.decode_marks(marks[0], marks[1], int(n))
+    except Exception:
+        return {}
+    if not decoded.get("regions"):
+        out = {"marks_recorded": int(len(marks[0]))}
+        if decoded.get("unknown_bytes"):
+            out["marks_warning"] = decoded["unknown_note"]
+        return out
+    names = _mark_names(meta)
+    seen = [names.get(s) or f"mark {s}" for s in decoded["symbols_seen"]]
+    out = {"marks_seen": seen, "mark_regions": len(decoded["regions"])}
+    if decoded.get("max_depth", 0) > 1:
+        out["mark_nesting_depth"] = decoded["max_depth"]
+    for k in ("unknown_note", "crossed_note"):
+        if decoded.get(k):
+            out.setdefault("marks_warning", decoded[k])
+    if run_id:
+        out["mark_hint"] = (
+            f"p1150_state_split('{run_id}') gives current, charge and share of "
+            f"the battery for each of these regions.")
+    return out
+
+
+def _state_mechanism(meta: dict = None) -> str:
+    """How the target declares its state for this run: 'marks', 'signal', None.
+
+    Marks win where both are configured, because they are strictly the more
+    expressive of the two and a project that has both is one mid-migration.
+    Nothing prevents having both -- the pins and the UART are independent -- and
+    each tool still reads whichever the run in front of it actually carries.
+    """
+    if (meta or {}).get("state_marks") or (not meta and config.mark_symbols()):
+        return "marks"
+    if (meta or {}).get("state_signal") or (not meta and
+                                            config.get_state_signal()
+                                            .get("codes")):
+        return "signal"
+    return None
+
+
+def _splits_by_marks(meta: dict, marks) -> bool:
+    """Should this run be split by its serial marks rather than by a pin code?
+
+    Yes when it was captured under a declared mark scheme -- and yes as well
+    for a run that simply has marks in it and carries no code, which is what a
+    capture taken before the states were named looks like.  The stream is
+    recorded whether or not anything has been declared for it, and this is the
+    reason: the run taken this morning still splits once the marks are named
+    this afternoon.
+    """
+    if marks is None or not len(marks[0]):
+        return False
+    return _state_mechanism(meta) in ("marks", None)
 
 
 def _marker_headline(aux: dict, meta: dict = None, run_id: str = None) -> dict:
@@ -416,8 +526,12 @@ def p1150_start() -> dict:
       3. Describe how the product is used -- its states and their share of the
          time, and the things that happen a countable number of times a day.
          This cannot be measured and has to be asked for.
-      4. Measure each state, once, with the developer putting the target into it.
+      4. Measure each state, once, with the developer putting the target into
+         it. If you are also writing the firmware, have it declare its own
+         state instead and measure them all in one capture -- see
+         p1150_state_mark_guide.
       5. Estimate battery life, and see which contributor actually dominates.
+         p1150_battery_pie draws that ranking as a share of the battery.
       6. Optimise that one, re-measure that one state, estimate again.
 
     Everything else the server does hangs off that spine: p1150_compare for
@@ -474,9 +588,11 @@ def p1150_start() -> dict:
                    "and declare them with p1150_set_usage_state. Read "
                    "p1150_battery_life_guide first; it has the questions to ask "
                    "and why a capture cannot answer them. If you are also "
-                   "writing the target's firmware, add a state signal at the "
-                   "same time (p1150_state_signal_guide): fifteen lines, and "
-                   "every state measurement afterwards is exact.")
+                   "writing the target's firmware, have it declare its own "
+                   "state at the same time: p1150_state_mark_guide if the MCU "
+                   "has a UART to spare, p1150_state_signal_guide if it does "
+                   "not. Either way every state measurement afterwards is "
+                   "exact instead of resting on someone confirming it.")
         elif abs(total - 100.0) > 0.5:
             nxt = (f"The declared states account for {total:.1f}% of the time, "
                    f"not 100%. Ask the developer what the device is doing for "
@@ -484,14 +600,13 @@ def p1150_start() -> dict:
                    f"unaccounted time cannot be assumed to be cheap.")
         elif unmeasured:
             s = unmeasured[0]
-            signal = config.get_state_signal()
             nxt = (
                 f"Measure the remaining states ({', '.join(unmeasured)}). The "
-                f"target signals its own state, so p1150_measure_states(60) "
+                f"target declares its own state, so p1150_measure_states(60) "
                 f"while it runs normally captures them all at once -- or "
                 f"p1150_measure_state(state='{s}') to wait for one and measure "
                 f"only that."
-                if signal.get("codes") else
+                if _state_mechanism() else
                 f"Measure the '{s}' state: ask the developer to put the target "
                 f"into it, wait for it to settle, and confirm before you "
                 f"capture. Then p1150_measure_state(state='{s}', "
@@ -499,17 +614,22 @@ def p1150_start() -> dict:
         else:
             nxt = ("Every declared state has a baseline: run "
                    "p1150_battery_life() for the estimate and the ranking of "
-                   "what is actually spending the battery.")
+                   "what is actually spending the battery, then "
+                   "p1150_battery_pie() for the same thing as a picture.")
         out["next_action"] = nxt
         out["state_signal"] = config.get_state_signal() or None
+        out["state_marks"] = config.mark_symbols() or None
+        out["state_declared_by"] = _state_mechanism()
         out["guides"] = {
             "p1150_battery_life_guide": "how long will the battery last, and "
                                         "what should I optimise",
             "p1150_measurement_guide": "how to measure well; the profiles worth "
                                        "knowing",
-            "p1150_state_signal_guide": "have the firmware declare its own "
-                                        "state, so measurements stop depending "
-                                        "on anyone confirming it",
+            "p1150_state_mark_guide": "have the firmware name what it is doing "
+                                      "with one character on a UART -- the "
+                                      "best option when the MCU has one spare",
+            "p1150_state_signal_guide": "the same idea on two GPIOs, for a "
+                                        "target with no UART to spare",
             "p1150_inrush_guide": "surges that reset the target in the field",
             "p1150_marker_guide": "what one function or feature costs",
         }
@@ -603,6 +723,37 @@ def p1150_battery_life_guide() -> str:
 
 
 @mcp.tool()
+def p1150_state_mark_guide() -> str:
+    """How to have the target name what it is doing by sending one character,
+    so a measurement never rests on someone confirming it.
+
+    READ THIS IF YOU ARE ALSO WRITING THE TARGET'S FIRMWARE AND THE MCU HAS A
+    UART TO SPARE. It is the highest-value change available here. The P1150
+    decodes its D0 input as a 460800 baud serial receiver, so a putchar at each
+    end of a region of code -- 'A' going in, 'a' coming out -- records what the
+    target was doing, sample for sample, beside what it was drawing.
+
+    Prefer it to the two-pin state code (p1150_state_signal_guide) wherever
+    there is a UART free: thirty regions instead of four, regions that NEST so
+    a feature's cost can be separated from the state containing it, one pin
+    instead of two, and names that exist in the firmware source. The pin code
+    wins only when no UART is free, or when the sleep mode being measured stops
+    the UART's clock and a GPIO level would survive where a peripheral does not.
+
+    Covers: the encoding and the bracket alternatives; why the baud rate is
+    fixed at 460800 and what a wrong one looks like (bytes that arrive and
+    decode into rubbish, not an error); the firmware, with where to put a mark
+    and where not to; the three failures that catch people -- a UART clock
+    gated off in sleep, a TX buffer truncated by the sleep instruction, and a
+    debug log sharing the port; what nesting means for the numbers, and why
+    only the exclusive figures plus the unmarked remainder add up to the
+    capture; the wiring and its 3.3 V limit; and the working order from firmware
+    to battery-life estimate.
+    """
+    return STATE_MARK_GUIDE
+
+
+@mcp.tool()
 def p1150_state_signal_guide() -> str:
     """How to make the target declare which state it is in, so a measurement
     never rests on someone confirming it.
@@ -638,6 +789,14 @@ def p1150_marker_guide() -> str:
     Read this before using p1150_set_aux, p1150_marker_stats or
     p1150_compare_marker, and whenever asked what a particular function,
     driver or feature costs the battery.
+
+    Check p1150_state_mark_guide first if the target has a UART to spare: a
+    serial mark bounds a region the same way with no threshold, no polarity and
+    no pin per region, and nested regions separate a callee's cost from its
+    caller's. A GPIO marker is the right choice when no UART is free, when the
+    region is short enough that a 22 us byte at each end would distort it, or
+    when what is being marked is not the firmware's own signal at all -- an
+    enable line, a chip select, a rail coming up.
 
     The P1150 has three auxiliary inputs (A0, D0, D1) that record alongside
     current. Wiring a spare target GPIO to one of them, and raising it around
@@ -930,10 +1089,215 @@ def p1150_set_usage_event(name: str, per_day: float = None,
 
 
 @mcp.tool()
+def p1150_set_state_mark(state: str, symbol: str = None) -> dict:
+    """Declare that the target announces this state by writing a character to a
+    UART wired to the P1150's D0 input.
+
+    IF YOU ARE ALSO WRITING THE TARGET'S FIRMWARE AND IT HAS A SPARE UART, THIS
+    IS THE ONE TO USE. Read p1150_state_mark_guide for the firmware; it is a
+    putchar at each end of a region of code. It removes the weakest step in
+    every battery measurement -- a person asserting which mode the target was
+    in -- and unlike the two-pin code it scales past four states and records
+    which regions ran inside which.
+
+    THE UART MUST BE AT 460800 BAUD, 8N1. That is the rate the input decodes
+    and it is not configurable. At any other rate the bytes still arrive and
+    still decode -- into rubbish -- so this is checked by p1150_state_check
+    rather than discovered later.
+
+    The encoding is one character in, its partner out:
+
+        'A' entering        'a' leaving         (any letter A-Z)
+        '(' entering        ')' leaving         (also [ ] { } < >)
+
+    Regions NEST, and that is the point of them. 'A' ... 'B' ... 'b' ... 'a'
+    records that B ran inside A, and the breakdown then charges B's energy to B
+    and the rest of A's to A. Thirty regions are available, so a feature can
+    have one rather than the encoding being rationed to top-level power modes.
+
+    state: the name declared with p1150_set_usage_state. Using the same names
+        is what lets p1150_battery_life pick the measurement up by itself.
+
+    symbol: the character the firmware sends on the way IN. Omit it and the
+        next free letter is assigned -- the letter carries no meaning, it is
+        only a handle the firmware and the report agree on.
+
+    D0 CANNOT ALSO CARRY A LOGIC SIGNAL. The pin is decoded as a serial stream
+    and sampled as a level from the same input, so a state-signal bit or a
+    region marker on D0 is refused here. D1 and A0 stay free for a marker.
+
+    AFTERWARDS, RUN p1150_state_check with the target running normally. A wrong
+    baud rate or a lead on the wrong pad produces a capture that looks entirely
+    normal and contains no marks, and one call rules both out.
+    """
+    try:
+        marks = config.set_state_mark(state, symbol)
+        symbols = marks.get("symbols") or {}
+        assigned = symbols.get((state or "").strip().lower())
+        out = {"state": state, "symbol": assigned,
+               "exit_symbol": analysis.mark_exit_for(assigned),
+               "baud": marks.get("baud"),
+               "symbols": symbols,
+               "note": (f"The firmware sends '{assigned}' on entering "
+                        f"'{state}' and '{analysis.mark_exit_for(assigned)}' "
+                        f"on leaving it, to a UART at "
+                        f"{marks.get('baud')} baud wired to D0. "
+                        f"{len(symbols)} state(s) declared.")}
+        undeclared = [n for n in symbols
+                      if n not in config.get_usage()["states"]]
+        if undeclared:
+            out["usage_hint"] = (
+                f"These have a mark but no share of the product's time yet: "
+                f"{', '.join(undeclared)}. An estimate needs both -- see "
+                f"p1150_set_usage_state.")
+        out["action"] = ("Run p1150_state_check with the target running "
+                         "normally, before measuring anything. It is the one "
+                         "call that catches a wrong baud rate.")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_get_state_marks() -> dict:
+    """Show which character the target sends for each state, if it sends any.
+    """
+    try:
+        symbols = config.mark_symbols()
+        if not symbols:
+            return {"configured": False,
+                    "note": "The target does not mark its states on the serial "
+                            "input, so a state baseline depends on someone "
+                            "confirming the target is in the right mode when "
+                            "the capture is taken. If the firmware can be "
+                            "edited and the MCU has a spare UART, "
+                            "p1150_state_mark_guide shows the few lines that "
+                            "make it exact instead."}
+        return {"configured": True, "baud": analysis.D0S_BAUD,
+                "recording": config.d0s_recorded(),
+                "symbols": {n: {"enter": s, "exit": analysis.mark_exit_for(s)}
+                            for n, s in symbols.items()}}
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_clear_state_marks(state: str = None) -> dict:
+    """Forget one state's mark, or the whole scheme.
+
+    Use when the instrumentation comes out of the firmware or a state is
+    renamed. Stored runs keep the map they were captured with and still decode.
+    """
+    try:
+        marks = config.clear_state_marks(state)
+        return {"configured": bool(marks.get("symbols")),
+                "symbols": marks.get("symbols") or {},
+                "note": (f"'{state}' no longer has a mark." if state else
+                         "Serial state marks cleared. The stream on D0 is "
+                         "still recorded -- it costs nothing and a run taken "
+                         "now can still be decoded later.")}
+    except Exception as e:
+        return _fail(e)
+
+
+def _mark_check(duration_s: float) -> dict:
+    """p1150_state_check, for a target that marks its states serially."""
+    i, _, aux, marks = SESSION.measure(duration_s)
+    if marks is None:
+        return {"error":
+                "The serial stream on D0 is not being recorded, because "
+                "something else has claimed that pin -- p1150_get_aux shows "
+                "what. One pin cannot be both a logic level and a serial "
+                "input."}
+    n = int(i.size)
+    decoded = analysis.decode_marks(marks[0], marks[1], n)
+    r = analysis.mark_breakdown(i, decoded, _mark_names(), SAMPLE_RATE,
+                                config.capacity_mah())
+    unknown = sum((decoded.get("unknown_bytes") or {}).values())
+    out = {"duration_s": duration_s, "mechanism": "state_marks",
+           "baud": analysis.D0S_BAUD,
+           "bytes_received": int(len(marks[0])),
+           "unrecognised_bytes": unknown,
+           "regions_seen": r.get("regions_seen"),
+           "states": r.get("marks"), "unmarked": r.get("unmarked"),
+           "mean_current_ma": round(float(i.mean()), 6) if i.size else None}
+    for k in ("unmapped_symbols", "unmapped_note", "unknown_bytes",
+              "unknown_note", "open_at_start", "open_at_start_note",
+              "open_at_end", "open_at_end_note", "crossed_regions",
+              "crossed_note", "max_nesting_depth", "self_nested_symbols",
+              "self_nested_note"):
+        if r.get(k) or decoded.get(k):
+            out[k] = r.get(k) or decoded.get(k)
+
+    if not out["bytes_received"]:
+        out["verdict"] = "NO_TRAFFIC"
+        out["action"] = (
+            f"Nothing arrived on D0 in {duration_s:g} s. The UART is not "
+            f"enabled, TX is on a different pin, the lead is on the wrong pad, "
+            f"or the firmware is not calling the mark. Check the target is "
+            f"reaching the instrumented code at all, and that the ground is "
+            f"common -- usually it already is, through the probe at the "
+            f"battery terminals. One innocent explanation as well: a mark is "
+            f"an edge, so a target that entered a region before this check "
+            f"began and has not left it sends nothing. Make it change state, "
+            f"or check for longer than one of its cycles.")
+    elif not r.get("regions_seen"):
+        out["verdict"] = "NOT_MARKS"
+        out["action"] = (
+            f"{out['bytes_received']} byte(s) arrived and none of them was a "
+            f"mark. Almost always the baud rate: the input decodes "
+            f"{analysis.D0S_BAUD} 8N1 and nothing else, so a target at 115200 "
+            f"produces exactly this. Check the UART's configured rate, and its "
+            f"actual one -- a clock or prescaler that is not what the driver "
+            f"believes gives the same result.")
+    elif unknown > 2 * r["regions_seen"]:
+        out["verdict"] = "NOISY"
+        out["action"] = (
+            f"{unknown} unrecognised byte(s) against {r['regions_seen']} valid "
+            f"region(s). Either the UART is shared with a debug log -- give "
+            f"the marks a port of their own -- or the baud rate is close but "
+            f"not exact, which corrupts a fraction of the bytes rather than "
+            f"all of them.")
+    elif decoded.get("self_nested_symbols"):
+        # Measured on the bench: a target at 115200 into this 460800 input
+        # produced three identical bytes that were all valid mark characters,
+        # so nothing above catches it -- only the shape does.
+        out["verdict"] = "SUSPECT_BAUD"
+        out["action"] = (
+            f"{', '.join(decoded['self_nested_symbols'])} was opened again "
+            f"inside itself without closing. Check the target's UART is at "
+            f"{analysis.D0S_BAUD} before trusting any of this: a rate mismatch "
+            f"mangles characters, and the mangled ones are often still valid "
+            f"marks, so a wrong baud rate can produce a decode that looks "
+            f"plausible rather than an obvious error. If the firmware really "
+            f"does mark a recursive function with one symbol, this is expected "
+            f"and the nesting is real.")
+    elif len({m["symbol"] for m in (r.get("marks") or [])}) == 1:
+        out["verdict"] = "SINGLE_REGION"
+        out["action"] = (
+            "Only one region was marked. The stream is working; exercise the "
+            "other states and re-check if you want them all confirmed.")
+    else:
+        out["verdict"] = "OK"
+        out["note"] = (
+            f"{r['regions_seen']} region(s) decoded cleanly across "
+            f"{len({m['symbol'] for m in r['marks']})} distinct marks. Ready "
+            f"to measure -- p1150_measure_states captures them all at once.")
+    return out
+
+
+@mcp.tool()
 def p1150_set_state_signal(state: str, code: int,
                            channels: list = None) -> dict:
     """Declare that the target itself signals which state it is in, by driving a
     code on the P1150's digital inputs.
+
+    IF THE TARGET HAS A UART TO SPARE, USE p1150_set_state_mark INSTEAD. It
+    answers the same question with one pin rather than two, thirty states
+    rather than four, and regions that nest so a feature's cost can be
+    separated from the state containing it. This tool is the right one when no
+    UART is free, or when the sleep mode being measured stops the UART's clock
+    and a GPIO level would survive where a peripheral would not.
 
     IF YOU ARE ALSO WRITING THE TARGET'S FIRMWARE, DO THIS EARLY. It is about
     fifteen lines -- read p1150_state_signal_guide for them -- and it removes
@@ -1005,9 +1369,10 @@ def p1150_get_state_signal() -> dict:
                             "baseline depends on someone confirming the target "
                             "is in the right mode when the capture is taken. "
                             "If the firmware can be edited -- and if you are "
-                            "writing it, it can -- p1150_state_signal_guide "
-                            "shows the fifteen lines that make it exact "
-                            "instead."}
+                            "writing it, it can -- p1150_state_mark_guide "
+                            "shows the few lines that make it exact instead, "
+                            "or p1150_state_signal_guide when no UART is "
+                            "free."}
         return {"configured": True, "channels": sig["channels"],
                 "codes": sig["codes"]}
     except Exception as e:
@@ -1031,13 +1396,27 @@ def p1150_clear_state_signal() -> dict:
 
 @mcp.tool()
 def p1150_state_check(duration_s: float = 5.0) -> dict:
-    """Confirm the target really drives its state code, before relying on it.
+    """Confirm the target really declares its state, before relying on it.
 
-    RUN THIS ONCE AFTER p1150_set_state_signal, with the target running
-    normally, and ideally over a window in which it visits more than one state.
+    RUN THIS ONCE AFTER p1150_set_state_mark or p1150_set_state_signal, with
+    the target running normally, and ideally over a window in which it visits
+    more than one state. It checks whichever mechanism the project uses.
 
-    It catches the failures that otherwise produce a capture that looks entirely
-    normal and means nothing:
+    FOR SERIAL MARKS it catches:
+      * nothing arriving at all -- the UART is not enabled, TX is on another
+        pin, or the lead is on the wrong pad.
+      * bytes arriving that are not marks, which at this speed almost always
+        means the target is not at 460800 baud. That is the one rate the input
+        decodes and it cannot be changed.
+      * a rate mismatch whose mangled bytes happen to still be valid mark
+        characters -- measured on the bench, 115200 into this input arrived as
+        three identical letters that decoded as three perfectly valid nested
+        regions. Nothing about the bytes gives that away, only their shape, so
+        this is the failure that most needs a check rather than a glance.
+      * marks the firmware sends that no state is named for.
+      * regions that open and never close, or that overlap instead of nesting.
+
+    FOR THE TWO-PIN CODE it catches:
       * pins never driven -- the firmware change did not take, or the leads are
         on the wrong pads. Everything reads as code 0.
       * GPIO drive released in deep sleep. Several MCUs do this unless pad
@@ -1047,18 +1426,24 @@ def p1150_state_check(duration_s: float = 5.0) -> dict:
       * a floating or ungrounded input, which decodes as rapid nonsense.
       * a code the firmware drives that no state is declared for.
 
-    Reports the codes seen, how long each was held, how many transitions
-    occurred, and the per-channel signal survey. Watch for an implausible
-    transition count: a state code should change a handful of times in five
-    seconds, not thousands.
+    Reports what was seen, how long each state was held, how many transitions
+    occurred, and for the pin code the per-channel signal survey. Watch for an
+    implausible transition count: a state should change a handful of times in
+    five seconds, not thousands.
     """
     try:
+        if _state_mechanism() == "marks":
+            return _mark_check(duration_s)
         sig = config.get_state_signal()
         if not sig.get("channels"):
-            return {"error": "No state signal is declared. Call "
-                             "p1150_set_state_signal first "
-                             "(p1150_state_signal_guide has the firmware)."}
-        i, _, aux = SESSION.measure(duration_s)
+            return {"error":
+                    "The target does not declare its state yet. Two ways to "
+                    "add it, both about fifteen lines of firmware: a character "
+                    "on a UART at each state boundary (p1150_state_mark_guide, "
+                    "then p1150_set_state_mark), or a 2-bit code on two GPIOs "
+                    "(p1150_state_signal_guide, then "
+                    "p1150_set_state_signal)."}
+        i, _, aux, marks = SESSION.measure(duration_s)
         codes, names = _state_codes(aux, None)
         r = analysis.state_breakdown(i, codes, names, SAMPLE_RATE)
         out = {"duration_s": duration_s, "channels": sig["channels"],
@@ -1336,7 +1721,7 @@ def p1150_aux_check(duration_s: float = 2.0) -> dict:
             return {"error": "No auxiliary input is configured. Call "
                              "p1150_set_aux first (p1150_marker_guide explains "
                              "the firmware and wiring side)."}
-        i, _, aux = SESSION.measure(duration_s)
+        i, _, aux, marks = SESSION.measure(duration_s)
         out = {"duration_s": duration_s, "channels": {}}
         for ch in channels:
             if ch not in aux:
@@ -1677,11 +2062,11 @@ def p1150_measure(duration_s: float, label: str,
     warning on to the developer; see p1150_inrush_check.
     """
     try:
-        i, isnk, aux = SESSION.measure(duration_s, connect_probe_during)
+        i, isnk, aux, marks = SESSION.measure(duration_s, connect_probe_during)
         return _store(label, i,
                       {"capture_type": "timed",
                        "connect_probe_during": bool(connect_probe_during)},
-                      isnk_ma=isnk, aux=aux)
+                      isnk_ma=isnk, aux=aux, marks=marks)
     except Exception as e:
         return _fail(e)
 
@@ -1698,12 +2083,13 @@ def p1150_measure_state(state: str, duration_s: float = 30.0,
     p1150_battery_life combines them. Read p1150_battery_life_guide before the
     first one.
 
-    IF THE TARGET SIGNALS ITS OWN STATE (p1150_set_state_signal), none of the
-    next two paragraphs applies: this waits until the firmware declares it is in
-    the state, keeps only the samples where it says so, and discards the rest.
-    The state becomes a fact rather than a claim. When the firmware can be
-    edited -- and if you are writing it, it can -- adding that signal is worth
-    more than anything else here; p1150_state_signal_guide has the fifteen lines.
+    IF THE TARGET DECLARES ITS OWN STATE -- by a serial mark
+    (p1150_set_state_mark) or a pin code (p1150_set_state_signal) -- none of
+    the next two paragraphs applies: this waits until the firmware says it is
+    in the state, keeps only the samples where it says so, and discards the
+    rest. The state becomes a fact rather than a claim. When the firmware can
+    be edited -- and if you are writing it, it can -- adding that is worth more
+    than anything else here; p1150_state_mark_guide has the few lines it takes.
 
     OTHERWISE, ASK THE DEVELOPER TO PUT THE TARGET INTO THE STATE, AND WAIT FOR
     THEM TO CONFIRM IT IS THERE. Only they can do it -- press the button, close
@@ -1746,13 +2132,14 @@ def p1150_measure_state(state: str, duration_s: float = 30.0,
         the same state, e.g. "standby-after-fix". The newest capture of a state
         is the one an estimate uses, whatever it is labelled.
 
-    wait_s: only used when the target signals its own state
-        (p1150_set_state_signal). The capture then WAITS until the target
-        declares it is in this state and keeps only the samples where it says
-        so, discarding the rest -- so the measurement is of the state by
-        construction rather than by anyone's say-so, and nobody has to press
-        anything. This is how to measure a state whose entry you cannot time by
-        hand. Give up after wait_s seconds.
+    wait_s: only used when the target declares its own state, by a mark
+        (p1150_set_state_mark) or a pin code (p1150_set_state_signal). The
+        capture then WAITS until the target says it is in this state and keeps
+        only the samples where it says so, discarding the rest -- so the
+        measurement is of the state by construction rather than by anyone's
+        say-so, and nobody has to press anything. This is how to measure a
+        state whose entry you cannot time by hand. Give up after wait_s
+        seconds.
     """
     try:
         name = (state or "").strip()
@@ -1761,9 +2148,89 @@ def p1150_measure_state(state: str, duration_s: float = 30.0,
 
         signal = config.get_state_signal()
         code = (signal.get("codes") or {}).get(name.lower())
+        symbol = config.mark_symbols().get(name.lower())
         gate = {}
-        if code is None:
-            i, isnk, aux = SESSION.measure(duration_s)
+        if symbol is not None:
+            # The mark version of the same idea as the code gate below: wait
+            # until the target says it has entered the region, then keep only
+            # the samples between its opening and closing bytes.  The stack has
+            # to persist across chunks -- a target that entered the region ten
+            # seconds ago sends nothing at all in the chunk being examined, and
+            # a per-chunk test would read that silence as "not in the state"
+            # and wait forever.
+            stack, saw = [], set()
+
+            def _match(chunk):
+                for c in chunk[D0S_KEY][1].tolist():
+                    ch = chr(c)
+                    if ch in analysis.MARK_ENTER_SET:
+                        stack.append(ch)
+                        saw.add(ch)
+                    elif ch in analysis.MARK_EXIT_SET:
+                        want = analysis.MARK_ENTER_OF_EXIT[ch]
+                        saw.add(want)
+                        if want in stack:
+                            while stack.pop() != want:
+                                pass
+                return symbol in stack
+
+            try:
+                i, isnk, aux, marks, waited = SESSION.measure_when(
+                    duration_s, _match, wait_s)
+            except Exception as e:
+                names = _mark_names()
+                return {"error": str(e),
+                        "wanted": {"state": name, "mark": symbol},
+                        "marks_seen_while_waiting":
+                            sorted(f"{s} ({names.get(s) or 'unnamed'})"
+                                   for s in saw),
+                        "action": (
+                            "The target never entered this region during the "
+                            "wait. A mark is an EDGE, so a target already "
+                            "inside the region -- and staying there, which is "
+                            "exactly what a resting state does -- sends "
+                            "nothing to wait for. In that case do not gate at "
+                            "all: p1150_measure(duration_s) followed by "
+                            "p1150_state_split reconstructs a region that was "
+                            "open when the capture began, provided the target "
+                            "leaves it once. Otherwise the firmware may not "
+                            "send this mark, or the UART may be misconfigured "
+                            "-- p1150_state_check tells the two apart, since a "
+                            "wrong baud rate yields no valid marks rather than "
+                            "an error.")}
+            if marks is None:
+                return {"error": "The serial mark stream was not recorded, so "
+                                 "the capture cannot be gated on a mark. "
+                                 "Something else has claimed D0 -- "
+                                 "p1150_get_aux shows what."}
+            decoded = analysis.decode_marks(marks[0], marks[1], int(i.size))
+            mask = np.zeros(int(i.size), dtype=bool)
+            visits = 0
+            for r in decoded["regions"]:
+                if r["symbol"] == symbol:
+                    mask[r["start"]:r["end"]] = True
+                    visits += 1
+            kept = int(mask.sum())
+            if not kept:
+                return {"error": f"The target left the '{name}' region before "
+                                 f"any of it could be recorded."}
+            gate = {"gated_on": f"mark '{symbol}'", "mark": symbol,
+                    "waited_s": round(waited, 2),
+                    "kept_s": round(kept / SAMPLE_RATE, 4),
+                    "discarded_s": round((mask.size - kept) / SAMPLE_RATE, 4),
+                    "visits": visits}
+            keep = np.flatnonzero(mask)
+            i, isnk = i[mask], (isnk[mask] if isnk is not None else None)
+            aux = {k: v[mask] for k, v in aux.items()}
+            # The marks have to be re-indexed onto the samples that survived,
+            # or a mark nested inside this region would point at whatever
+            # sample now happens to sit at its old offset.  Bytes outside the
+            # region go with the samples they described.
+            m_idx, m_val = marks
+            inside = mask[np.clip(m_idx, 0, mask.size - 1)]
+            marks = (np.searchsorted(keep, m_idx[inside]), m_val[inside])
+        elif code is None:
+            i, isnk, aux, marks = SESSION.measure(duration_s)
         else:
             # The target says when it is in the state, so wait for it to say so
             # and then keep only what it vouches for.  Both halves matter: the
@@ -1786,7 +2253,7 @@ def p1150_measure_state(state: str, duration_s: float = 30.0,
                     seen.add(c)
 
             try:
-                i, isnk, aux, waited = SESSION.measure_when(
+                i, isnk, aux, marks, waited = SESSION.measure_when(
                     duration_s, _match, wait_s, on_reject=_note)
             except Exception as e:
                 names = {int(c): n for n, c in signal["codes"].items()}
@@ -1825,7 +2292,7 @@ def p1150_measure_state(state: str, duration_s: float = 30.0,
                      dict({"capture_type": "state_baseline",
                            "state": name,
                            "baseline_verdict": check.get("verdict")}, **gate),
-                     isnk_ma=isnk, aux=aux)
+                     isnk_ma=isnk, aux=aux, marks=marks)
         if "error" in out:
             return out
         out["baseline"] = check
@@ -1865,11 +2332,13 @@ def p1150_measure_states(duration_s: float = 60.0,
     """Measure every state at once, from one capture of the target doing its
     real work.
 
-    Requires the target to signal its own state (p1150_set_state_signal). Let it
-    run normally for long enough to pass through everything it does, and this
-    splits the capture by the code the firmware was driving: a current, a
-    charge, a peak and a time for each state, from a single measurement, with no
-    one having to put the target into anything.
+    Requires the target to declare its own state, either by a serial mark
+    (p1150_set_state_mark) or by a pin code (p1150_set_state_signal); it uses
+    whichever the project has. Let it run normally for long enough to pass
+    through everything it does, and this splits the capture by what the
+    firmware said it was doing: a current, a charge, a peak, a time and a share
+    of the battery for each state, from a single measurement, with no one
+    having to put the target into anything.
 
     This is the fastest route to a battery-life estimate that exists here, and
     it is more accurate than measuring the states one at a time -- every state
@@ -1897,41 +2366,70 @@ def p1150_measure_states(duration_s: float = 60.0,
         cost silently disappears from the estimate.
     """
     try:
-        signal = config.get_state_signal()
-        if not signal.get("channels"):
+        how = _state_mechanism()
+        if how is None:
             return {"error":
-                    "No state signal is declared, so a capture cannot be split "
-                    "by state. This needs about fifteen lines in the target's "
-                    "firmware to drive a code on two spare GPIOs -- "
-                    "p1150_state_signal_guide has them. Without it, measure the "
-                    "states one at a time with p1150_measure_state, asking the "
-                    "developer to put the target into each."}
-        i, isnk, aux = SESSION.measure(duration_s)
-        codes, names = _state_codes(aux, None)
-        r = analysis.state_breakdown(i, codes, names, SAMPLE_RATE,
-                                     config.capacity_mah())
+                    "The target does not declare its state, so a capture "
+                    "cannot be split by state. Two ways to fix that, both a "
+                    "firmware change of about fifteen lines: a character "
+                    "written to a UART at each state boundary "
+                    "(p1150_state_mark_guide -- thirty states, and they nest), "
+                    "or a 2-bit code on two spare GPIOs "
+                    "(p1150_state_signal_guide -- four states, no UART "
+                    "needed). Without either, measure the states one at a time "
+                    "with p1150_measure_state, asking the developer to put the "
+                    "target into each."}
+        i, isnk, aux, marks = SESSION.measure(duration_s)
 
         key = "settled_mean_ma" if exclude_entry_transient else "mean_ma"
         currents, times = {}, {}
-        for row in r["states"]:
-            if not row["state"]:
-                continue
-            currents[row["state"]] = row.get(key) or row["mean_ma"]
-            times[row["state"]] = row["time_pct"]
+        if how == "marks":
+            if marks is None:
+                return {"error": "The serial mark stream was not recorded for "
+                                 "this capture -- something else has claimed "
+                                 "D0. p1150_get_aux shows what."}
+            r = _mark_split(i, marks, None, SAMPLE_RATE)
+            rows = r.get("marks") or []
+            for row in rows:
+                if not row["state"]:
+                    continue
+                currents[row["state"]] = row.get(key) or row["mean_ma"]
+                times[row["state"]] = row["time_pct"]
+        else:
+            codes, names = _state_codes(aux, None)
+            r = analysis.state_breakdown(i, codes, names, SAMPLE_RATE,
+                                         config.capacity_mah())
+            rows = r["states"]
+            for row in rows:
+                if not row["state"]:
+                    continue
+                currents[row["state"]] = row.get(key) or row["mean_ma"]
+                times[row["state"]] = row["time_pct"]
 
         out = _store(label, i,
                      {"capture_type": "state_sweep",
                       "state_currents": currents,
                       "state_times_pct": times,
-                      "state_current_basis": key},
-                     isnk_ma=isnk, aux=aux)
+                      "state_current_basis": key,
+                      "state_source": how},
+                     isnk_ma=isnk, aux=aux, marks=marks)
         if "error" in out:
             return out
-        out["states"] = r["states"]
-        out["transitions"] = r["transitions"]
-        for k in ("unmapped_codes", "unmapped_note", "dominant_state"):
+        out["split_by"] = how
+        out["states"] = rows
+        for k in ("transitions", "unmapped_codes", "unmapped_note",
+                  "dominant_state", "unmarked", "unmarked_warning",
+                  "unmapped_symbols", "open_at_start_note", "open_at_end_note",
+                  "crossed_note", "unknown_note", "max_nesting_depth"):
             if r.get(k):
                 out[k] = r[k]
+        if out.get("max_nesting_depth", 0) > 1:
+            out["nesting_note"] = (
+                "Some regions were marked inside others. Only the outermost "
+                "ones are states of the product; the nested ones are features "
+                "running within a state and are already counted inside it. "
+                "Declaring both as usage states would charge their current "
+                "twice.")
 
         declared = set(config.get_usage()["states"])
         seen = {s.lower() for s in currents}
@@ -1964,26 +2462,55 @@ def p1150_measure_states(duration_s: float = 60.0,
 def p1150_state_split(run_id: str, exclude_entry_transient: bool = False) -> dict:
     """Split any stored capture by the state the target said it was in.
 
-    Works on any run taken while a state signal was declared -- including an
-    ordinary p1150_measure or a background capture, which record the code
-    alongside the current whether or not anyone was thinking about states at the
-    time. A capture taken to look at something else will often answer "and what
-    does it draw in each mode" for free.
+    Works on any run taken while the target was declaring its state, by serial
+    mark or by pin code -- including an ordinary p1150_measure or a background
+    capture, which record it alongside the current whether or not anyone was
+    thinking about states at the time. A capture taken to look at something
+    else will often answer "and what does it draw in each mode" for free. The
+    serial stream is recorded even before any mark is named, so a run taken
+    before the states were declared still splits afterwards.
 
     Reports per state: time held, share of the capture, mean and settled mean
-    current, peak, floor, charge, how many times it was visited, and how much
-    the entry transient lifts the average. Plus the number of transitions and
-    any code the firmware drove that no state is declared for.
+    current, peak, floor, charge, how many times it was visited, how much the
+    entry transient lifts the average, and charge_share_pct -- the share of the
+    battery this capture spent in that state, which is the column the question
+    "where is the power going" is actually asking about, and the one
+    p1150_battery_pie draws.
+
+    Reads whichever mechanism the run carries. For serial marks
+    (p1150_state_mark_guide) that also means regions marked INSIDE other
+    regions: each is reported both inclusively (everything between its opening
+    and closing byte) and exclusively (less whatever was nested inside it),
+    plus an unmarked remainder for the time no region claimed. Only the
+    exclusive figures and the remainder add up to the capture -- summing the
+    inclusive ones counts nested work twice.
     """
     try:
         i, _, aux, meta = storage.load_all(run_id)
-        codes, names = _state_codes(aux, meta)
-        out = analysis.state_breakdown(i, codes, names, _fs(meta),
-                                       config.capacity_mah())
+        marks = _run_marks(run_id, meta)
+        if _splits_by_marks(meta, marks):
+            out = _mark_split(i, marks, meta, _fs(meta))
+            out["split_by"] = "state_marks"
+        elif _state_mechanism(meta) == "marks":
+            return {"error":
+                    f"Run '{run_id}' carries the mark scheme but no marks: the "
+                    f"target sent nothing during it. A mark is an edge, so a "
+                    f"region entered before the capture and not left during it "
+                    f"produces no bytes -- capture across a full cycle of what "
+                    f"the target does. p1150_state_check confirms the stream "
+                    f"is alive at all."}
+        else:
+            codes, names = _state_codes(aux, meta)
+            out = analysis.state_breakdown(i, codes, names, _fs(meta),
+                                           config.capacity_mah())
+            out["split_by"] = "state_signal"
         out["run_id"] = run_id
         out["label"] = meta.get("label")
         if exclude_entry_transient:
             out["current_basis"] = "settled_mean_ma"
+        out["pie_hint"] = (
+            f"p1150_battery_pie('{run_id}') draws this as a share-of-charge "
+            f"pie, which is the form a developer reads fastest.")
         return out
     except Exception as e:
         return _fail(e)
@@ -2018,12 +2545,29 @@ def p1150_usage_from_capture(run_id: str, adopt: bool = False) -> dict:
     """
     try:
         i, _, aux, meta = storage.load_all(run_id)
-        codes, names = _state_codes(aux, meta)
-        r = analysis.state_breakdown(i, codes, names, _fs(meta))
-        rows = [s for s in r["states"] if s["state"]]
-        if not rows:
-            return {"error": f"Run '{run_id}' contains no named states. "
-                             f"Codes seen: {r.get('codes_seen')}."}
+        marks = _run_marks(run_id, meta)
+        nested = []
+        if _splits_by_marks(meta, marks):
+            r = _mark_split(i, marks, meta, _fs(meta))
+            # Only the outermost regions are states of the product. One marked
+            # inside another is a feature running WITHIN a state, its time is
+            # already inside its parent's, and adopting both as fractions would
+            # spend the same seconds twice.
+            rows = [s for s in (r.get("marks") or [])
+                    if s["state"] and not s.get("nested_inside")]
+            nested = [s["state"] for s in (r.get("marks") or [])
+                      if s["state"] and s.get("nested_inside")]
+            if not rows:
+                return {"error": f"Run '{run_id}' contains no named top-level "
+                                 f"regions. Marks seen: "
+                                 f"{r.get('unmapped_symbols') or 'none'}."}
+        else:
+            codes, names = _state_codes(aux, meta)
+            r = analysis.state_breakdown(i, codes, names, _fs(meta))
+            rows = [s for s in r["states"] if s["state"]]
+            if not rows:
+                return {"error": f"Run '{run_id}' contains no named states. "
+                                 f"Codes seen: {r.get('codes_seen')}."}
         measured = {s["state"]: s["time_pct"] for s in rows}
         out = {"run_id": run_id, "duration_s": r["duration_s"],
                "measured_fractions_pct": measured,
@@ -2032,6 +2576,15 @@ def p1150_usage_from_capture(run_id: str, adopt: bool = False) -> dict:
                "adopted": False}
         if r.get("unmapped_codes"):
             out["unmapped_codes"] = r["unmapped_codes"]
+        if r.get("unmapped_symbols"):
+            out["unmapped_symbols"] = r["unmapped_symbols"]
+        if nested:
+            out["nested_regions_excluded"] = nested
+            out["nested_note"] = (
+                f"{', '.join(nested)} were marked inside another region, so "
+                f"they are features running within a state rather than states "
+                f"of the product. Their time is already counted in the region "
+                f"enclosing them and they are left out of the fractions.")
         if not adopt:
             out["caveat"] = (
                 "These are the fractions the target actually spent during this "
@@ -2106,9 +2659,9 @@ def p1150_capture_stop() -> dict:
     a baseline, or to p1150_segment / p1150_events to see where the energy went.
     """
     try:
-        label, i, isnk, aux = SESSION.capture_stop_raw()
+        label, i, isnk, aux, marks = SESSION.capture_stop_raw()
         return _store(label, i, {"capture_type": "background"},
-                      isnk_ma=isnk, aux=aux)
+                      isnk_ma=isnk, aux=aux, marks=marks)
     except Exception as e:
         return _fail(e)
 
@@ -2148,11 +2701,11 @@ def p1150_verify_charging(duration_s: float = 10.0,
     intermittency is visible.
     """
     try:
-        i, isnk, aux = SESSION.measure(duration_s)
+        i, isnk, aux, marks = SESSION.measure(duration_s)
         battery = config.capacity_mah()
         out = analysis.charge_test(i, isnk, SAMPLE_RATE, battery)
         stored = _store(label, i, {"capture_type": "charge_test"},
-                        isnk_ma=isnk, aux=aux)
+                        isnk_ma=isnk, aux=aux, marks=marks)
         out["run_id"] = stored.get("run_id")
         out["label"] = label
         # A sink over-current trip is latched on the device, not visible in the
@@ -2241,14 +2794,14 @@ def p1150_capture_single(label: str, timebase: str = "TBASE_SPAN_100MS",
         TRIG_SLOPE_FALL on an active-low one.
     """
     try:
-        i, isnk, aux, fs = SESSION.capture_single(
+        i, isnk, aux, marks, fs = SESSION.capture_single(
             timebase, trigger_ma, position, slope, timeout_s,
             trigger_on, trigger_level)
         return _store(label, i, {"capture_type": "single",
                                  "timebase": timebase,
                                  "trigger_ma": trigger_ma,
                                  "trigger_on": trigger_on},
-                      isnk_ma=isnk, aux=aux, fs=fs)
+                      isnk_ma=isnk, aux=aux, fs=fs, marks=marks)
     except Exception as e:
         return _fail(e)
 
@@ -2351,10 +2904,10 @@ def p1150_inrush_test(label: str = "inrush", voltage_mv: int = None,
                              "(confirm it with the developer first -- it goes "
                              "directly to the target's battery terminals), or "
                              "call p1150_power_on first."}
-        i, isnk, aux, fs, info = SESSION.inrush_capture(
+        i, isnk, aux, marks, fs, info = SESSION.inrush_capture(
             v, ovc_ma, timebase, trigger_ma)
         stored = _store(label, i, dict(info, capture_type="inrush"),
-                        isnk_ma=isnk, aux=aux, fs=fs)
+                        isnk_ma=isnk, aux=aux, fs=fs, marks=marks)
         if "error" in stored:
             return stored
 
@@ -2592,7 +3145,15 @@ def p1150_battery_life(target_days: float = None) -> dict:
     reach that with 15-25% of the rated charge left in the cell. Where the
     number has to be defensible rather than indicative, quote it again with 20%
     off the capacity and give the range.
+
+    p1150_battery_pie draws the contributor ranking as a share-of-battery pie,
+    which is the same information in the form a developer reads fastest.
     """
+    return _battery_life_report(target_days)
+
+
+def _battery_life_report(target_days: float = None) -> dict:
+    """The estimate itself, so the chart and the tool cannot disagree."""
     try:
         usage = config.get_usage()
         if not usage["states"] and not usage["events"]:
@@ -2983,11 +3544,14 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
     default because a battery profile spans microamps to milliamps, and a linear
     axis flattens the sleep floor into the baseline.
 
-    show_marker shades the regions where the target's marker GPIO was asserted,
-    when the run has an auxiliary channel recorded. Seeing the current alongside
-    the code region that produced it is usually what settles an ambiguous
-    result: it shows immediately whether the cost sits inside the marked work or
-    just outside it, which the numbers alone cannot.
+    show_marker shades the regions the target itself declared: where its marker
+    GPIO was asserted, or -- for a run carrying serial marks
+    (p1150_state_mark_guide) -- one colour per marked region, with a legend
+    naming them. Seeing the current alongside the code region that produced it
+    is usually what settles an ambiguous result: it shows immediately whether
+    the cost sits inside the marked work or just outside it, which the numbers
+    alone cannot. Nested regions are not shaded separately; they sit inside
+    their parent's band, and p1150_state_split separates their cost.
 
     With bandwidth_hz the plot gets both traces: the raw envelope in grey behind
     the averaged line. That is the useful picture on a switching target -- the
@@ -3037,7 +3601,7 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
 
         plt.figure(figsize=(11, 4.5))
 
-        marked = None
+        marked, legend_extra = None, []
         if show_marker and aux:
             try:
                 ch, cfg, asserted = _resolve_marker(aux, None, meta)
@@ -3056,6 +3620,50 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
                               "shaded": 0,
                               "note": f"{starts.size} assertions is too many to "
                                       f"shade legibly; left unmarked."}
+            except Exception:
+                pass
+
+        # Serial marks shade the same way, one colour per region, when there is
+        # no GPIO marker already shading the axis.  Only the outermost regions
+        # are drawn: a nested one sits inside its parent's band and shading
+        # both would read as a darker stripe rather than as two regions.
+        mark_bands = None
+        if show_marker and not (marked and marked.get("shaded")):
+            try:
+                from matplotlib.patches import Patch
+                mk = _run_marks(run_id, meta)
+                if mk is not None and len(mk[0]):
+                    dec = analysis.decode_marks(mk[0], mk[1], int(i.size))
+                    top = [r for r in dec["regions"] if r["parent"] is None]
+                    order = dec["symbols_seen"]
+                    if 0 < len(top) <= 400:
+                        names = _mark_names(meta)
+                        # Named exactly as p1150_battery_pie names them, and
+                        # coloured off the same ordering, so a state is the
+                        # same colour in the chart and in the trace it came
+                        # from.
+                        def _label(sym):
+                            return names.get(sym) or f"mark {sym}"
+
+                        shown = [s for s in order
+                                 if any(r["symbol"] == s for r in top)]
+                        hues = _colour_order(_label(s) for s in shown)
+                        for r in top:
+                            plt.axvspan(
+                                r["start"] / fs, r["end"] / fs, linewidth=0,
+                                alpha=0.16,
+                                color=_slice_colour(_label(r["symbol"]), hues))
+                        legend_extra = [
+                            Patch(alpha=0.4, label=_label(s),
+                                  facecolor=_slice_colour(_label(s), hues))
+                            for s in shown]
+                        mark_bands = {"shaded": len(top),
+                                      "regions": [_label(s) for s in shown]}
+                    elif top:
+                        mark_bands = {"shaded": 0,
+                                      "note": f"{len(top)} marked regions is "
+                                              f"too many to shade legibly; "
+                                              f"left unshaded."}
             except Exception:
                 pass
 
@@ -3081,7 +3689,12 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
         if filt:
             plt.plot(filt[0], filt[1], linewidth=1.0, color="#1f5fa8",
                      label=f"averaged to {band['effective_hz']:g} Hz")
-            plt.legend(loc="best", fontsize=8, framealpha=0.85)
+        # One legend for both, or the shaded regions are colours with nothing
+        # saying what they are.
+        handles = plt.gca().get_legend_handles_labels()[0] + legend_extra
+        if handles:
+            plt.legend(handles=handles, loc="best", fontsize=8,
+                       framealpha=0.85)
         if log_scale:
             plt.yscale("log")
         plt.xlabel("Time (s)")
@@ -3104,9 +3717,264 @@ def p1150_plot(run_id: str, path: str = None, log_scale: bool = True,
         res = {"run_id": run_id, "path": out}
         if marked:
             res["marker"] = marked
+        if mark_bands:
+            res["marks"] = mark_bands
         if band:
             res["bandwidth"] = band
         return res
+    except Exception as e:
+        return _fail(e)
+
+
+# ------------------------------------------------------------------ #
+# Where the battery goes                                               #
+# ------------------------------------------------------------------ #
+# Hues taken as a set, in this order, from a categorical palette validated for
+# separation under colour-vision deficiency.  Picking them out of order, or
+# generating a seventh, breaks the property they were chosen for -- so a
+# seventh contributor folds into one grey "other" slice instead.
+#
+# Six is also about as many slices as a pie can be read at, which is the other
+# reason for the fold.  Every slice is directly labelled with its name and
+# share for the same reason: a reader who cannot separate two hues can still
+# read the chart, and comparing two similar slices by eye -- the thing a pie is
+# worst at -- becomes reading two numbers.
+PIE_COLOURS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300")
+PIE_OTHER_COLOUR = "#8c8c88"
+PIE_MAX_SLICES = 6
+PIE_MIN_SLICE_PCT = 1.0
+
+
+def _colour_order(names) -> list:
+    """The stable ordering hues are handed out in: the contributor names,
+    alphabetically.
+
+    Alphabetical and not by size, because a colour has to follow the state
+    rather than its rank.  Sleep current halving must not repaint the chart, and
+    the same state must be the same colour in the pie and in the shaded plot of
+    the capture behind it -- which it cannot be if either orders by value.
+    """
+    return sorted({n for n in names
+                   if n and n != "unmarked" and not n.startswith("other (")})
+
+
+def _slice_colour(name: str, order: list) -> str:
+    """The hue for one contributor.  Grey for the two that are not entities:
+    the fold, and the time no region claimed."""
+    if name in order:
+        return PIE_COLOURS[order.index(name) % len(PIE_COLOURS)]
+    return PIE_OTHER_COLOUR
+
+
+def _pie_slices(items: list) -> list:
+    """[(name, share)] -> the slices to draw, largest first, tail folded.
+
+    Shares, not charges.  A pie is a chart of proportions and the proportions
+    are already computed at full precision upstream; the charge figures beside
+    them are rounded for reading, and a state drawing microamps is a few
+    nanoamp-hours, which rounds to nothing.  Feeding this the charges dropped
+    exactly the sleep states the chart exists to size -- found on the bench,
+    where a whole capture came back as "every contributor is zero".
+
+    A slice under a percent is invisible and its label collides with its
+    neighbour's, so it goes into the fold rather than being drawn as a line.
+    """
+    items = [(n, float(v)) for n, v in items if v and float(v) > 0]
+    items.sort(key=lambda kv: kv[1], reverse=True)
+    total = sum(v for _, v in items)
+    if total <= 0:
+        return []
+    limit = PIE_MAX_SLICES if len(items) <= PIE_MAX_SLICES \
+        else PIE_MAX_SLICES - 1
+    keep, fold = [], []
+    for name, v in items:
+        if len(keep) < limit and 100.0 * v / total >= PIE_MIN_SLICE_PCT:
+            keep.append((name, v))
+        else:
+            fold.append((name, v))
+    if len(fold) == 1:
+        # One folded contributor is still worth naming: it is drawn the same
+        # size either way, and "other (1)" tells the reader strictly less.
+        keep.append(fold[0])
+    elif fold:
+        keep.append((f"other ({len(fold)})", sum(v for _, v in fold)))
+    return keep
+
+
+@mcp.tool()
+def p1150_battery_pie(run_id: str = None, path: str = None,
+                      title: str = None) -> dict:
+    """Draw where the battery actually goes, as a pie of shares, and return the
+    file path and the numbers behind it.
+
+    This is the picture a developer wants out of a battery-current project:
+    which state or feature is spending the battery, and how much of it. "Standby
+    is 71% of the battery" is a sentence that redirects a week of work, and it
+    is not one any single current reading contains.
+
+    TWO DIFFERENT QUESTIONS, AND THE ARGUMENT CHOOSES BETWEEN THEM:
+
+      run_id omitted -- share of the battery over the PRODUCT'S LIFE, from
+          p1150_battery_life: each state's measured current weighted by the
+          share of time the developer says it occupies, plus the events
+          amortised over the day. This is the one to show someone. It needs the
+          usage model, and it is the only version in which "standby is 71% of
+          the battery" is a statement about the product rather than about a
+          minute on a bench.
+
+      run_id given -- share of the charge WITHIN THAT ONE CAPTURE, split by the
+          state or region the target declared it was in (p1150_state_split).
+          Faster, needs no usage model, and correct only as far as the capture
+          is representative -- a minute in which the target happened never to
+          transmit shows no transmit slice.
+
+    For a capture split by serial marks the slices are the EXCLUSIVE shares:
+    a region marked inside another is charged to itself and taken out of its
+    parent, and the remainder no region claimed is drawn as "unmarked". That
+    remainder is worth looking at before anything else -- it is the share of
+    the battery the instrumentation does not yet explain.
+
+    Slices are ordered largest first and each is labelled with its own share,
+    so two similar slices are compared by reading two numbers rather than by
+    eye. Past six contributors the tail is folded into one "other" slice; the
+    full ranking is in the returned data either way, and in
+    p1150_battery_life's contributors.
+
+    path: where to write the PNG. Defaults to the runs directory.
+
+    title: replaces the heading. The default already states the capacity, the
+        average current and the projected life, so set this only when the chart
+        is going somewhere those do not belong.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        if run_id:
+            i, _, aux, meta = storage.load_all(run_id)
+            fs = _fs(meta)
+            marks = _run_marks(run_id, meta)
+            # charge_share_pct throughout, never the charge beside it: see
+            # _pie_slices.  absolute keeps the mAh for the returned data, where
+            # rounding is only a display matter.
+            absolute = {}
+            if _splits_by_marks(meta, marks):
+                r = _mark_split(i, marks, meta, fs)
+                rows = []
+                for m in r["marks"]:
+                    name = m["state"] or f"mark {m['symbol']}"
+                    rows.append((name, m.get("charge_share_pct")))
+                    absolute[name] = m["exclusive_charge_mah"]
+                un = r.get("unmarked") or {}
+                if un.get("charge_share_pct"):
+                    rows.append(("unmarked", un["charge_share_pct"]))
+                    absolute["unmarked"] = un["exclusive_charge_mah"]
+                basis = "state marks"
+            else:
+                codes, names = _state_codes(aux, meta)
+                r = analysis.state_breakdown(i, codes, names, fs,
+                                             config.capacity_mah())
+                rows = []
+                for s in r["states"]:
+                    name = s["state"] or f"code {s['code']}"
+                    rows.append((name, s.get("charge_share_pct")))
+                    absolute[name] = s["charge_mah"]
+                basis = "state signal"
+            unit, total = "mAh", r.get("charge_mah")
+            head = (f"{meta.get('label') or run_id}  --  "
+                    f"{r.get('duration_s'):g} s, {total:.4g} mAh")
+            sub = f"share of the charge drawn in this capture, by {basis}"
+            report = {"run_id": run_id, "basis": basis,
+                      "total_charge_mah": total}
+        else:
+            r = _battery_life_report()
+            if "error" in r:
+                return dict(r, hint=(
+                    "A share-of-the-battery pie over the product's life needs "
+                    "the usage model as well as the measurements. Either "
+                    "supply what is missing above, or pass a run_id to draw "
+                    "the split within one capture instead -- that needs only "
+                    "the capture."))
+            rows = [(c["name"], c["contribution_pct"])
+                    for c in r.get("contributors") or []]
+            absolute = {c["name"]: c["contribution_ma"]
+                        for c in r.get("contributors") or []}
+            unit, total = "mA", r.get("average_ma")
+            days = r.get("projected_days")
+            head = "Where the battery goes"
+            if r.get("battery_mah") and days:
+                head += (f"  --  {r['battery_mah']:g} mAh, "
+                         f"{total:.3g} mA average, {days:g} days")
+            else:
+                head += f"  --  {total:.3g} mA average"
+            sub = ("share of the battery over the product's life: measured "
+                   "current x declared share of the time")
+            report = {"basis": "battery_life", "average_ma": total,
+                      "projected_days": days}
+
+        slices = _pie_slices(rows)
+        if not slices:
+            return {"error": "Nothing to draw: every contributor is zero. "
+                             + (f"Either the capture has no marked or coded "
+                                f"regions, or it drew no measurable current at "
+                                f"all -- its total is {total} mAh, which is a "
+                                f"probe that was not connected or a target "
+                                f"that was not powered."
+                                if run_id else
+                                "No state has a measured current yet.")}
+        total_v = sum(v for _, v in slices)
+        # Hues assigned from the FULL contributor list, not from the slices, so
+        # that folding the tail does not shift the colours of what survives.
+        order = _colour_order(n for n, _ in rows)
+        colours = [_slice_colour(n, order) for n, _ in slices]
+        labels = [f"{n}\n{100.0 * v / total_v:.1f}%" for n, v in slices]
+
+        fig, ax = plt.subplots(figsize=(8.0, 5.4))
+        # Clockwise from twelve o'clock, so the largest share starts where a
+        # reader's eye already is, and a two-pie comparison lines up.
+        ax.pie([v for _, v in slices], labels=labels, colors=colours,
+               startangle=90, counterclock=False, labeldistance=1.07,
+               # A hairline of the surface between wedges, so two adjacent
+               # fills read as two shapes rather than as one band.
+               wedgeprops={"linewidth": 2.0, "edgecolor": "white"},
+               # Labels wear text colour, never the wedge's: the wedge beside
+               # them already carries the identity.
+               textprops={"fontsize": 9, "color": "#2b2b2b"})
+        ax.set_aspect("equal")
+        ax.set_title(title or head, fontsize=11, color="#111111")
+        fig.text(0.5, 0.03, sub, ha="center", fontsize=8, color="#6a6a66")
+        fig.tight_layout(rect=(0, 0.05, 1, 1))
+
+        out = path or os.path.join(
+            storage.runs_dir(),
+            (run_id + "_battery_pie" if run_id else "battery_pie") + ".png")
+        fig.savefig(out, dpi=110)
+        plt.close(fig)
+
+        report["path"] = out
+        report["unit"] = unit
+        report["slices"] = [
+            dict({"name": n, "share_pct": round(100.0 * v / total_v, 2)},
+                 **({"value": absolute[n]} if n in absolute else {}))
+            for n, v in slices]
+        if len(rows) > len(slices):
+            report["folded"] = len(rows) - len(slices) + 1
+            report["folded_note"] = (
+                f"{report['folded']} contributors under "
+                f"{PIE_MIN_SLICE_PCT:g}%, or past the sixth, are drawn as one "
+                f"'other' slice. The full ranking is in "
+                + ("p1150_state_split." if run_id else
+                   "p1150_battery_life's contributors."))
+        if not run_id and r.get("warnings"):
+            report["warnings"] = r["warnings"]
+        if run_id:
+            report["caveat"] = (
+                "These are shares of ONE capture, so they describe the "
+                "battery only as far as that capture is representative of how "
+                "the product runs. For the share over the product's life, "
+                "declare the usage model and call this again without a run_id.")
+        return report
     except Exception as e:
         return _fail(e)
 

@@ -45,9 +45,19 @@ def runs_dir() -> str:
 
 _AUX_PREFIX = "aux_"
 
+# The serial mark stream, stored as two members rather than one per-sample
+# channel.  A mark is an event, not a level: what the capture holds is a byte
+# and the sample it arrived at, and there are hundreds of those where there are
+# tens of millions of samples.  Kept outside the aux prefix so load_all() does
+# not hand them back as if they were a channel, and named so they can be read
+# on their own -- see load_marks().
+_MARK_IDX = "d0s_idx"
+_MARK_CHR = "d0s_chr"
+
 
 def save(label: str, i_ma: np.ndarray, meta: dict,
-         isnk_ma: np.ndarray = None, aux: dict = None) -> str:
+         isnk_ma: np.ndarray = None, aux: dict = None,
+         marks: tuple = None) -> str:
     """Store a capture, returning its run_id."""
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_id = f"{stamp}_{_slug(label)}"
@@ -66,6 +76,15 @@ def save(label: str, i_ma: np.ndarray, meta: dict,
     for name, arr in (aux or {}).items():
         if arr is not None:
             arrays[_AUX_PREFIX + name] = arr.astype(np.float32, copy=False)
+    # Stored raw for the same reason the aux channels are: which state a symbol
+    # stands for is a decision the developer may revise, and the bytes are what
+    # the target actually said.  int64 and not float32 -- a sample index in a
+    # long capture passes the point where a float32 can represent consecutive
+    # integers, and a mark landing on the wrong sample is silent.
+    if marks is not None:
+        idx, val = marks
+        arrays[_MARK_IDX] = np.asarray(idx, dtype=np.int64)
+        arrays[_MARK_CHR] = np.asarray(val, dtype=np.uint8)
     # Uncompressed: a several-minute capture is hundreds of MB of noisy float32
     # that barely compresses, and savez_compressed would stall the tool call
     # for many seconds to save little disk.
@@ -164,6 +183,26 @@ def load_all(run_id: str):
         aux = {f[len(_AUX_PREFIX):]: z[f]
                for f in z.files if f.startswith(_AUX_PREFIX)}
         return z["i"], isnk, aux, meta
+
+
+def load_marks(run_id: str):
+    """(sample index, byte) for a run's serial marks, or None if it has none.
+
+    Separate from load_all() because it is the one part of a capture that can
+    be had without the capture.  An npz is a zip of independently stored
+    members, so this reads the few kilobytes the marks occupy and never touches
+    the hundreds of megabytes of samples beside them -- which is what lets a
+    listing say which states a run contains, or a breakdown reject a run before
+    reading it.
+    """
+    path = os.path.join(runs_dir(), run_id + ".npz")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"No run '{run_id}'. Use p1150_list_runs to see stored runs.")
+    with np.load(path) as z:
+        if _MARK_IDX not in z.files:
+            return None
+        return z[_MARK_IDX], z[_MARK_CHR]
 
 
 # ------------------------------------------------------------------ #

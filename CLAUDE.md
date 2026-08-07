@@ -25,9 +25,9 @@ demo scripts while the MCP server holds the device.
 
 ## Read the guide tools before measuring
 
-`p1150_measurement_guide`, `p1150_battery_life_guide`, `p1150_state_signal_guide`,
-`p1150_inrush_guide` and `p1150_marker_guide` are written for you rather than for
-the user.  They carry
+`p1150_measurement_guide`, `p1150_battery_life_guide`, `p1150_state_mark_guide`,
+`p1150_state_signal_guide`, `p1150_inrush_guide` and `p1150_marker_guide` are
+written for you rather than for the user.  They carry
 the method — window lengths, what a sleep measurement actually requires, how to
 judge a voltage sag — none of which is derivable from the tool signatures.
 Getting it wrong produces a capture that looks fine and means nothing: a 100 ms
@@ -50,12 +50,32 @@ predicted from a minute — `p1150_battery_life_guide` has the method.  No singl
 capture is a battery life, and the per-capture
 `projected_days_if_continuous` is named for its assumption for that reason.
 
-When you are also writing the target's firmware, add the state signal
-(`p1150_state_signal_guide`): about fifteen lines driving a 2-bit code on two
-spare GPIOs into D0/D1.  It turns "the target was in standby while this was
-measured" from something a person asserts into a fact recorded beside the
-current, and one capture then yields every state's current at once.  Raise it
-before spending a session staging baselines by hand.
+When you are also writing the target's firmware, have it declare its own state.
+It turns "the target was in standby while this was measured" from something a
+person asserts into a fact recorded beside the current, and one capture then
+yields every state's current at once.  Raise it before spending a session
+staging baselines by hand.  Two mechanisms, and the choice is whether the MCU
+has a UART to spare:
+
+* `p1150_state_mark_guide` — one character written to a UART wired to D0, at
+  **460800 baud and no other rate**, upper case entering a region and lower case
+  leaving it.  Prefer this one.  Thirty regions rather than four, and they nest,
+  so what a feature costs can be separated from the state it ran inside.
+* `p1150_state_signal_guide` — a 2-bit code on two spare GPIOs into D0/D1, for a
+  target with no UART free or whose deepest sleep gates the UART's clock off.
+
+D0 carries one or the other, never both — it is decoded as a serial stream and
+sampled as a level from the same input, and `config.py` refuses every
+combination that would put a logic signal and the marks on that pin together.
+
+The serial stream is recorded in every capture whenever D0 is free, even before
+any mark is named: it is stored as (sample index, byte) pairs, so it costs
+kilobytes where a level channel costs a megabyte a second, and a run taken
+before the states were declared still splits afterwards.
+
+`p1150_battery_pie` is what turns any of this into the sentence a developer
+acts on — "standby is 71% of the battery".  Prefer it to reciting contributor
+figures.
 
 ## Captures are large
 

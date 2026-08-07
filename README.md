@@ -312,12 +312,64 @@ measurements: a target still descending into a low-power state — they step dow
 over minutes, so a standby figure taken right after boot can read several times
 high — and a capture too short to cover enough of the state's own repetitions.
 
-### Letting the target say which state it is in
+### Letting the target say what it is doing
 
 Every baseline above rests on someone confirming the target was in the right
 mode.  That is the weakest step in the whole measurement, and if the firmware can
-be edited it can be removed entirely: have the target drive a 2-bit code on two
-spare GPIOs into D0 and D1, saying which state it is in.
+be edited it can be removed entirely.  There are two ways, and which one to use
+comes down to whether the MCU has a UART to spare.
+
+#### With a UART: one character per state boundary
+
+The P1150 decodes its D0 input as a **460800 baud** serial receiver as well as
+sampling it as a logic level, and records the byte that arrived at each sample.
+So the target says what it is doing by writing one character — an upper-case
+letter entering a region of code, the matching lower-case letter leaving it.
+
+```c
+// 460800 8N1 on the UART wired to the instrument's D0
+static inline void mark(char c) {
+    while (!(UART->ISR & UART_ISR_TXE)) { }   // ~22 us at 460800
+    UART->TDR = (uint8_t)c;
+}
+
+mark('A');                  // entering "active"
+    mark('B');              //   radio transmitting, nested inside active
+    radio_transmit();
+    mark('b');
+mark('a');
+```
+
+```
+p1150_set_state_mark("active", "A")
+p1150_set_state_mark("radio-tx", "B")
+p1150_state_check()                          # confirms the baud rate and wiring
+p1150_measure_states(60)                     # the device just runs normally
+```
+
+Thirty regions are available — `A`–`Z` plus the bracket pairs `()`, `[]`, `{}`,
+`<>` — against four for the two-pin code, so a feature can have one of its own
+rather than the encoding being rationed to top-level power modes.  And they
+**nest**: `A … B … b … a` records that B ran inside A, so the breakdown charges
+B's energy to B and the remainder to A.  A 2-bit code holds exactly one state at
+a time, so instrumenting a callee there destroys the caller's record.
+
+The baud rate is fixed and is not negotiable — at any other rate the bytes still
+arrive and still decode, into rubbish, which is why `p1150_state_check` exists
+and reports that case by name.  D0 cannot carry a logic signal at the same time,
+so a state-signal bit or a region marker on that pin is refused rather than
+allowed to produce a capture that decodes into plausible nonsense.
+
+`p1150_state_mark_guide` has the rest: where to put a mark, the three failures
+that catch people (a UART clock gated off in sleep, a TX buffer truncated by the
+sleep instruction, a debug log sharing the port), and what nesting means for the
+numbers.
+
+#### Without one: a 2-bit code on two GPIOs
+
+Have the target drive a code on two spare GPIOs into D0 and D1, saying which
+state it is in.  Fewer states and no nesting, but it needs no peripheral — and a
+GPIO level survives a sleep mode that gates a UART's clock off.
 
 ```c
 typedef enum { ST_SLEEP=0, ST_IDLE=1, ST_ACTIVE=2, ST_TX=3 } state_t;
@@ -337,12 +389,35 @@ p1150_state_check()                          # confirms the pins are driven
 p1150_measure_states(60)                     # the device just runs normally
 ```
 
-One capture of the target doing its real work then yields a separate current for
-every state it passed through, with no one staging anything — and more
-accurately than measuring them one at a time, since every state shares a board, a
-session, a supply voltage and a build.  `p1150_measure_state("sleep")` still
-works and now waits until the firmware declares it is in that state, keeping only
-the samples where it says so.
+Either way, one capture of the target doing its real work then yields a separate
+current for every state it passed through, with no one staging anything — and
+more accurately than measuring them one at a time, since every state shares a
+board, a session, a supply voltage and a build.  `p1150_measure_state("sleep")`
+still works and now waits until the firmware declares it is in that state,
+keeping only the samples where it says so.
+
+### Where the battery actually goes
+
+```
+p1150_battery_pie()                  # share of the battery over the product's life
+p1150_battery_pie(run_id="...")      # share of the charge within one capture
+```
+
+"Standby is 71% of the battery" is a sentence that redirects a week of work, and
+it is not one any single current reading contains.  Without a `run_id` the chart
+weights each measured state by the share of time the developer declared for it,
+which is the version that is a statement about the product rather than about a
+minute on a bench; with one it splits a single capture by the state or region the
+target declared it was in, which needs no usage model and is correct only as far
+as that capture is representative.
+
+Slices are ordered largest first and each carries its own share as a label, past
+six contributors the tail folds into one slice, and a state keeps the same colour
+here as in the shaded trace from `p1150_plot`.  For a capture split by serial
+marks the slices are the **exclusive** shares — a region marked inside another is
+charged to itself and taken out of its parent — plus an `unmarked` remainder for
+the time no region claimed, which is the share of the battery the instrumentation
+does not yet explain.
 
 This is aimed squarely at the case where an agent is co-developing the target's
 firmware and driving the instrument in the same conversation: the fifteen lines
@@ -398,13 +473,23 @@ where an agent should begin a session.
 **Battery life** — `p1150_measure_state` (one state's baseline, checked for
 fitness), `p1150_baseline_check` (the same check on any stored run),
 `p1150_battery_life` (the estimate, the ranking of contributors, and the verdict
-against the requirement)
+against the requirement), `p1150_battery_pie` (that ranking as a share of the
+battery, or the split within one capture)
+
+**State marks** — `p1150_set_state_mark`, `p1150_get_state_marks`,
+`p1150_clear_state_marks` — the serial stream on D0, 460800 baud, one character
+per state boundary, thirty regions and they nest
 
 **State signal** — `p1150_set_state_signal`, `p1150_get_state_signal`,
-`p1150_clear_state_signal`, `p1150_state_check` (wiring and firmware
+`p1150_clear_state_signal` — the 2-bit code on D0/D1, for a target with no UART
+to spare
+
+**Either mechanism** — `p1150_state_check` (wiring, baud rate and firmware
 verification), `p1150_measure_states` (every state from one capture),
 `p1150_state_split` (the same breakdown on any stored run),
-`p1150_usage_from_capture`
+`p1150_usage_from_capture`.  Each reads whichever the run in front of it
+actually carries, so a project can migrate from one to the other without its
+stored runs going stale.
 
 **Device** — `p1150_list_devices`, `p1150_connect`, `p1150_disconnect`,
 `p1150_status`, `p1150_clear_error`, `p1150_self_test`
@@ -518,9 +603,9 @@ agent needs: how to choose a voltage and over-current limit, the ten current
 profiles worth knowing and what capture length each needs, and the mistakes that
 produce measurements which look fine but mean nothing.
 `p1150_battery_life_guide` covers the estimation method above,
-`p1150_state_signal_guide` the firmware that makes the target declare its own
-state, `p1150_marker_guide` the GPIO-marker workflow below, and
-`p1150_inrush_guide` the inrush one.
+`p1150_state_mark_guide` and `p1150_state_signal_guide` the two ways to make the
+target declare its own state, `p1150_marker_guide` the GPIO-marker workflow
+below, and `p1150_inrush_guide` the inrush one.
 
 Charge is reported in mAh (µAh for a single wake-up event), matching how battery
 capacity is specified.

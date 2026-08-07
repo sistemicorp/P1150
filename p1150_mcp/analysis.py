@@ -1914,6 +1914,11 @@ def state_breakdown(i_ma: np.ndarray, codes: np.ndarray, names: dict,
     if n == 0:
         return {"error": "capture contains no samples"}
 
+    # Share of the capture's charge, which is the question a breakdown is
+    # actually asked -- "where is the battery going" -- and is not the same as
+    # the share of the time.  A state occupying 1% of the capture at 40 mA
+    # against a 20 uA floor is 95% of the charge, and only this column says so.
+    total_charge = float(i64.sum()) / fs / 3600.0
     settle = max(0, int(settle_ms * 1e-3 * fs))
     min_visit = max(1, int(STATE_MIN_VISIT_MS * 1e-3 * fs))
     rows, unmapped = [], []
@@ -1940,6 +1945,7 @@ def state_breakdown(i_ma: np.ndarray, codes: np.ndarray, names: dict,
             if keep.any():
                 settled = float(i64[keep].mean())
         mean = float(sel.mean())
+        charge = float(sel.sum() / fs / 3600.0)
         row = {
             "code": code,
             "state": name,
@@ -1949,9 +1955,16 @@ def state_breakdown(i_ma: np.ndarray, codes: np.ndarray, names: dict,
             "settled_mean_ma": _f(settled) if settled is not None else None,
             "peak_ma": _f(float(sel.max())),
             "floor_ma": _f(float(np.percentile(sel, 5))),
-            "charge_mah": _f(float(sel.sum() / fs / 3600.0)),
+            "charge_mah": _f(charge),
             "visits": int(starts.size),
         }
+        # From the unrounded charge, not from the displayed one.  charge_mah is
+        # rounded for reading, and a deep-sleep state is microamps for seconds
+        # -- a few nanoamp-hours, which rounds to zero at that precision.  The
+        # share computed from the rounded figure would then be 0% for exactly
+        # the state whose share the whole exercise exists to establish.
+        if total_charge > 0:
+            row["charge_share_pct"] = _f(100.0 * charge / total_charge, 2)
         if starts.size:
             visits_ms = (ends - starts) / fs * 1000.0
             row["mean_visit_ms"] = _f(float(visits_ms.mean()), 3)
@@ -1978,6 +1991,7 @@ def state_breakdown(i_ma: np.ndarray, codes: np.ndarray, names: dict,
 
     out = {
         "duration_s": _f(n / fs, 4),
+        "charge_mah": _f(total_charge),
         "states": rows,
         # Every code change, so the count of transitions the firmware made.
         "transitions": int(np.count_nonzero(np.diff(codes))),
@@ -2012,6 +2026,385 @@ def intervals(asserted: np.ndarray) -> tuple:
 def assertion_count(asserted: np.ndarray) -> int:
     """How many times the marker went from de-asserted to asserted."""
     return int(intervals(asserted)[0].size)
+
+
+# ------------------------------------------------------------------ #
+# State marks: the serial stream on D0                                 #
+# ------------------------------------------------------------------ #
+# The instrument decodes D0 as a 460800 baud serial input as well as sampling
+# it as a logic level, and reports the byte that arrived at each sample.  A
+# target with a spare UART can therefore say what it is doing by writing one
+# character: 'A' on the way into a region of code and 'a' on the way out.
+#
+# It answers the same question as the two-pin state code and answers it better,
+# at the cost of a peripheral the two-pin version does not need:
+#
+#   * Thirty regions rather than four, so a feature can have one of its own
+#     instead of the encoding being rationed to the top-level power modes.
+#   * They NEST.  'A' ... 'B' ... 'b' ... 'a' records that B ran inside A, and
+#     the breakdown can then charge B's energy to B and the remainder to A.  A
+#     2-bit code cannot express that at all -- it has exactly one state at a
+#     time, so instrumenting a callee destroys the caller's record.
+#   * One pin instead of two, which leaves D1 free for a region marker.
+#
+# What it costs the target is a byte time -- 22 us at 460800 -- at each
+# boundary, and a UART whose TX line is otherwise unused.  That is why the baud
+# rate is not negotiable and is high: at 9600 a mark would take a millisecond,
+# which is longer than most of the regions worth measuring.
+#
+# Pairing is by case for the letters and by shape for the brackets.  The
+# brackets are here because a developer instrumenting a call tree reaches for
+# them, and because they read as nesting in the source they are added to.
+D0S_BAUD = 460800
+MARK_ENTER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ([{<"
+MARK_EXIT = "abcdefghijklmnopqrstuvwxyz)]}>"
+MARK_ENTER_OF_EXIT = dict(zip(MARK_EXIT, MARK_ENTER))
+MARK_EXIT_OF_ENTER = dict(zip(MARK_ENTER, MARK_EXIT))
+MARK_ENTER_SET = frozenset(MARK_ENTER)
+MARK_EXIT_SET = frozenset(MARK_EXIT)
+
+# An idle line reads as NUL, and sooner or later a debug print shares the port
+# and a newline arrives.  Neither is a mark and neither is a fault, so they are
+# dropped silently; anything else unrecognised is reported, because on a stream
+# this fast an unexpected byte is usually a baud rate or a wiring problem.
+MARK_IGNORED = frozenset("\x00\r\n\t ")
+
+
+def mark_exit_for(symbol: str) -> str:
+    """The character that closes the region a given character opens."""
+    return MARK_EXIT_OF_ENTER.get(symbol)
+
+
+def decode_marks(idx, codes, n_samples: int) -> dict:
+    """The serial bytes of a capture -> the nested regions they delimit.
+
+    idx/codes are the stream as recorded: the sample index each byte arrived
+    at, and the byte.  Returns regions in the order they were opened, each
+    carrying the index of the region it sits inside, which is what makes an
+    exclusive split possible afterwards.
+
+    Two things are reconstructed rather than reported as errors, because both
+    are the ordinary consequence of a capture being a window onto a target that
+    was already running:
+
+      * a closing byte for a region that was never opened means the target was
+        already inside that region when the capture began.  It is opened at
+        sample 0.  Dropping it instead would file the time as unmarked, and for
+        a long-held state -- which is to say for standby, the state that
+        matters most -- that is most of the capture.
+      * a region still open at the end is closed at the last sample.
+
+    Both are reported rather than done quietly, because either can equally be a
+    symptom: a byte corrupted on the wire produces exactly the first, and a
+    target that stopped sending produces the second.
+    """
+    idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+    codes = np.asarray(codes, dtype=np.uint8).reshape(-1)
+
+    # The same byte on consecutive samples is one byte, not several.  Two real
+    # characters at 460800 baud are at least 22 us apart, which is nearly three
+    # samples at 125 kSa/s, so nothing genuine can ever land on two adjacent
+    # ones.  Collapsing the run makes the decode independent of whether the
+    # instrument reports a character at the sample it completed on or holds it
+    # for the width of the character -- otherwise one 'A' held for three
+    # samples would open three nested regions.
+    if idx.size > 1:
+        keep = np.ones(idx.size, dtype=bool)
+        keep[1:] = (np.diff(idx) != 1) | (codes[1:] != codes[:-1])
+        idx, codes = idx[keep], codes[keep]
+
+    events, ignored, unknown = [], 0, {}
+    for k, c in zip(idx.tolist(), codes.tolist()):
+        ch = chr(c)
+        if ch in MARK_ENTER_SET or ch in MARK_EXIT_SET:
+            events.append((min(max(int(k), 0), n_samples), ch))
+        elif ch in MARK_IGNORED:
+            ignored += 1
+        else:
+            unknown[ch] = unknown.get(ch, 0) + 1
+
+    # Pass one exists only to find the regions that were already open when the
+    # capture started.  They cannot be discovered while building the tree,
+    # because by then their opening byte would have to be inserted before
+    # events already placed.
+    stack, pre_open, force_closed = [], [], []
+    for _, ch in events:
+        if ch in MARK_ENTER_SET:
+            stack.append(ch)
+            continue
+        want = MARK_ENTER_OF_EXIT[ch]
+        if want in stack:
+            # Anything popped on the way down was closed by an enclosing
+            # region ending first, and its own closing byte is still to come.
+            while True:
+                got = stack.pop()
+                if got == want:
+                    break
+                force_closed.append(got)
+        elif want in force_closed:
+            # That closing byte, arriving late.  It closes nothing -- the
+            # region is already shut -- and must not be read as evidence that
+            # the capture began inside one.
+            force_closed.remove(want)
+        else:
+            pre_open.append(want)
+    # Discovered in the order they close, so the first one found is the
+    # innermost and has to be opened last.
+    events = [(0, ch) for ch in reversed(pre_open)] + events
+
+    regions, open_stack, crossed = [], [], []
+    for at, ch in events:
+        if ch in MARK_ENTER_SET:
+            regions.append({"symbol": ch, "start": at, "end": None,
+                            "parent": open_stack[-1] if open_stack else None,
+                            "depth": len(open_stack)})
+            open_stack.append(len(regions) - 1)
+            continue
+        want = MARK_ENTER_OF_EXIT[ch]
+        at_k = next((k for k in range(len(open_stack) - 1, -1, -1)
+                     if regions[open_stack[k]]["symbol"] == want), None)
+        if at_k is None:
+            continue                    # pass one guaranteed one exists
+        # Closing 'a' while 'B' is still open means the firmware overlapped two
+        # regions instead of nesting them.  The inner ones are closed here so
+        # the tree stays a tree; the alternative is regions that overlap
+        # partially, for which "the energy inside B" has no single answer.
+        while len(open_stack) > at_k:
+            r = regions[open_stack.pop()]
+            r["end"] = at
+            if r["symbol"] != want:
+                crossed.append(r["symbol"])
+
+    still_open = [regions[k]["symbol"] for k in open_stack]
+    for k in open_stack:
+        regions[k]["end"] = n_samples
+
+    out = {
+        "regions": regions,
+        "bytes": int(idx.size),
+        "symbols_seen": sorted({r["symbol"] for r in regions}),
+        "max_depth": max((r["depth"] for r in regions), default=0) + 1
+        if regions else 0,
+    }
+    if pre_open:
+        out["open_at_start"] = sorted(set(pre_open))
+        out["open_at_start_note"] = (
+            f"The capture began with the target already inside "
+            f"{', '.join(sorted(set(pre_open)))}: a closing byte arrived for a "
+            f"region no opening byte was seen for. Those regions are counted "
+            f"from the first sample, which is what actually happened -- but a "
+            f"single corrupted byte looks identical, so check the count is "
+            f"plausible before building an estimate on it.")
+    if still_open:
+        out["open_at_end"] = sorted(set(still_open))
+        out["open_at_end_note"] = (
+            f"Still inside {', '.join(sorted(set(still_open)))} when the "
+            f"capture ended; those regions are closed at the last sample. "
+            f"Expected for the state the target rests in, worth a look for "
+            f"anything else -- a region that never closes is also what a "
+            f"missing exit call looks like.")
+    # A region opened directly inside another of the SAME symbol.  Worth
+    # calling out because it is the shape a corrupted stream takes: measured on
+    # the bench, a target sending 'S','s','A','a' at 115200 into this 460800
+    # input arrived as three identical bytes, which decoded as three valid
+    # regions of one symbol nested in each other.  Nothing was invalid about
+    # them -- the bytes really are marks -- so only the shape gives it away.
+    # Recursion marked with one symbol produces the same shape legitimately,
+    # which is why this is reported rather than treated as an error.
+    self_nested = sorted({r["symbol"] for r in regions
+                          if r["parent"] is not None
+                          and regions[r["parent"]]["symbol"] == r["symbol"]})
+    if self_nested:
+        out["self_nested_symbols"] = self_nested
+        out["self_nested_note"] = (
+            f"{', '.join(self_nested)} was opened again inside itself without "
+            f"being closed first. That is either recursion marked with one "
+            f"symbol -- fine, and the nesting is real -- or a corrupted "
+            f"stream, which is what a wrong baud rate looks like once the "
+            f"mangled bytes happen to land on valid mark characters. Check "
+            f"the rate is {D0S_BAUD} before reading anything into the result.")
+    if crossed:
+        out["crossed_regions"] = sorted(set(crossed))
+        out["crossed_note"] = (
+            f"{', '.join(sorted(set(crossed)))} were left open when an "
+            f"enclosing region closed, so the firmware is overlapping regions "
+            f"rather than nesting them. They have been closed at the enclosing "
+            f"exit. Marks have to nest -- exit the inner region before the "
+            f"outer one -- or the energy inside them is not well defined.")
+    if unknown:
+        out["unknown_bytes"] = {k: v for k, v in sorted(unknown.items())}
+        out["unknown_note"] = (
+            f"{sum(unknown.values())} byte(s) arrived that are not marks: "
+            f"{', '.join(repr(k) for k in sorted(unknown))}. A few mean the "
+            f"UART is shared with something else. A lot, or bytes that look "
+            f"random, mean the target is not at {D0S_BAUD} baud -- that is the "
+            f"one rate the input decodes and it is not negotiable.")
+    if ignored:
+        out["framing_bytes_ignored"] = ignored
+    return out
+
+
+def mark_breakdown(i_ma: np.ndarray, decoded: dict, names: dict,
+                   fs: int = SAMPLE_RATE, battery_mah: float = None,
+                   settle_ms: float = STATE_SETTLE_MS) -> dict:
+    """Split a capture by the regions the target marked on the serial stream.
+
+    names maps symbol -> state name.  Every figure is reported on two bases,
+    and the difference between them is the whole reason marks nest:
+
+      inclusive  everything between the opening and closing byte, nested
+                 regions included.  What the feature costs the battery in
+                 total, which is what you compare against a requirement.
+      exclusive  the same, less whatever nested regions took out of it.  What
+                 this code costs that is not already charged to something
+                 else, which is what you optimise against.
+
+    A flat instrumentation -- no marks inside other marks -- makes the two
+    identical, so a developer who never nests anything never has to think
+    about the distinction.
+
+    The exclusive figures, plus the unmarked remainder, are the ones that add
+    up to the capture, and so the ones a share-of-battery breakdown is built
+    from.  Summing the inclusive figures would count nested work twice.
+    """
+    i64 = i_ma.astype(np.float64, copy=False)
+    n = int(i64.size)
+    if n == 0:
+        return {"error": "capture contains no samples"}
+    regions = [dict(r) for r in (decoded.get("regions") or [])]
+    settle = max(0, int(settle_ms * 1e-3 * fs))
+
+    for r in regions:
+        a = min(max(int(r["start"]), 0), n)
+        b = min(max(int(r["end"] if r["end"] is not None else n), a), n)
+        r["a"], r["b"] = a, b
+        sel = i64[a:b]
+        r["n"], r["sum"] = sel.size, float(sel.sum()) if sel.size else 0.0
+        r["peak"] = float(sel.max()) if sel.size else None
+        # Trimmed of the entry transient, on the same argument as the state
+        # code path: the samples just after a region opens are the target
+        # getting into it, and charging them to the region overstates the
+        # steady cost of being in it.
+        s = i64[a + settle:b] if b - a > settle else None
+        r["s_n"] = int(s.size) if s is not None else 0
+        r["s_sum"] = float(s.sum()) if s is not None and s.size else 0.0
+    # Exclusive: take each region out of its parent.  Nesting is a tree by
+    # construction above -- a region always closes before the one enclosing it
+    # -- so every sample belongs to exactly one chain and one subtraction per
+    # region is exact, with no per-sample ownership array to allocate.  That
+    # matters: at 125 kSa/s an ownership array for a long capture is another
+    # hundred megabytes for information a dozen subtractions already hold.
+    for r in regions:
+        r["xn"], r["xsum"] = r["n"], r["sum"]
+    for r in regions:
+        if r["parent"] is not None:
+            regions[r["parent"]]["xn"] -= r["n"]
+            regions[r["parent"]]["xsum"] -= r["sum"]
+
+    total_charge = float(i64.sum()) / fs / 3600.0
+    rows = []
+    for sym in sorted({r["symbol"] for r in regions}):
+        vs = [r for r in regions if r["symbol"] == sym]
+        inc_n = sum(r["n"] for r in vs)
+        inc_sum = sum(r["sum"] for r in vs)
+        exc_n = sum(r["xn"] for r in vs)
+        exc_sum = sum(r["xsum"] for r in vs)
+        s_n = sum(r["s_n"] for r in vs)
+        s_sum = sum(r["s_sum"] for r in vs)
+        peaks = [r["peak"] for r in vs if r["peak"] is not None]
+        visits_ms = np.array([(r["b"] - r["a"]) / fs * 1000.0 for r in vs])
+        inc_charge = inc_sum / fs / 3600.0
+        exc_charge = exc_sum / fs / 3600.0
+        row = {
+            "symbol": sym,
+            "state": names.get(sym),
+            "visits": len(vs),
+            "time_s": _f(inc_n / fs, 4),
+            "time_pct": _f(100.0 * inc_n / n, 3),
+            "mean_ma": _f(inc_sum / inc_n) if inc_n else None,
+            "settled_mean_ma": _f(s_sum / s_n) if s_n else None,
+            "peak_ma": _f(max(peaks)) if peaks else None,
+            "charge_mah": _f(inc_charge),
+            "exclusive_time_s": _f(exc_n / fs, 4),
+            "exclusive_charge_mah": _f(exc_charge),
+            "mean_visit_ms": _f(float(visits_ms.mean()), 3),
+            "longest_visit_ms": _f(float(visits_ms.max()), 3),
+            "max_depth": max(r["depth"] for r in vs),
+        }
+        # From the unrounded charge: a deep-sleep region is microamps for
+        # seconds, which rounds to zero at the precision charge_mah is
+        # displayed to, and its share would then read 0% -- for exactly the
+        # state whose share the whole exercise exists to establish.
+        if total_charge > 0:
+            row["charge_share_pct"] = _f(100.0 * exc_charge / total_charge, 2)
+        if battery_mah:
+            row["battery_pct"] = _f(100.0 * inc_charge / battery_mah, 6)
+        nested = sorted({regions[r["parent"]]["symbol"] for r in vs
+                         if r["parent"] is not None})
+        if nested:
+            row["nested_inside"] = nested
+        rows.append(row)
+
+    # What no region claimed.  It is not an error -- a target is rarely inside
+    # an instrumented region the whole time -- but it is the number that says
+    # how much of the battery the instrumentation does not yet explain, and a
+    # breakdown that omitted it would silently rescale everything else.
+    top = [r for r in regions if r["parent"] is None]
+    un_n = n - sum(r["n"] for r in top)
+    un_sum = float(i64.sum()) - sum(r["sum"] for r in top)
+    un_charge = max(0.0, un_sum) / fs / 3600.0
+    unmarked = {
+        "state": None, "symbol": None,
+        "time_s": _f(max(0, un_n) / fs, 4),
+        "time_pct": _f(100.0 * max(0, un_n) / n, 3),
+        "exclusive_charge_mah": _f(un_charge),
+        "mean_ma": _f(un_sum / un_n) if un_n > 0 else None,
+    }
+    if total_charge > 0:
+        unmarked["charge_share_pct"] = _f(100.0 * un_charge / total_charge, 2)
+
+    rows.sort(key=lambda r: r.get("exclusive_charge_mah") or 0.0, reverse=True)
+    out = {
+        "duration_s": _f(n / fs, 4),
+        "charge_mah": _f(total_charge),
+        "marks": rows,
+        "unmarked": unmarked,
+        "regions_seen": len(regions),
+        "max_nesting_depth": decoded.get("max_depth", 0),
+    }
+    for k in ("open_at_start", "open_at_start_note", "open_at_end",
+              "open_at_end_note", "crossed_regions", "crossed_note",
+              "unknown_bytes", "unknown_note", "self_nested_symbols",
+              "self_nested_note"):
+        if decoded.get(k):
+            out[k] = decoded[k]
+
+    unmapped = [r["symbol"] for r in rows if not r["state"]]
+    if unmapped:
+        out["unmapped_symbols"] = unmapped
+        out["unmapped_note"] = (
+            f"The target marked {', '.join(unmapped)}, which no state is named "
+            f"for. Name them with p1150_set_state_mark, or the breakdown "
+            f"reports a letter where a battery-life estimate needs a state.")
+    named = [r for r in rows if r["state"]]
+    if named:
+        out["dominant_state"] = named[0]["state"]
+    if unmarked.get("charge_share_pct") is not None and \
+            unmarked["charge_share_pct"] > 25.0:
+        out["unmarked_warning"] = (
+            f"{unmarked['charge_share_pct']:.0f}% of the charge in this "
+            f"capture was drawn while the target was inside no marked region "
+            f"at all, so the breakdown does not explain where it went. Three "
+            f"things look like this. The marks may not yet cover what the "
+            f"target spends its time on. It may have been resting between them "
+            f"-- if that resting is a state, mark it too and it becomes the "
+            f"slice it deserves. Or it may have been inside a region for the "
+            f"whole capture, entered before the capture began and not left: a "
+            f"mark is an edge, so a region nobody enters or leaves during the "
+            f"window sends no bytes and cannot be seen. Capture across a full "
+            f"cycle of whatever the target does, or have the firmware close "
+            f"and reopen the resting state each time it wakes.")
+    return out
 
 
 def marker_survey(x: np.ndarray, cfg: dict = None,

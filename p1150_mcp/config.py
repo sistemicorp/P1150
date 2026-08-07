@@ -34,7 +34,8 @@ import os
 import json
 
 from . import storage
-from .analysis import AUX_INPUT_MAX_MV
+from .analysis import (AUX_INPUT_MAX_MV, D0S_BAUD, MARK_ENTER,
+                       MARK_EXIT_OF_ENTER)
 
 _FILE = "battery.json"
 _AUX_FILE = "aux.json"
@@ -166,6 +167,7 @@ def get_usage() -> dict:
     cfg.setdefault("states", {})
     cfg.setdefault("events", {})
     cfg.setdefault("signal", {})
+    cfg.setdefault("marks", {})
     return cfg
 
 
@@ -271,12 +273,14 @@ def set_usage_event(name: str, per_day: float = None, per_hour: float = None,
 def clear_usage(name: str = None) -> dict:
     """Remove one state or event by name, or the whole model."""
     if name is None:
-        return _write_usage({"states": {}, "events": {}, "signal": {}})
+        return _write_usage({"states": {}, "events": {}, "signal": {},
+                             "marks": {}})
     cfg = get_usage()
     key = _key(name)
     if not (cfg["states"].pop(key, None) or cfg["events"].pop(key, None)):
         raise ValueError(f"Nothing named '{name}' in the usage model.")
     cfg["signal"].get("codes", {}).pop(key, None)
+    cfg["marks"].get("symbols", {}).pop(key, None)
     return _write_usage(cfg)
 
 
@@ -324,6 +328,14 @@ def set_state_signal(state: str, code: int, channels: list = None) -> dict:
                 f"got '{ch}'. They rescale whatever the target drives to fixed "
                 f"levels, so no threshold is needed and a 1.8 V target works the "
                 f"same as a 3.3 V one. A0 is left for a region marker.")
+    if "D0" in channels and mark_symbols():
+        raise ValueError(
+            f"D0 already carries the serial mark stream "
+            f"({', '.join(sorted(mark_symbols()))}), and one pin cannot be "
+            f"both a logic level and a serial input. Put the signal on D1 "
+            f"alone -- channels=['D1'], two codes -- or clear the marks with "
+            f"p1150_clear_state_marks. Bear in mind the marks already give "
+            f"thirty states, and nested ones, where the pin code gives four.")
     if sig.get("channels") and list(sig["channels"]) != channels:
         raise ValueError(
             f"The state signal already uses {', '.join(sig['channels'])}. "
@@ -380,6 +392,139 @@ def state_for_code(code: int) -> str:
 
 
 # ------------------------------------------------------------------ #
+# State marks                                                          #
+# ------------------------------------------------------------------ #
+# The other way the target can declare its state: a character written to a UART
+# wired to D0, which the instrument decodes at 460800 baud and reports at the
+# sample it arrived at.  analysis.py holds the encoding and the reasoning about
+# why it beats the two-pin code; what belongs here is only the project's
+# symbol-to-state map, kept alongside the usage model for the same reason the
+# 2-bit codes are -- so that removing a state removes its symbol with it.
+#
+# D0 CANNOT DO BOTH.  The pin is decoded as a serial stream and sampled as a
+# logic level from the same input, so a D0 carrying a state-code bit or a region
+# marker is not carrying bytes, and a D0 carrying bytes reads as a square wave
+# at the bit rate to anything looking at its level.  Every combination that
+# would put the two on the same pin is refused here rather than allowed to
+# produce a capture that decodes into plausible nonsense.
+def get_state_marks() -> dict:
+    """{"symbols": {"standby": "A", ...}, "baud": 460800} or {}."""
+    return dict(get_usage().get("marks") or {})
+
+
+def mark_symbols() -> dict:
+    """state name -> the character the firmware sends for it.  May be empty."""
+    return dict(get_state_marks().get("symbols") or {})
+
+
+def _d0_conflict() -> str:
+    """Why D0 cannot carry the serial stream right now, or None."""
+    sig = get_state_signal()
+    if "D0" in (sig.get("channels") or []):
+        return (
+            "D0 already carries bit 0 of the two-pin state signal, and one pin "
+            "cannot be both a logic level and a serial stream. Either drop to "
+            "a one-pin signal on D1 alone (p1150_clear_state_signal, then "
+            "p1150_set_state_signal(..., channels=['D1'])), or clear the "
+            "signal entirely -- marks give thirty states where it gives four, "
+            "so keeping both is rarely worth a pin.")
+    if aux_channel_cfg("D0").get("role", "marker") == "marker" and \
+            "D0" in get_aux().get("channels", {}):
+        return (
+            "D0 is declared as a region marker (p1150_set_aux), and one pin "
+            "cannot be both a logic level and a serial stream. Move the marker "
+            "to D1 or A0 -- or drop it, since a mark measures the same region "
+            "and names it.")
+    return None
+
+
+def set_state_mark(state: str, symbol: str = None) -> dict:
+    """Map one state name to the character the firmware sends for it.
+
+    symbol may be omitted, in which case the next unused letter is assigned.
+    Auto-assignment is offered because the letter itself carries no meaning --
+    it is a handle the firmware and the report agree on -- and a developer
+    naming five states should not have to keep a register of which letters are
+    taken.
+    """
+    key = _key(state)
+    conflict = _d0_conflict()
+    if conflict:
+        raise ValueError(conflict)
+
+    marks = get_state_marks()
+    taken = dict(marks.get("symbols") or {})
+    if symbol is None:
+        symbol = taken.get(key) or next(
+            (c for c in MARK_ENTER if c not in taken.values()), None)
+        if symbol is None:
+            raise ValueError("All 30 mark symbols are in use.")
+    symbol = str(symbol)
+    if len(symbol) != 1 or symbol not in MARK_EXIT_OF_ENTER:
+        raise ValueError(
+            f"'{symbol}' cannot open a region. A mark is ONE character: a "
+            f"capital letter A-Z, or one of the opening brackets ( [ {{ <. The "
+            f"firmware sends that character on the way in and its partner on "
+            f"the way out -- the matching lower-case letter, or the closing "
+            f"bracket.")
+    for other, s in taken.items():
+        if s == symbol and other != key:
+            raise ValueError(
+                f"'{symbol}' is already the mark for '{other}'. Two states "
+                f"cannot share one, since the capture could not tell them "
+                f"apart. Pick another, or clear '{other}' first.")
+    taken[key] = symbol
+
+    cfg = get_usage()
+    cfg["marks"] = {"symbols": taken, "baud": D0S_BAUD}
+    _write_usage(cfg)
+    return cfg["marks"]
+
+
+def clear_state_marks(state: str = None) -> dict:
+    """Forget one state's mark, or the whole scheme."""
+    cfg = get_usage()
+    marks = dict(cfg.get("marks") or {})
+    if state is None:
+        cfg["marks"] = {}
+    else:
+        symbols = dict(marks.get("symbols") or {})
+        if symbols.pop(_key(state), None) is None:
+            raise ValueError(f"No mark is declared for '{state}'.")
+        cfg["marks"] = ({"symbols": symbols, "baud": D0S_BAUD} if symbols
+                        else {})
+    _write_usage(cfg)
+    return cfg["marks"]
+
+
+def state_for_mark(symbol: str) -> str:
+    """Name mapped to a mark symbol, or None."""
+    for name, s in mark_symbols().items():
+        if s == symbol:
+            return name
+    return None
+
+
+def mark_names() -> dict:
+    """symbol -> state name, which is the direction a decoded capture needs."""
+    return {s: n for n, s in mark_symbols().items()}
+
+
+def d0s_recorded() -> bool:
+    """Whether to keep the serial stream from D0 in a capture.
+
+    On unless D0 has been given another job.  It is kept even when no marks are
+    declared, and that is deliberate: the stream is sparse -- a few bytes where
+    a level channel is a megabyte a second -- so retaining it costs nothing
+    measurable, and it means a developer who wires the UART up and captures
+    before declaring anything still has the marks in the run afterwards. The
+    alternative is discovering at analysis time that the one capture worth
+    having was taken with the stream switched off.
+    """
+    return "D0" not in get_aux().get("channels", {})
+
+
+# ------------------------------------------------------------------ #
 # Auxiliary marker inputs                                              #
 # ------------------------------------------------------------------ #
 def _aux_path() -> str:
@@ -418,6 +563,14 @@ def set_aux(channel: str, name: str = None, active_high: bool = True,
     if channel not in AUX_CHANNELS:
         raise ValueError(f"channel must be one of {', '.join(AUX_CHANNELS)}, "
                          f"got '{channel}'.")
+    if channel == "D0" and role == "marker" and mark_symbols():
+        raise ValueError(
+            "D0 carries the serial mark stream, and one pin cannot be both a "
+            "logic level and a serial input -- a marker declared here would "
+            "read the bytes as a square wave and the marks would stop "
+            "decoding. Put the marker on D1 or A0. Or measure the region with "
+            "a mark of its own instead: it needs no pin, no threshold and no "
+            "polarity, and it comes out of the capture named.")
     if channel == "A0" and threshold_mv is None:
         raise ValueError(
             "A0 is an analog input, so threshold_mv is required: it is the "

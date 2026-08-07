@@ -107,9 +107,10 @@ is the short version.
 What: the representative current of one state the product spends its life in --
      standby, connected-idle, streaming.  The building block of a battery-life
      estimate, and where a new project starts.
-How: best, if the firmware can be edited, is to have the target signal its own
-     state on two GPIOs -- p1150_state_signal_guide -- and then
-     p1150_measure_states(60) gives a current for every state from one capture.
+How: best, if the firmware can be edited, is to have the target declare its
+     own state -- one character to a UART (p1150_state_mark_guide) or a code on
+     two GPIOs (p1150_state_signal_guide) -- and then p1150_measure_states(60)
+     gives a current for every state from one capture.
      Otherwise ask the developer to put the target into the state and confirm it
      is there, let it settle, then
      p1150_measure_state(state="standby", duration_s=30).
@@ -506,12 +507,14 @@ the current.  Every warning in the next section about settling and about
 capturing the wrong state stops applying, because the samples that were not the
 state are simply not in the measurement.
 
-p1150_state_signal_guide has the firmware.  Raise it before spending a session
-on hand-staged baselines.
+p1150_state_mark_guide has the firmware for the serial version, which is the
+one to reach for when the MCU has a UART to spare; p1150_state_signal_guide has
+the two-pin version for when it does not.  Raise either before spending a
+session on hand-staged baselines.
 
 ## Measuring a state by hand
-Without a state signal, the target has to be put into the state by a person and
-the capture timed around it.
+Without a state signal or serial marks, the target has to be put into the state
+by a person and the capture timed around it.
 
     p1150_measure_state(state="standby", duration_s=30)
 
@@ -557,6 +560,11 @@ is much easier to see before the work than after.
 `duty_cycle_sensitivity` says whether the developer's time split needed to be
 accurate.  Read it before quoting a figure to anyone.
 
+p1150_battery_pie() draws the same ranking as a share of the battery.  It is the
+form to put in front of a person: "standby is 71% of the battery" is a sentence
+that redirects a week of work, and a list of contributions in milliamps is the
+same fact that nobody acts on.
+
 `target` turns the estimate into a verdict against the required life, and when
 it is SHORT, into what each contributor would have to become to reach it:
 "sleep current from 180 uA to 95 uA", or "boots from 20 a day to 6".  Some rows
@@ -592,17 +600,18 @@ is a range: quote the estimate, and quote it again with 20% off the capacity.
  2. p1150_set_usage_state(...) for each state              -- must total 100%
  3. p1150_set_usage_event(...) for boots, wakes, user actions
  4. Measure each state:
-    with a state signal    p1150_measure_states(60) while the target runs
-                           normally -- every state at once, and better than
-                           measuring them separately, since they then share a
-                           board, a session, a supply voltage and a build
-    without one            for each state, ask the developer to put the target
-                           in it, wait for it to settle, then
-                           p1150_measure_state(state=..., duration_s=...)
+    if the target declares   p1150_measure_states(60) while the target runs
+    its own state            normally -- every state at once, and better than
+                             measuring them separately, since they then share a
+                             board, a session, a supply voltage and a build
+    if it does not           for each state, ask the developer to put the target
+                             in it, wait for it to settle, then
+                             p1150_measure_state(state=..., duration_s=...)
  5. For each event: capture one occurrence (p1150_capture_single, or
     p1150_measure with connect_probe_during=True for a boot) and pass its
     run_id to p1150_set_usage_event
- 6. p1150_battery_life()
+ 6. p1150_battery_life(), then p1150_battery_pie() for the same answer in the
+    form a person reads fastest
  7. Optimise the top contributor, re-measure that state, and run it again --
     only the state that changed needs re-measuring.
 
@@ -901,6 +910,17 @@ If you are also writing the target's firmware, this is not a favour to ask of
 the developer.  It is an edit you can make, in about fifteen lines, and it makes
 every measurement after it exact.  Make it early.
 
+## First: is a UART free?
+There are two ways to do this, and this guide covers the one that needs no
+peripheral.  If the MCU has a spare UART, read p1150_state_mark_guide instead:
+the target writes one character per state boundary to D0, which gives thirty
+states rather than four, regions that NEST -- so what a feature costs can be
+separated from the state it ran inside -- and leaves D1 free.
+
+Stay with this guide when no UART is free, or when the sleep mode you most need
+to measure gates the UART's clock off.  A GPIO level survives a sleep mode that
+a peripheral does not, and that is the case this mechanism exists for.
+
 ## The encoding
 Two digital inputs, D0 as bit 0 and D1 as bit 1, carry four states:
 
@@ -1025,6 +1045,183 @@ measured or declared.
 """
 
 
+STATE_MARK_GUIDE = """\
+# Letting the target name what it is doing, one character at a time
+
+## What this is
+The P1150 decodes its D0 input as a serial receiver as well as sampling it as a
+logic level, and records the byte that arrived at each sample.  A target with a
+spare UART can therefore say what it is doing by writing ONE CHARACTER: an
+upper-case letter on the way into a region of code, the matching lower-case
+letter on the way out.
+
+    putchar('A');       // entering the region called A
+    ...work...
+    putchar('a');       // leaving it
+
+That is the whole protocol.  What comes back is a capture in which every
+microamp is attributed to a region the firmware named, rather than to a mode a
+person asserted the target was in.
+
+## THE BAUD RATE IS 460800, 8N1, AND IT IS NOT NEGOTIABLE
+It is the one rate the input decodes, and getting it wrong does not produce an
+error.  Measured on the bench: a sender at 115200 writing 'S','s','A','a'
+arrived as three identical bytes -- and all three were valid mark characters, so
+they decoded into three perfectly well-formed nested regions.  Nothing about
+that result looks wrong.  It is simply fiction.
+
+So set the rate, and then run p1150_state_check rather than eyeballing a
+capture.  It looks at the shape as well as the bytes, and a symbol opened again
+inside itself -- which is what the corruption above produces -- is reported as
+SUSPECT_BAUD.
+
+The rate is high because a mark should cost nothing.  A byte at 460800 takes
+22 us, so marking a region that lasts a millisecond costs 2% of it; the same
+mark at 9600 would take a millisecond and there would be nothing left to
+measure.  Send it by DMA or from a TX FIFO if the port has one.
+
+## Why this rather than the two-pin code
+p1150_state_signal_guide covers the other mechanism: a 2-bit code driven on D0
+and D1.  Both make the target's state a fact instead of a claim.  Marks are
+better wherever the MCU has a UART to spare:
+
+    thirty regions, not four.  A 2-bit code has to be rationed to the top-level
+        power modes.  With marks, every feature worth measuring can have one.
+    they nest.  'A' ... 'B' ... 'b' ... 'a' records that B ran inside A, and
+        the breakdown charges B's energy to B and the remainder to A.  A code
+        holds exactly one state at a time, so instrumenting a callee destroys
+        the caller's record.
+    one pin, not two.  D1 and A0 stay free.
+    they are named in the source.  'RADIO_TX' is a symbol in the firmware, not
+        a bit pattern someone has to look up.
+
+The pin code wins in exactly one case: an MCU with no UART free, or one where
+the sleep mode being measured stops the UART clock.  A GPIO level survives
+where a peripheral does not.
+
+## The firmware
+Give each region a symbol and wrap the work:
+
+    // P1150 marks: 460800 8N1 on the UART wired to the instrument's D0
+    #define MARK(c)   p1150_mark(c)
+
+    static inline void p1150_mark(char c) {
+        while (!(UART->ISR & UART_ISR_TXE)) { }   // ~22 us at 460800
+        UART->TDR = (uint8_t)c;
+    }
+
+    void app_loop(void) {
+        MARK('A');                 // active
+            MARK('B');             //   radio transmitting, inside active
+            radio_transmit();
+            MARK('b');
+        MARK('a');
+
+        MARK('S');                 // standby
+        enter_low_power();
+        MARK('s');                 // ... on the way out of it
+    }
+
+Put the mark where the work ACTUALLY begins and ends, not at the top and bottom
+of the function that eventually gets there.  A mark set early attributes the
+setup to the region that follows it, which is the same error as setting a state
+code early and just as invisible afterwards.
+
+Brackets work as well as letters -- ( ) [ ] { } < > -- and read as nesting in
+the source.  Use them for the outermost region if that helps the code; the
+instrument does not care which you pick.
+
+## The three ways this goes wrong
+CHECK THE UART SURVIVES THE SLEEP MODE.  This is the marks' version of the
+GPIO-retention trap, and it bites harder: a peripheral clock gated off in deep
+sleep means the 's' that should close the standby region is never sent, or is
+sent as a partial character.  Send the mark BEFORE entering the sleep
+instruction and close it after waking -- which is what the example above does --
+and confirm with p1150_state_check that the region closes.
+
+DRAIN THE TX BUFFER BEFORE SLEEPING.  A byte still shifting out when the clock
+stops arrives truncated, and a truncated byte is a framing error, which is
+another unrecognised byte in the report.  Wait for the transmit-complete flag,
+not just the buffer-empty one.
+
+DO NOT SHARE THE PORT WITH A DEBUG LOG.  Every other byte on the line arrives
+here as an unrecognised character.  A few are ignored; a log stream buries the
+marks.  If the target has only one UART, this is the case where the two-pin
+state signal is the better trade.
+
+## A mark is an edge, and that has one consequence worth knowing
+The instrument sees the transitions, not the state.  A target that entered a
+region before the capture started and has not left it sends nothing, so that
+region is invisible for as long as it lasts -- and the whole capture reads as
+"unmarked" even though the target was inside something the entire time.
+
+Two things make it a non-issue, and it is worth doing both:
+
+    Capture across a full cycle of whatever the target does, not a slice of
+    one.  As soon as ONE closing byte arrives, the decode reconstructs the
+    region back to the first sample and the time is attributed correctly.
+
+    Close and reopen the resting state around each wake, rather than opening it
+    once at boot and leaving it open forever.  A duty-cycled target does this
+    naturally: 's' on waking, work, 'S' on going back to sleep.
+
+p1150_measure_state gates on a mark by waiting for the target to ENTER the
+region, so it cannot be used for a state the target is already in and will not
+leave.  For that one, take a plain p1150_measure over a full cycle and use
+p1150_state_split.
+
+## Nesting, and what the breakdown does with it
+Every figure comes back on two bases:
+
+    inclusive   everything between the opening and closing byte, nested
+                regions included.  What the feature costs the battery in
+                total -- the number to compare against a requirement.
+    exclusive   the same, less whatever was nested inside it.  What this code
+                costs that is not already charged to something else -- the
+                number to optimise against.
+
+If you never nest anything the two are identical and the distinction never
+comes up.  When you do nest, only the exclusive figures plus the unmarked
+remainder add up to the capture; summing the inclusive ones counts the nested
+work twice.  p1150_battery_pie draws the exclusive split, for that reason.
+
+There is also an UNMARKED slice: time the target spent inside no region at all.
+It is not an error -- a target is rarely inside instrumented code every
+microsecond -- but it is the share of the battery the instrumentation does not
+yet explain, and if it is large the answer is usually to mark the resting state
+too rather than to distrust the rest.
+
+## Wiring
+One wire from the target's UART TX pin to the P1150's D0, grounds in common
+(usually already shared through the probe at the battery terminals).  D0 accepts
+1.2-3.3 V and no more -- a 5 V UART must not be connected to it.  Nothing is
+sent back to the target: the instrument only listens, so the target's RX is not
+involved and no flow control exists.
+
+## The working order
+ 1. Add the marks to the firmware at 460800 8N1 and flash it.
+ 2. p1150_set_state_mark("standby", "S"), one call per state.  Omit the symbol
+    and the next free letter is assigned.
+ 3. p1150_state_check() -- with the target running normally.  Confirms the
+    baud rate, the wiring, and that the regions close.  Do not skip it; a wrong
+    baud rate is invisible in every other tool.
+ 4. p1150_measure_states(60) -- one capture, a current and a share of the
+    battery for every region the target marked.
+    Or p1150_measure_state("standby", 30) to wait until the target enters one
+    named region and measure only that.
+ 5. p1150_battery_pie() for where the battery actually goes, and
+    p1150_battery_life() for how long it lasts.
+
+## What the measured time fractions mean
+The same caveat as for the pin code applies unchanged: the fractions measured
+are how the target behaved DURING THE CAPTURE.  That is the product's real duty
+cycle for a self-driven device -- a sensor node, a beacon, a tracker -- and it
+is false for anything a user drives, which spends none of a minute on the bench
+being used.  Ask which kind it is before adopting them with
+p1150_usage_from_capture.
+"""
+
+
 MARKER_GUIDE = """\
 # Marking a code region with a GPIO
 
@@ -1046,6 +1243,18 @@ That gives three things a current threshold cannot:
   drawing more look identical in average current and need different fixes.
 
 Nearly every embedded target has a pin free for this.  It is worth asking for.
+
+## First: would a serial mark do the job better?
+p1150_state_mark_guide covers the other way to bound a region -- one character
+written to a UART wired to D0, at 460800 baud.  It answers the same question and
+usually answers it better: any number of regions rather than one per pin, no
+threshold and no polarity to get wrong, regions that nest so a callee's cost
+separates from its caller's, and a name in the report instead of a channel.
+
+Stay with a GPIO marker when there is no UART free, when the region is short
+enough that a 22 us byte at each end would distort it, or when the signal being
+marked is not the firmware's at all -- an enable line, a chip select, a rail
+coming up -- which is a thing a pin can watch and a putchar cannot.
 
 ## What the developer has to do
 Two things, and both need agreeing before any of the aux tools are useful:

@@ -30,9 +30,15 @@ SAMPLE_RATE = 125_000
 # MCP-facing aux channel name -> key in the driver's acquisition dict.
 AUX_KEYS = {"A0": "a0", "D0": "d0", "D1": "d1"}
 
+# The driver's key for the serial decode of D0 -- one byte per sample, NUL
+# where no character arrived.  It is not in AUX_KEYS because it is not a level
+# channel: it is stored sparse and analysed as events, not as samples.
+D0S_KEY = "d0s"
+
 # Trigger sources for the aux inputs.  A0A is the analog input; D0/D1 are the
-# digital ones.  TRIG_SRC_D0S (the serial decode on D0) is deliberately absent:
-# nothing in this server configures or reports that stream.
+# digital ones.  TRIG_SRC_D0S is absent because nothing here triggers on a
+# mark: the marks are decoded out of the capture afterwards, which needs no
+# trigger and does not tie up the one the current channel may want.
 AUX_TRIG_SRC = {
     "A0": PxxxxAPI.TRIG_SRC_A0A,
     "D0": PxxxxAPI.TRIG_SRC_D0,
@@ -388,18 +394,63 @@ class _Ammeter:
                  "current_ma": round(v / 1000.0, 6)} for t, v in points]
 
 
+def _sparse_marks(stream) -> tuple:
+    """The driver's per-sample byte stream -> (sample index, byte) arrays.
+
+    The stream carries a character for every sample and almost every one of
+    them is NUL: a byte at 460800 baud occupies about 22 us, so a target
+    marking a region every millisecond still leaves 999 samples in a thousand
+    empty.  Reducing it here rather than at save time is what keeps a capture's
+    marks in kilobytes instead of a byte per sample -- 112 MB for a long run,
+    to record a few hundred events.
+    """
+    if stream is None or len(stream) == 0:
+        return np.empty(0, np.int64), np.empty(0, np.uint8)
+    if isinstance(stream, (bytes, bytearray)):
+        raw = np.frombuffer(bytes(stream), dtype=np.uint8)
+    elif isinstance(stream, np.ndarray):
+        raw = stream.astype(np.uint8, copy=False)
+    else:
+        # The documented form: a list of one-character strings, latin-1, one
+        # per sample.  Joined and re-read as bytes rather than looped over,
+        # because this runs in the acquisition callback for every chunk.
+        raw = np.frombuffer("".join(stream).encode("latin-1"), dtype=np.uint8)
+    hit = np.flatnonzero(raw)
+    return hit.astype(np.int64), raw[hit]
+
+
 def _join(chunks: list) -> tuple:
-    """Concatenate chunk dicts into one (i, isnk, aux) triple.
+    """Concatenate chunk dicts into one (i, isnk, aux, marks) tuple.
 
     aux is {"D0": array, ...} holding whichever auxiliary channels were armed
     for this capture, and is empty when none were.
+
+    marks is (sample index, byte) for the serial stream on D0, or None when the
+    stream was not being recorded.  None and an empty pair mean different
+    things and both are worth having: the first says nothing was listening, the
+    second says something was and the target said nothing.
     """
     if not chunks:
-        return np.empty(0, np.float32), np.empty(0, np.float32), {}
-    aux_keys = [k for k in chunks[0] if k not in ("i", "isnk")]
-    return (np.concatenate([c["i"] for c in chunks]),
-            np.concatenate([c["isnk"] for c in chunks]),
-            {k: np.concatenate([c[k] for c in chunks]) for k in aux_keys})
+        return np.empty(0, np.float32), np.empty(0, np.float32), {}, None
+    aux_keys = [k for k in chunks[0] if k not in ("i", "isnk", D0S_KEY)]
+    i = np.concatenate([c["i"] for c in chunks])
+    isnk = np.concatenate([c["isnk"] for c in chunks])
+    aux = {k: np.concatenate([c[k] for c in chunks]) for k in aux_keys}
+
+    marks = None
+    if D0S_KEY in chunks[0]:
+        # Each chunk indexes from its own first sample, so every one has to be
+        # lifted by the samples that came before it.
+        idx, val, base = [], [], 0
+        for c in chunks:
+            k, v = c[D0S_KEY]
+            if k.size:
+                idx.append(k + base)
+                val.append(v)
+            base += c["i"].size
+        marks = (np.concatenate(idx) if idx else np.empty(0, np.int64),
+                 np.concatenate(val) if val else np.empty(0, np.uint8))
+    return i, isnk, aux, marks
 
 
 class Session:
@@ -426,6 +477,7 @@ class Session:
         # that editing the config mid-capture cannot produce chunks of
         # different shapes that then fail to concatenate.
         self._aux = []
+        self._marks = False
 
         self._capture_thread = None
         self._capture_stop = threading.Event()
@@ -448,16 +500,25 @@ class Session:
         channel and a long capture is already hundreds of megabytes.  Keeping
         all three unconditionally would triple that for data most sessions
         never look at.
+
+        The serial stream on D0 is the exception and is kept whenever D0 has
+        no other job, because reduced to the bytes that actually arrived it
+        costs kilobytes rather than a megabyte a second -- and a mark stream
+        the developer wired up but had not declared yet would otherwise be lost
+        from the one capture that needed it.
         """
         chunk = {"i": data["i"], "isnk": data["isnk"]}
         for ch in self._aux:
             chunk[ch] = data[AUX_KEYS[ch]]
+        if self._marks:
+            chunk[D0S_KEY] = _sparse_marks(data.get(D0S_KEY))
         self._acq_chunk = chunk
         self._acq_event.set()
 
     def _arm_aux(self) -> list:
-        """Snapshot which aux channels this capture will retain."""
+        """Snapshot what this capture will retain besides the currents."""
         self._aux = [c for c in config.aux_channels() if c in AUX_KEYS]
+        self._marks = config.d0s_recorded()
         return self._aux
 
     def _cb_async(self, data: dict) -> None:
@@ -845,7 +906,8 @@ class Session:
                 connect_probe_during: bool = False) -> tuple:
         """Blocking capture of duration_s seconds.
 
-        Returns (i, isnk, aux); currents in mA, aux keyed by channel name.
+        Returns (i, isnk, aux, marks); currents in mA, aux keyed by channel
+        name, marks the serial stream from D0 as (index, byte) or None.
 
         connect_probe_during closes the probe relay *after* streaming has begun,
         which is the only way to capture a target's power-on inrush and boot
@@ -877,7 +939,7 @@ class Session:
                      on_reject=None) -> tuple:
         """Stream, discarding until match() accepts a chunk, then capture.
 
-        Returns (i, isnk, aux, waited_s).
+        Returns (i, isnk, aux, marks, waited_s).
 
         The alternative -- wait in one call, then capture in another -- leaves a
         gap between the two in which the target can leave the state again, and
@@ -896,11 +958,13 @@ class Session:
             raise DeviceError("A background capture is running; "
                               "call p1150_capture_stop first.")
         self._arm_aux()
-        if not self._aux:
+        if not self._aux and not self._marks:
             raise DeviceError(
-                "No auxiliary channel is being recorded, so there is no signal "
-                "to wait for. Declare the state signal with "
-                "p1150_set_state_signal first.")
+                "No auxiliary channel and no mark stream are being recorded, "
+                "so there is no signal to wait for. Declare how the target "
+                "says what it is doing first -- p1150_set_state_mark for the "
+                "serial marks, or p1150_set_state_signal for the two-pin "
+                "code.")
         dev.set_timebase(STREAM_TIMEBASE)
         n_chunks = max(1, int(round(duration_s / STREAM_CHUNK_S)))
         chunks, waited = [], 0.0
@@ -1036,8 +1100,8 @@ class Session:
                    f"mA. Check the level is above the resting current but "
                    f"below the event peak.")
 
-        i, isnk, aux = self._acquire_single(dev, timeout_s, msg)
-        return i, isnk, aux, self.effective_fs(timebase, i.size)
+        i, isnk, aux, marks = self._acquire_single(dev, timeout_s, msg)
+        return i, isnk, aux, marks, self.effective_fs(timebase, i.size)
 
     # ---- inrush ----------------------------------------------------- #
 
@@ -1106,7 +1170,7 @@ class Session:
             self.probe_on = True
             self.ammeter.disturb()
 
-        i, isnk, aux = self._acquire_single(
+        i, isnk, aux, marks = self._acquire_single(
             dev, timeout_s,
             f"The target drew less than the {trigger_ma} mA trigger level "
             f"within {timeout_s}s of being powered, so nothing was captured. "
@@ -1131,7 +1195,7 @@ class Session:
             info["probe_connected"] = st.get("probe_connected")
         except Exception:
             pass
-        return i, isnk, aux, self.effective_fs(timebase, i.size), info
+        return i, isnk, aux, marks, self.effective_fs(timebase, i.size), info
 
     def self_test(self) -> dict:
         """Measure the P1150's own calibration resistors as a known load.
@@ -1175,7 +1239,8 @@ class Session:
         aux = self._arm_aux()
         chunks = []
         self._capture = {"label": label, "chunks": chunks,
-                         "started": timer(), "max_s": max_s, "aux": aux}
+                         "started": timer(), "max_s": max_s, "aux": aux,
+                         "marks": self._marks}
         self._capture_err = None
         self._capture_stop.clear()
 
@@ -1188,7 +1253,8 @@ class Session:
         self._capture_thread = threading.Thread(target=run, daemon=True)
         self._capture_thread.start()
         return {"capturing": True, "label": label, "max_duration_s": max_s,
-                "aux_channels": aux or None}
+                "aux_channels": aux or None,
+                "recording_marks": self._marks}
 
     def capture_status(self) -> dict:
         if self._capture_thread is None:
@@ -1203,11 +1269,17 @@ class Session:
             "captured_s": round(n / SAMPLE_RATE, 3),
             "max_duration_s": c["max_s"],
             "aux_channels": c.get("aux") or None,
+            # Marks arriving is the one sign, while a background capture is
+            # still running, that the target's instrumentation is alive. A
+            # count stuck at zero means the run in progress will not split by
+            # state, which is worth learning now rather than after it stops.
+            "marks_recorded": sum(len(x[D0S_KEY][0]) for x in c["chunks"]
+                                  if D0S_KEY in x) if c.get("marks") else None,
             "error": self._capture_err,
         }
 
     def capture_stop_raw(self) -> tuple:
-        """Stop the background capture; returns (label, i, isnk, aux)."""
+        """Stop the background capture; returns (label, i, isnk, aux, marks)."""
         if self._capture_thread is None:
             raise DeviceError("No capture is running.")
         self._capture_stop.set()
@@ -1216,8 +1288,8 @@ class Session:
         c, self._capture = self._capture, None
         if self._capture_err:
             raise DeviceError(f"Capture failed: {self._capture_err}")
-        i, isnk, aux = _join(c["chunks"])
-        return c["label"], i, isnk, aux
+        i, isnk, aux, marks = _join(c["chunks"])
+        return c["label"], i, isnk, aux, marks
 
 
 SESSION = Session()

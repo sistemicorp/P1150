@@ -3,4 +3,4 @@
 
 mcp          # Model Context Protocol SDK (provides FastMCP)
 numpy        # sample storage and statistics
-matplotlib   # p1150_plot only
+matplotlib   # p1150_plot and p1150_battery_pie only
