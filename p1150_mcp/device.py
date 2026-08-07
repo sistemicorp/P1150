@@ -15,6 +15,7 @@ agent cannot sequence it wrongly.
 """
 import os
 import time
+import collections
 import threading
 from timeit import default_timer as timer
 
@@ -223,6 +224,170 @@ class _ConnectProgress:
                   f"{label} {pct}%" if 0 < pct < 100 else label)
 
 
+# ---- ammeter ------------------------------------------------------- #
+#
+# The P1150 streams an "asc_ammeter" message once a second, unprompted, for the
+# whole time it is connected: during an acquisition, between acquisitions, and
+# while nothing at all is being asked of it.  It is the only current reading
+# this server gets for free -- every other number here costs a capture, a run on
+# disk and an analysis pass -- which makes it the right answer to "what is the
+# target drawing right now" and the wrong answer to almost everything else.
+#
+# What it reports is the MEAN output current over the second just elapsed, in
+# microamps, measured where the P1150 sources current.  So it is the target's
+# current only while the probe relay is closed; with the probe open it reads
+# whatever internal calibration load is switched in, or near zero when there is
+# none.  Near zero is exactly what a well-behaved sleeping target looks like,
+# so the probe state is reported beside the value rather than left to the
+# caller to remember to check.
+#
+# Checked against the internal calibration resistors at 4000 mV: 2004 uA for a
+# nominal 2 mA, 20004 for 20 mA, 199167 for 200 mA.  Inside 0.5%, which is as
+# much as an average needs to be worth.
+AMMETER_PERIOD_S = 1.0
+
+# A reading older than this means the stream has stopped, which is what a wedged
+# or unplugged device looks like from here.  Two and a half periods is late
+# enough that a merely jittery message is not called stale.
+AMMETER_STALE_S = 2.5
+
+# Messages arriving closer together than this are the connect-time backlog
+# rather than new measurements: when the link comes up the driver replays the
+# device's buffered log, so a hundred-odd seconds of history lands inside a
+# single millisecond.  Their values are real but their arrival times are not,
+# and appending them would drop a hundred points at one instant into a series
+# that is supposed to span a minute.  The newest of them still updates the
+# latest reading -- it is the most recent thing the device has said -- it just
+# does not earn its own point in the history.
+AMMETER_BURST_S = 0.25
+
+# Ten minutes of history at one sample a second.  A deque of 600 floats is
+# nothing beside a capture, and it means "what has the current been doing" has
+# an answer without anyone having had to ask for it in advance.
+AMMETER_HISTORY = 600
+
+
+class _Ammeter:
+    """The P1150's once-a-second current reading, kept current in background.
+
+    Fed from the driver's async callback, which runs on the driver's own thread,
+    so every method takes the lock and nothing on the callback path is allowed
+    to raise: an exception thrown on that stack cannot reach a caller and would
+    be printed and swallowed by ctypes.
+
+    That the reading is an average over the preceding second has one consequence
+    worth stating plainly, because it produced a wrong number on the bench
+    before it was handled here: the message spanning a change reports neither
+    the old current nor the new one.  Switching a 2 mA load in read 1497 uA and
+    then 2004; switching a 200 mA load out read 49091 and then 0.  A reading is
+    therefore only trustworthy when its whole window lies after the last thing
+    that changed the current, which is what disturb() marks and what the
+    'settled' flag reports.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._value_ua = None
+        self._at = 0.0            # monotonic arrival of the newest reading
+        self._history = collections.deque(maxlen=AMMETER_HISTORY)
+        self._disturbed_at = 0.0  # last deliberate change to the output
+        self._count = 0
+
+    def reset(self) -> None:
+        """Forget everything.  Called when a new connection starts, because
+        readings from the previous one describe a different set-up."""
+        with self._lock:
+            self._value_ua = None
+            self._at = 0.0
+            self._history.clear()
+            self._disturbed_at = 0.0
+            self._count = 0
+
+    def disturb(self) -> None:
+        """Note that the output current was just changed deliberately.
+
+        Called wherever this server switches the probe, the voltage or a
+        calibration load.  It does not discard anything; it moves the boundary
+        that decides whether the newest reading is reported as settled.
+        """
+        with self._lock:
+            self._disturbed_at = time.monotonic()
+
+    def feed(self, iavg_ua: float) -> None:
+        """Take one asc_ammeter message.  Runs on the driver's thread."""
+        now = time.monotonic()
+        with self._lock:
+            self._value_ua = float(iavg_ua)
+            self._count += 1
+            if self._at and (now - self._at) < AMMETER_BURST_S:
+                # Backlog replay: keep the value as the latest, but overwrite
+                # rather than extend the series, so the burst collapses to the
+                # single point it is worth.
+                self._at = now
+                if self._history:
+                    self._history[-1] = (now, float(iavg_ua))
+                return
+            self._at = now
+            self._history.append((now, float(iavg_ua)))
+
+    def snapshot(self, window_s: float = 60.0) -> dict:
+        """Latest reading in mA, plus how it has behaved over window_s.
+
+        Returns mA throughout: the device speaks microamps but everything else
+        in this server is milliamps, and one conversion at the boundary is
+        cheaper than remembering which unit a given number is in.
+        """
+        now = time.monotonic()
+        with self._lock:
+            value_ua, at = self._value_ua, self._at
+            disturbed, count = self._disturbed_at, self._count
+            recent = [v for t, v in self._history if now - t <= window_s]
+            span = (now - min((t for t, _ in self._history
+                               if now - t <= window_s), default=now))
+
+        if value_ua is None:
+            return {
+                "available": False,
+                "reason": ("No ammeter reading yet. The P1150 sends one a "
+                           "second from the moment it connects, so this means "
+                           "the link has only just come up -- wait a second "
+                           "and ask again -- or that it is not connected."),
+            }
+
+        age = now - at
+        out = {
+            "available": True,
+            "current_ma": round(value_ua / 1000.0, 6),
+            "age_s": round(age, 2),
+            "stale": age > AMMETER_STALE_S,
+            # The newest reading averages the second ending at 'at', so it only
+            # describes the present configuration if that whole second began
+            # after the last change.
+            "settled": (at - disturbed) >= AMMETER_PERIOD_S,
+            "readings_received": count,
+        }
+        if recent:
+            out["window_s"] = round(span, 1)
+            out["window_samples"] = len(recent)
+            out["window_min_ma"] = round(min(recent) / 1000.0, 6)
+            out["window_max_ma"] = round(max(recent) / 1000.0, 6)
+            out["window_mean_ma"] = round(
+                sum(recent) / len(recent) / 1000.0, 6)
+        return out
+
+    def series(self, since: float, until: float = None) -> list:
+        """Readings between two monotonic instants, as [{"t_s", "current_ma"}].
+
+        t_s is relative to 'since', so a caller that started watching at a known
+        moment gets a series counted from when it started watching.
+        """
+        until = time.monotonic() if until is None else until
+        with self._lock:
+            points = [(t, v) for t, v in self._history if since <= t <= until]
+        return [{"t_s": round(t - since, 2),
+                 "current_ma": round(v / 1000.0, 6)} for t, v in points]
+
+
 def _join(chunks: list) -> tuple:
     """Concatenate chunk dicts into one (i, isnk, aux) triple.
 
@@ -247,6 +412,13 @@ class Session:
         self.vout_mv = None
         self.ovc_ma = None
         self.probe_on = False
+
+        # Fed by the driver's async callback for the whole life of the
+        # connection, so it has an answer before anyone asks for one.
+        self.ammeter = _Ammeter()
+        # What the device last said its output voltage is, which is not
+        # necessarily what set_vout asked for.
+        self.vout_reported_mv = None
 
         self._acq_event = threading.Event()
         self._acq_chunk = None
@@ -289,7 +461,27 @@ class Session:
         return self._aux
 
     def _cb_async(self, data: dict) -> None:
-        pass  # periodic ammeter/temperature chatter; nothing to do with it here
+        """DLL async callback: unprompted device chatter, about once a second.
+
+        Runs on the driver's receive thread, so it returns immediately and
+        cannot raise -- an exception here would not reach any caller and ctypes
+        would print and swallow it, leaving the ammeter silently dead with no
+        sign of why.  An unrecognised message is not an error: the device says
+        more than this server listens for, and a firmware that adds another
+        kind of chatter must not break the readings.
+        """
+        try:
+            f = data.get("f")
+            # 's' is the device's own verdict on the message it just sent; a
+            # false one carries no reading worth having.
+            if f == "asc_ammeter" and data.get("s"):
+                self.ammeter.feed(data["iavg"])
+            elif f == "asc_vout_mv" and data.get("s"):
+                # The only unsolicited confirmation that vout actually reached
+                # what set_vout asked for.
+                self.vout_reported_mv = int(data["vout_mv"])
+        except Exception:
+            pass
 
     def is_connected(self) -> bool:
         return self.dev is not None and self.dev.is_connected()
@@ -375,6 +567,11 @@ class Session:
         # covers the case where the first connect landed mid-transition.
         attempts = CONNECT_ATTEMPTS
         details = None
+        # Readings taken over the previous link describe a set-up that no longer
+        # exists, and calibration moves the output about, so this connection
+        # starts with no history and nothing counted as settled.
+        self.ammeter.reset()
+        self.ammeter.disturb()
         while attempts >= 1:
             dev = PXXXX(port=port,
                         cb_uclog_async=self._cb_async,
@@ -427,6 +624,8 @@ class Session:
         self.dev = None
         self.probe_on = False
         self.vout_mv = None
+        self.vout_reported_mv = None
+        self.ammeter.reset()
         return {"connected": False}
 
     # ---- power ----------------------------------------------------- #
@@ -461,6 +660,10 @@ class Session:
         if not ok:
             raise DeviceError(f"probe connect failed: {r}")
         self.probe_on = True
+        # The ammeter message that spans this instant averages the target's
+        # current together with the open-probe zero before it, and reads as a
+        # target drawing roughly half what it does.
+        self.ammeter.disturb()
 
         return {"powered": True, "voltage_mv": self.vout_mv,
                 "ovc_ma": self.ovc_ma, "probe_connected": True}
@@ -471,6 +674,7 @@ class Session:
         if not ok:
             raise DeviceError(f"probe disconnect failed: {r}")
         self.probe_on = False
+        self.ammeter.disturb()
         return {"powered": False, "probe_connected": False}
 
     # ---- status ---------------------------------------------------- #
@@ -506,6 +710,13 @@ class Session:
             "temperature_c": round(float(s["t_degc"]), 1),
             "errors": errs or None,
         }
+        # The live reading costs nothing to include and answers the question
+        # that follows a status check often enough -- "so is it drawing
+        # anything?" -- to be worth not requiring a second call.  One-second
+        # average; p1150_ammeter carries the caveats.
+        a = self.ammeter.snapshot()
+        if a.get("available") and not a.get("stale"):
+            out["ammeter_ma"] = a["current_ma"]
         if errs:
             out["hint"] = (
                 "OVER_CURRENT_SOURCE means the target drew more than the OVC "
@@ -528,6 +739,75 @@ class Session:
         if not ok:
             raise DeviceError("clear_error failed")
         return self.status()
+
+    # ---- ammeter ---------------------------------------------------- #
+
+    def _ammeter_context(self, out: dict) -> dict:
+        """Attach what the number means to the number itself.
+
+        The ammeter measures where the P1150 sources current, not at the probe
+        tip, so the same reading means different things depending on what the
+        output is connected to.  A bare 0.001 mA is the most misreadable result
+        this server can produce: it is what a superb sleep current looks like
+        and equally what an open probe looks like.  Nothing downstream can tell
+        those apart from the value, so the distinction travels with it.
+        """
+        out["probe_connected"] = self.probe_on
+        out["voltage_mv"] = self.vout_mv
+        if not self.probe_on:
+            out["warning"] = (
+                "The probe is OPEN, so this is not the target's current -- it "
+                "is what the P1150's own output is drawing, which is near zero. "
+                "Call p1150_power_on before reading anything into it.")
+        elif out.get("stale"):
+            out["warning"] = (
+                f"The last reading is {out['age_s']}s old. The P1150 sends one "
+                f"a second, so the stream has stopped: check p1150_status for a "
+                f"latched error, and that the unit is still attached.")
+        elif not out.get("settled"):
+            out["warning"] = (
+                "The output was changed less than a second ago, so this reading "
+                "averages across the change and is neither the current before "
+                "nor the current after. Wait a second and read again.")
+        return out
+
+    def ammeter_read(self, window_s: float = 60.0) -> dict:
+        self.require()
+        return self._ammeter_context(self.ammeter.snapshot(window_s))
+
+    def ammeter_watch(self, duration_s: float) -> dict:
+        """Collect readings from now for duration_s, then report the series.
+
+        Blocking, and deliberately so: the point is to watch while the developer
+        does something to the target.  Note that the readings accumulate whether
+        anyone is watching or not, so wanting the last minute is not a reason to
+        block for a minute -- ammeter_read's window covers that already.
+        """
+        self.require()
+        start = time.monotonic()
+        deadline = start + float(duration_s)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.2, remaining))
+        series = self.ammeter.series(start)
+        out = self._ammeter_context(self.ammeter.snapshot(duration_s))
+        # The rolling window covers the same seconds the series does, so its
+        # statistics would be the same numbers under different names.  Two sets
+        # of nearly-equal figures invite the reader to look for a difference
+        # that is not there.
+        for k in ("window_s", "window_samples", "window_min_ma",
+                  "window_max_ma", "window_mean_ma"):
+            out.pop(k, None)
+        out["duration_s"] = round(time.monotonic() - start, 2)
+        out["series"] = series
+        if series:
+            vals = [p["current_ma"] for p in series]
+            out["series_min_ma"] = min(vals)
+            out["series_max_ma"] = max(vals)
+            out["series_mean_ma"] = round(sum(vals) / len(vals), 6)
+        return out
 
     # ---- acquisition ----------------------------------------------- #
 
@@ -585,6 +865,7 @@ class Session:
                 if connect_probe_during and k == 0 and not self.probe_on:
                     dev.probe(connect=True)
                     self.probe_on = True
+                    self.ammeter.disturb()
         finally:
             try:
                 dev.acquisition_stop()
@@ -823,6 +1104,7 @@ class Session:
             if not ok:
                 raise DeviceError(f"probe connect failed: {r}")
             self.probe_on = True
+            self.ammeter.disturb()
 
         i, isnk, aux = self._acquire_single(
             dev, timeout_s,
@@ -875,6 +1157,10 @@ class Session:
             i, isnk, _ = self.measure(1.0)
         finally:
             dev.set_cal_sweep(sweep=False)
+            # The sweep put decade resistors across the output for a second, so
+            # the ammeter readings covering it describe the calibration load and
+            # not the target.
+            self.ammeter.disturb()
         return {"current_ma": i, "sink_ma": isnk, "voltage_mv": self.vout_mv}
 
     # ---- background capture ---------------------------------------- #

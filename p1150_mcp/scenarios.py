@@ -58,6 +58,28 @@ Leave the power on between measurements.  Cutting it forces the target to
 reboot, and a reboot is a large current event that contaminates the next
 capture.
 
+## The free reading, and what it cannot do
+The P1150 reports its output current once a second on its own, the whole time it
+is connected, whether or not anything is capturing.  p1150_ammeter returns the
+newest one and p1150_ammeter_watch follows it for a while.  Neither costs a
+capture, a run on disk or any waiting, and both work while a capture is already
+running.
+
+Use it for the questions that are about *what is happening*, not about a number:
+is the target awake, did it survive the re-flash, has it settled after boot, is
+the probe actually making contact, did that change move anything at all.  It is
+the fastest way to tell a target asleep at 8 uA from one that is not powered --
+though note that an open probe also reads near zero, so check probe_connected
+before reading anything into a low value.
+
+Do not use it for a number that has to mean something.  It is a one-second
+average, so it cannot show a peak, a burst, a duration or a shape: a target
+sleeping at 10 uA that transmits 80 mA for 2 ms each second reads about 170 uA,
+which is arithmetically true and describes neither the sleep nor the transmit.
+Nothing in a battery life estimate should come from it, no state baseline should
+be quoted from it, and a surprising reading is a reason to capture rather than to
+read again.  Everything below this line is about captures for that reason.
+
 ## Choosing a voltage
 Match what the battery actually delivers, not its nominal label.  A single-cell
 Li-ion is 4200 mV full, ~3700 mV nominal, ~3300 mV nearly empty; current draw

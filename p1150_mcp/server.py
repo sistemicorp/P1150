@@ -378,6 +378,13 @@ def p1150_start() -> dict:
             "usage_events": usage["events"],
             "runs_stored": len(storage.list_runs(1000)),
         }
+        # What the target is drawing at this moment, if anything is connected.
+        # It is free -- the reading arrives once a second whether it is asked
+        # for or not -- and orientation is exactly when it is useful.
+        if SESSION.is_connected():
+            a = SESSION.ammeter.snapshot()
+            if a.get("available") and not a.get("stale"):
+                out["ammeter_ma"] = a["current_ma"]
         total = config.usage_fraction_total()
         if usage["states"]:
             out["usage_fraction_total_pct"] = round(total, 3)
@@ -1396,6 +1403,85 @@ def p1150_clear_error() -> dict:
     """
     try:
         return SESSION.clear_error()
+    except Exception as e:
+        return _fail(e)
+
+
+# ------------------------------------------------------------------ #
+# Ammeter                                                              #
+# ------------------------------------------------------------------ #
+@mcp.tool()
+def p1150_ammeter(window_s: float = 60.0) -> dict:
+    """What the target is drawing right now. Free, instant, no capture.
+
+    The P1150 sends a current reading once a second, unasked, for the whole time
+    it is connected; this returns the newest one. It costs nothing, takes no
+    time, stores no run, and works while a capture is already running -- so it
+    is the right way to answer "is the target awake", "did that change do
+    anything", "is it still alive" without interrupting anything.
+
+    IT IS A ONE-SECOND AVERAGE, AND THAT IS ITS LIMIT. It cannot show a peak, a
+    burst, a spike or a shape. A target that sleeps at 10 uA and transmits 80 mA
+    for 2 ms every second reads about 170 uA here -- a number that is real, and
+    that describes neither state. Do not use it to characterise a state, to
+    quote a sleep current, or as an input to battery life: those need
+    p1150_measure and the method in p1150_measurement_guide. If a reading
+    surprises you, capture it rather than repeating it.
+
+    Nor is it a substitute for p1150_measure when the answer matters. The point
+    of this tool is that it is already there, not that it is equivalent.
+
+    Reads it correctly:
+      * current_ma -- the mean over the second just elapsed.
+      * settled -- false when the output was changed less than a second ago, so
+        the reading spans the change and is a blend of before and after. Wait a
+        second. This is measured behaviour, not a theoretical caution.
+      * stale -- true when the once-a-second stream has stopped, which is what a
+        wedged or unplugged unit looks like from here.
+      * probe_connected -- FALSE MEANS THIS IS NOT THE TARGET'S CURRENT. With
+        the probe open the reading is near zero, which is indistinguishable from
+        an excellent sleep current. Check this before believing a low number.
+
+    window_s also reports min, max and mean over the last window_s of readings,
+    up to ten minutes, held in memory since the moment the P1150 connected. That
+    history is free too: asking for the last five minutes does not wait five
+    minutes. A max well above the mean means the target is doing something
+    bursty, which is the signal to go and capture it properly.
+    """
+    try:
+        return SESSION.ammeter_read(window_s)
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_ammeter_watch(duration_s: float = 10.0) -> dict:
+    """Watch the target's current for duration_s and report it second by second.
+
+    Blocks for duration_s, then returns one reading per second as a small series
+    plus its min, max and mean. Use it to watch while something happens that you
+    want to see the effect of but do not need the shape of: the developer
+    pressing a button, a radio joining a network, a target settling after boot,
+    a firmware image being flashed and coming back up.
+
+    Prefer p1150_ammeter when you want the current NOW -- readings accumulate in
+    the background whether anything is watching or not, so its window already
+    covers the last ten minutes and blocking for a minute to learn about the
+    last minute wastes a minute.
+
+    Every caveat on p1150_ammeter applies to every point in this series: each is
+    a one-second average that hides whatever happened inside its second. A
+    series that steps 0.01 -> 0.01 -> 45 -> 0.01 tells you something woke up and
+    roughly what it cost on average; it does not tell you the peak, and the peak
+    is what trips an over-current limit and browns out a battery. Capture that
+    with p1150_measure or p1150_capture_single.
+
+    duration_s is capped at 300. For anything longer, start a real capture with
+    p1150_capture_start -- it records every sample rather than one a second.
+    """
+    try:
+        d = max(1.0, min(float(duration_s), 300.0))
+        return SESSION.ammeter_watch(d)
     except Exception as e:
         return _fail(e)
 

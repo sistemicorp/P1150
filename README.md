@@ -417,6 +417,22 @@ that do not simply ignore the notifications.
 
 **Power** — `p1150_power_on`, `p1150_power_off`
 
+**Live current** — `p1150_ammeter` (what the target is drawing right now),
+`p1150_ammeter_watch` (one reading a second for a while)
+
+The P1150 sends a current reading once a second on its own, unasked, the whole
+time it is connected.  The server keeps the newest one and the last ten minutes
+of them, so "what is it drawing?" is answered from memory: no capture, no run on
+disk, no waiting, and it works while a capture is already running.  It is also
+the cheapest way to tell a target that is asleep from one that is not powered at
+all.
+
+It is a one-second *average*, and that is the whole of its limit.  It cannot
+show a peak or a shape — a target sleeping at 10 µA that transmits 80 mA for 2 ms
+each second reads about 170 µA, which is true and describes neither state.  Use
+it to see what is happening; use `p1150_measure` when the number has to mean
+something.
+
 **Capture** — `p1150_measure` (fixed duration), `p1150_capture_start` /
 `p1150_capture_status` / `p1150_capture_stop` (open-ended, for the
 edit-flash-run loop), `p1150_capture_single` (one triggered event)
