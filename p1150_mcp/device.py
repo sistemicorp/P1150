@@ -592,6 +592,59 @@ class Session:
                 pass
         return _join(chunks)
 
+    def measure_when(self, duration_s: float, match, timeout_s: float = 60.0,
+                     on_reject=None) -> tuple:
+        """Stream, discarding until match() accepts a chunk, then capture.
+
+        Returns (i, isnk, aux, waited_s).
+
+        The alternative -- wait in one call, then capture in another -- leaves a
+        gap between the two in which the target can leave the state again, and
+        on a target that enters a state briefly that gap is most of the time.
+        Here the acquisition never stops: the chunk that satisfies the match is
+        the first chunk kept, so the capture begins inside the state rather than
+        some time after it was last seen.
+
+        match is given one chunk (the raw aux dict) and decides whether the
+        target is in the wanted state.  Rejected chunks go to on_reject, which
+        is how the caller accumulates what it saw for a timeout message -- this
+        layer deliberately knows nothing about how a state is encoded.
+        """
+        dev = self.require()
+        if self._capture_thread is not None:
+            raise DeviceError("A background capture is running; "
+                              "call p1150_capture_stop first.")
+        self._arm_aux()
+        if not self._aux:
+            raise DeviceError(
+                "No auxiliary channel is being recorded, so there is no signal "
+                "to wait for. Declare the state signal with "
+                "p1150_set_state_signal first.")
+        dev.set_timebase(STREAM_TIMEBASE)
+        n_chunks = max(1, int(round(duration_s / STREAM_CHUNK_S)))
+        chunks, waited = [], 0.0
+        try:
+            while True:
+                chunk = self._stream_chunk(dev)
+                if match(chunk):
+                    chunks.append(chunk)
+                    break
+                if on_reject is not None:
+                    on_reject(chunk)
+                waited += STREAM_CHUNK_S
+                if waited >= timeout_s:
+                    raise DeviceError(
+                        f"The target did not enter the state within "
+                        f"{timeout_s:g} s.")
+            while len(chunks) < n_chunks:
+                chunks.append(self._stream_chunk(dev))
+        finally:
+            try:
+                dev.acquisition_stop()
+            except Exception:
+                pass
+        return _join(chunks) + (waited,)
+
     def _aux_trigger_level(self, channel: str) -> float:
         """Level to trigger an aux channel at, in that channel's own units."""
         cfg = config.aux_channel_cfg(channel)

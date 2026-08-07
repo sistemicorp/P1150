@@ -239,6 +239,8 @@ settings:
 
 Ask the agent things like:
 
+* *"I've got a P1150 and a new board — where do I start?"*
+* *"How long will this run on a 220 mAh cell?  It needs to last a week."*
 * *"Power the target at 3700 mV and measure its sleep current."*
 * *"Take a baseline, then I'll flash the new build and we'll compare."*
 * *"Battery life dropped — find out what changed."*
@@ -250,14 +252,14 @@ Ask the agent things like:
 ## Battery settings
 
 The agent is told to ask you, once per project, what capacity battery the target
-runs on, and to record it with `p1150_set_battery`.  It persists in
-`.p1150_runs/battery.json`, so it is asked once and not again.
+runs on and how long it has to last, and to record both with `p1150_set_battery`.
+They persist in `.p1150_runs/battery.json`, so they are asked once and not again.
 
-It cannot be inferred from a waveform or from the code, and it is what turns a
-current reading into something you can act on: projected battery life, the share
-of the pack one wake-up or one boot costs, how many times an operation can run
-before the battery is flat, and whether a measured charging current is a
-sensible C rate.
+Neither can be inferred from a waveform or from the code, and together they turn
+a current reading into something you can act on: projected battery life against
+the requirement, the share of the pack one wake-up or one boot costs, how many
+times an operation can run before the battery is flat, and whether a measured
+charging current is a sensible C rate.
 
 Three optional settings go in the same place and matter only for the inrush
 assessment below: `chemistry`, the cell's internal resistance `esr_mohm` if you
@@ -269,6 +271,107 @@ A typical session: `p1150_connect` → `p1150_power_on(3700, 500)` → the targe
 stays powered while you edit and re-flash over JTAG →
 `p1150_capture_start("baseline")` … run the workload …  `p1150_capture_stop` →
 change code, repeat → `p1150_compare(baseline, candidate)`.
+
+## Estimating battery life
+
+Ask *"how long will it last"* and the agent works through `p1150_start`, which
+reports where the project has got to and what the next step is.
+
+A device meant to run for a week cannot be measured for a week, and the answer
+does not come from extrapolating one capture — a minute of a device that happens
+to be busy predicts a day, a minute of one that happens to be asleep predicts a
+decade.  Instead the product's life is split into **states**, and
+
+    battery life = capacity / Σ(fraction of time × current in that state)
+
+The P1150 measures the currents, in well under a minute each.  You supply the
+weighting, because how much of the day the device spends in each state is a fact
+about your product and not about the board on the bench.  The agent asks for it
+and records it with `p1150_set_usage_state`; it persists in
+`.p1150_runs/usage.json`.
+
+Anything that happens a countable number of times a day — a boot, a user
+interaction, an upload, a wake from standby — is declared instead with
+`p1150_set_usage_event`, as a rate and a charge per occurrence.  A three-second
+boot is 0.003% of a day and vanishes if you try to express it as a fraction,
+while at 2 × 410 µAh it can be a fifth of a coin cell's daily budget.
+
+```
+p1150_set_battery(capacity_mah=220, target_days=7)
+p1150_set_usage_state("standby", hours_per_day=23.5)
+p1150_set_usage_state("active",  hours_per_day=0.5)
+p1150_set_usage_event("boot", per_day=2, charge_uah=410)
+p1150_measure_state("standby", 30)     # you put the target in the state
+p1150_measure_state("active", 30)
+p1150_battery_life()
+```
+
+`p1150_measure_state` checks that each capture is actually fit to stand for a
+whole week, which catches the two failures that otherwise look like clean
+measurements: a target still descending into a low-power state — they step down
+over minutes, so a standby figure taken right after boot can read several times
+high — and a capture too short to cover enough of the state's own repetitions.
+
+### Letting the target say which state it is in
+
+Every baseline above rests on someone confirming the target was in the right
+mode.  That is the weakest step in the whole measurement, and if the firmware can
+be edited it can be removed entirely: have the target drive a 2-bit code on two
+spare GPIOs into D0 and D1, saying which state it is in.
+
+```c
+typedef enum { ST_SLEEP=0, ST_IDLE=1, ST_ACTIVE=2, ST_TX=3 } state_t;
+
+static inline void p1150_state(state_t s) {
+    NRF_P0->OUTCLR = P1150_D0 | P1150_D1;
+    NRF_P0->OUTSET = ((s & 1u) ? P1150_D0 : 0u)
+                   | ((s & 2u) ? P1150_D1 : 0u);
+}
+```
+
+```
+p1150_set_state_signal("sleep",  code=0)     # code 0 = lowest-power state
+p1150_set_state_signal("idle",   code=1)
+p1150_set_state_signal("active", code=2)
+p1150_state_check()                          # confirms the pins are driven
+p1150_measure_states(60)                     # the device just runs normally
+```
+
+One capture of the target doing its real work then yields a separate current for
+every state it passed through, with no one staging anything — and more
+accurately than measuring them one at a time, since every state shares a board, a
+session, a supply voltage and a build.  `p1150_measure_state("sleep")` still
+works and now waits until the firmware declares it is in that state, keeping only
+the samples where it says so.
+
+This is aimed squarely at the case where an agent is co-developing the target's
+firmware and driving the instrument in the same conversation: the fifteen lines
+are an edit it can make itself, and every measurement afterwards is exact rather
+than asserted.  `p1150_state_signal_guide` has the details, including the failure
+that catches everyone — several MCUs release GPIO drive in deep sleep unless pad
+retention is configured, so the pins float during exactly the state most worth
+measuring.
+
+For a self-driven device — a sensor node on a timer, a beacon, a tracker — the
+measured time in each state *is* the duty cycle, and `p1150_usage_from_capture`
+adopts it as the usage model.  For anything a user drives it is not, and the tool
+says so rather than guessing: a wearable measured on a desk spends none of that
+minute being worn.
+
+`p1150_battery_life` then reports more than a number.  It ranks what is *actually*
+spending the battery, which regularly contradicts intuition: a state occupying
+99% of the time can be a third of the drain.  It gives the life if each
+contributor were halved or removed entirely, which bounds what optimising it
+could ever be worth.  It says how much the answer moves if your time split is out
+by 2×, so you know whether the guess needed to be accurate.  And against
+`target_days` it returns PASS / MARGINAL / SHORT, with what each contributor
+would have to become to get there — *"sleep current from 180 µA to 95 µA"*, or
+*"boots from 20 a day to 6"* — including which ones cannot get there at all
+because the rest already exceed the budget.
+
+The estimate uses rated capacity and excludes self-discharge, temperature and
+ageing, so it is optimistic; `p1150_battery_life_guide` sets out by how much and
+what to do where the figure has to be defensible.
 
 ## Why it is not a 1:1 wrapper of the driver
 
@@ -285,7 +388,23 @@ open across tool calls so the target stays powered between measurements.
 
 ## Tools
 
-**Project** — `p1150_set_battery`, `p1150_get_battery`
+**Orientation** — `p1150_start` reports what is connected, what the project has
+configured, which states still need measuring, and the one next step.  It is
+where an agent should begin a session.
+
+**Project** — `p1150_set_battery`, `p1150_get_battery`, `p1150_set_usage_state`,
+`p1150_set_usage_event`, `p1150_get_usage`, `p1150_clear_usage`
+
+**Battery life** — `p1150_measure_state` (one state's baseline, checked for
+fitness), `p1150_baseline_check` (the same check on any stored run),
+`p1150_battery_life` (the estimate, the ranking of contributors, and the verdict
+against the requirement)
+
+**State signal** — `p1150_set_state_signal`, `p1150_get_state_signal`,
+`p1150_clear_state_signal`, `p1150_state_check` (wiring and firmware
+verification), `p1150_measure_states` (every state from one capture),
+`p1150_state_split` (the same breakdown on any stored run),
+`p1150_usage_from_capture`
 
 **Device** — `p1150_list_devices`, `p1150_connect`, `p1150_disconnect`,
 `p1150_status`, `p1150_clear_error`, `p1150_self_test`
@@ -318,10 +437,12 @@ band), `p1150_events` (wake-up rate, burst length, charge per wake),
 `p1150_list_runs`
 
 **Guidance** — `p1150_measurement_guide` returns the measurement know-how the
-agent needs: how to choose a voltage and over-current limit, the nine current
+agent needs: how to choose a voltage and over-current limit, the ten current
 profiles worth knowing and what capture length each needs, and the mistakes that
 produce measurements which look fine but mean nothing.
-`p1150_marker_guide` covers the GPIO-marker workflow below, and
+`p1150_battery_life_guide` covers the estimation method above,
+`p1150_state_signal_guide` the firmware that makes the target declare its own
+state, `p1150_marker_guide` the GPIO-marker workflow below, and
 `p1150_inrush_guide` the inrush one.
 
 Charge is reported in mAh (µAh for a single wake-up event), matching how battery

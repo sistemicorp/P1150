@@ -21,12 +21,26 @@ convert to Coulombs.
 
 ## Ask for the battery capacity first
 At the start of a project, before measuring anything, ask the developer what
-capacity battery (in mAh) the target runs on, and record it with
-p1150_set_battery.  It cannot be inferred from a waveform or from the code, and
-it is what turns a current reading into something actionable: how long the
-device lasts, what share of the battery a single wake-up or boot costs, how many
-times an operation can run before the pack is flat, and whether a charging
-current is a sensible C rate.  It persists, so it is asked once per project.
+capacity battery (in mAh) the target runs on, and how long it has to last.
+Record both with p1150_set_battery.  Neither can be inferred from a waveform or
+from the code, and together they turn a current reading into something
+actionable: how long the device lasts, whether that meets the requirement, what
+share of the battery a single wake-up or boot costs, how many times an operation
+can run before the pack is flat, and whether a charging current is a sensible
+C rate.  They persist, so they are asked once per project.
+
+## If the question is "how long will the battery last", read p1150_battery_life_guide
+It is the usual first question of a new project and it is not answered by any
+single capture.  A capture measures one state; the product moves between
+states, and the weighting between them comes from the developer rather than
+from the instrument.  Getting a week of predicted life out of a minute of
+measuring is a method -- states, events, and the arithmetic that combines them
+-- and the guide has it.  p1150_start reports where the current project is in
+that method.
+
+Do not answer it from projected_days_if_continuous on a single capture.  That
+number assumes the target never leaves the state it was captured in, and on a
+duty-cycled device it is wrong by the duty cycle -- routinely by 100x.
 
 ## The normal working order
 1. p1150_connect(sn)                       -- ~15 s the first time (firmware +
@@ -36,6 +50,9 @@ current is a sensible C rate.  It persists, so it is asked once per project.
 3. ... developer edits and re-flashes firmware over JTAG, power stays on ...
 4. p1150_measure(...) or capture_start/stop -- as many times as wanted
 5. p1150_compare(baseline, candidate)
+
+For battery life specifically, step 4 becomes p1150_measure_state once per
+declared state and step 5 becomes p1150_battery_life.
 
 Leave the power on between measurements.  Cutting it forces the target to
 reboot, and a reboot is a large current event that contaminates the next
@@ -62,7 +79,24 @@ developer early, before a session is spent inferring boundaries from a current
 trace.  p1150_marker_guide has the firmware and wiring detail; profile 6 below
 is the short version.
 
-## The nine profiles worth knowing
+## The ten profiles worth knowing
+
+### 0. Baseline for a usage state
+What: the representative current of one state the product spends its life in --
+     standby, connected-idle, streaming.  The building block of a battery-life
+     estimate, and where a new project starts.
+How: best, if the firmware can be edited, is to have the target signal its own
+     state on two GPIOs -- p1150_state_signal_guide -- and then
+     p1150_measure_states(60) gives a current for every state from one capture.
+     Otherwise ask the developer to put the target into the state and confirm it
+     is there, let it settle, then
+     p1150_measure_state(state="standby", duration_s=30).
+Read: the baseline verdict, then p1150_battery_life once every state has one.
+Wrong looks like: NOT_SETTLED -- the target was still descending into the state,
+     which targets do in steps over minutes.  TOO_SHORT -- the state has its own
+     duty cycle and too few periods were captured.  Both are reported with what
+     to do instead.  Neither can happen to a signalled state, because the
+     samples that were not the state are not in the measurement.
 
 ### 1. Sleep / quiescent floor
 What: the current when the target has nothing to do.  Usually microamps.
@@ -253,12 +287,227 @@ current, and proposes a likely cause.  The causes map to distinct fixes:
 - Averages hide duty cycle.  1 mA average can be 1 mA constant, or 1 uA for
   999 ms and 1 A for 1 ms.  Those need completely different fixes; always look
   at p1150_segment or p1150_events before concluding anything.
+- A capture of one state is not the product's battery life.  Projecting
+  capacity/average from a capture assumes the target never leaves the state it
+  was in, which is true of almost no battery-powered device.  Weight the states
+  with p1150_battery_life instead.
+- A target settles into its lowest state in steps over minutes, not instantly.
+  Measuring standby thirty seconds after boot commonly reads several times the
+  real figure, and nothing about the capture looks wrong.
 - A threshold-detected event is only as good as the threshold.  If the answer
   matters, mark the region with a GPIO instead -- see p1150_marker_guide.
 - The P1150 is not a battery.  It holds its output voltage where a cell would
   sag, so a target that pulls a large surge looks fine here and browns out in
   the field.  If a capture reports an inrush warning, do not dismiss it because
   the target ran perfectly during the measurement -- read p1150_inrush_guide.
+"""
+
+
+BATTERY_LIFE_GUIDE = """\
+# Estimating battery life
+
+## The problem
+A product designed to run for a week cannot be measured for a week, and nobody
+would wait.  A capture is seconds to a minute; the answer is days to years.
+Bridging four orders of magnitude looks like extrapolation, and extrapolation
+from a short capture is exactly how estimates go wrong -- a minute of a device
+that happens to be busy predicts a day, a minute of one that happens to be
+asleep predicts a decade, and both are the same device.
+
+## The method
+Do not extrapolate a capture.  Split the product's life into states, measure the
+CURRENT of each state, and get the TIME WEIGHTING from the developer:
+
+    battery life = capacity_mah / SUM(fraction_of_time x current_in_that_state)
+
+The instrument supplies the currents, to a fraction of a microamp, in under a
+minute per state.  The developer supplies the weights, which no instrument can
+measure because they are a fact about how the product gets used, not about the
+board on the bench.  Separating those two is the whole technique.  It is also
+why the estimate is trustworthy: each measured piece is short enough to be
+measured properly, and the only guess in it is one the developer is qualified to
+make.
+
+The same split explains what to do when the answer is wrong.  A life that comes
+out too short is either a current that is too high (a firmware or hardware
+problem, fixable) or a duty cycle that is too demanding (a product decision,
+negotiable).  The estimate says which, and they go to different people.
+
+## States and events are different, and the difference matters
+A STATE is continuous, and weighted by a fraction of time.
+    standby 99.2%, connected-idle 0.7%, streaming 0.1%
+Its cost is a current.
+
+An EVENT is discrete, and weighted by a rate.
+    boots twice a day; user opens the app 20 times a day; OTA once a month
+Its cost is a CHARGE per occurrence, in uAh.
+
+Do not try to express an event as a time fraction.  A 3-second boot is 0.003% of
+a day, which rounds to nothing and gets dropped -- while as 2 x 410 uAh it is
+plainly a fifth of the daily budget of a coin-cell design.  Anything that
+happens a countable number of times a day is an event.
+
+They reconcile in one line, which is why one estimator handles both:
+
+    equivalent_ma = charge_uah x occurrences_per_hour / 1000
+
+Transitions are events too.  Waking from standby into active is rarely free --
+a radio reconnects, a sensor warms up, a regulator starts -- and on a device
+that transitions often, the transitions can cost more than either state.  If the
+developer says the device wakes 200 times a day, measure one wake with
+p1150_capture_single and declare it with p1150_set_usage_event.  Do not fold it
+into either state.
+
+## Asking for the usage model
+This is a conversation, not an inference.  Never guess the split from the
+firmware source, from timer periods, or from what a similar product did -- a
+timer period tells you how often something runs, not how much of the day the
+device spends in each mode of a product nobody has finished designing yet.
+
+Ask, in roughly these words:
+
+  1. "What states does the device have?  Something like: asleep, awake but idle,
+     and actively doing its job."  Aim for two to four.  More than four and the
+     small ones will not matter; fewer than two and there is nothing to weight.
+  2. "Out of a typical day, how long is it in each?"  Hours per day is easier to
+     answer than percentages, and p1150_set_usage_state takes either.
+  3. "What happens a countable number of times a day?"  Boots, user
+     interactions, uploads, wake-ups, OTA updates.
+  4. "How long does the battery have to last?"  Record it with
+     p1150_set_battery(target_days=...) and every estimate is then reported
+     against it, with what would have to change to get there.
+
+The fractions must add to 100%.  If they do not, time is unaccounted for and the
+estimate is undefined -- unaccounted time could be at any current at all, so it
+cannot be assumed to be cheap.  The usual fix is that the resting state was left
+out because it felt too obvious to mention.
+
+An uncertain answer is fine and does not need to be resolved up front.  Take the
+developer's best guess, and p1150_battery_life reports how much the answer moves
+if that guess is out by a factor of two.  Very often it barely moves, because
+one state dominates -- and then the guess never needed to be precise.  Chase it
+only when the tool says it matters.
+
+## Let the target say which state it is in
+If the firmware can be edited -- and if you are the one writing it, it can --
+have it drive a 2-bit code on two spare GPIOs saying which state it is in.  That
+is about fifteen lines, and it changes the method fundamentally:
+
+    p1150_measure_states(60)     one capture of the device doing its real work,
+                                 split into a current for every state it visited
+    p1150_measure_state("sleep") waits until the firmware declares it is in the
+                                 state, keeps only the samples where it says so
+
+The claim "the target was in standby while this was measured" stops being
+something a person asserts and becomes a fact recorded sample-for-sample beside
+the current.  Every warning in the next section about settling and about
+capturing the wrong state stops applying, because the samples that were not the
+state are simply not in the measurement.
+
+p1150_state_signal_guide has the firmware.  Raise it before spending a session
+on hand-staged baselines.
+
+## Measuring a state by hand
+Without a state signal, the target has to be put into the state by a person and
+the capture timed around it.
+
+    p1150_measure_state(state="standby", duration_s=30)
+
+Three things have to be true of that capture, and only the first is obvious:
+
+**The target must actually be in the state.**  Only the developer can put it
+there.  Ask explicitly -- "put it into standby and tell me when it is there" --
+and wait for confirmation before capturing.  A capture is cheap; a week-long
+estimate built on the wrong state is not.
+
+**The target must have finished settling.**  Targets descend into their lowest
+state in steps, over minutes, not at once: an inactivity timeout drops a radio
+connection at 30 s, supervision intervals widen, a sensor cools, a bulk
+capacitor finishes charging.  A capture taken straight after boot catches a
+shallow intermediate state and can overstate standby drain by 10x.  Wait, then
+measure.  p1150_measure_state checks for this and reports NOT_SETTLED with the
+current the capture was converging on.
+
+**The capture must cover enough repetitions.**  A "standby" that advertises once
+a second is not flat, and eight periods averaged is a different number from
+eighty.  Ten periods minimum; the check reports TOO_SHORT with a duration to use
+if it sees fewer.
+
+Typical durations: a genuinely flat sleep 10-30 s; a state duty-cycled at 1 Hz
+30-60 s; anything slower, at least twelve of its periods.  Longer is not better
+-- past the point where the average stops moving, a longer capture only produces
+a larger file.
+
+## Reading the estimate
+    p1150_battery_life()
+
+`contributors` ranks what is actually spending the battery.  This is the point
+of the whole exercise, and it routinely contradicts intuition: a state occupying
+99% of the time can be a third of the drain, and a 40 mA burst lasting 8 ms can
+be irrelevant.  Optimising anything but the top row or two is wasted effort.
+
+`optimisation_payoff` bounds that effort.  For each contributor it gives the
+life if its cost were halved, and if it were removed entirely -- the ceiling on
+what any amount of work on it can achieve.  A contributor whose complete
+elimination adds half a day to a five-day life is not worth a sprint, and that
+is much easier to see before the work than after.
+
+`duty_cycle_sensitivity` says whether the developer's time split needed to be
+accurate.  Read it before quoting a figure to anyone.
+
+`target` turns the estimate into a verdict against the required life, and when
+it is SHORT, into what each contributor would have to become to reach it:
+"sleep current from 180 uA to 95 uA", or "boots from 20 a day to 6".  Some rows
+come back `unreachable`, meaning that even at zero this contributor cannot get
+there because the others already exceed the budget -- which is a design finding,
+not a firmware one.  A MARGINAL verdict means it passes by less than the usage
+model's own uncertainty, so it is not yet proven.
+
+## What the estimate does not include
+Say these plainly rather than let a three-significant-figure number imply a
+precision it does not have:
+
+* **Usable capacity is less than rated capacity.**  A pack's mAh is quoted to a
+  cutoff voltage under a gentle discharge at room temperature.  A target that
+  browns out at 3.3 V may reach it with 15-25% of the rated charge still in the
+  cell, and the cold makes it worse.  The estimate uses the rated figure, so it
+  is optimistic by roughly that much.
+* **Self-discharge.**  Below the point where a projected life passes a year or
+  so, the cell loses charge on its own faster than the target draws it, and
+  capacity/current stops being the answer.  The estimate flags this when it
+  happens.
+* **Temperature and ageing.**  Capacity falls in the cold and over the life of
+  the cell.
+* **Anything not declared.**  A leakage path, a mode nobody mentioned, or a
+  peripheral that only runs during a firmware update is absent from the model
+  because nobody put it there.
+
+Where the answer needs to be defensible rather than indicative, the honest form
+is a range: quote the estimate, and quote it again with 20% off the capacity.
+
+## The working order
+ 1. p1150_set_battery(capacity_mah=..., target_days=...)   -- ask for both
+ 2. p1150_set_usage_state(...) for each state              -- must total 100%
+ 3. p1150_set_usage_event(...) for boots, wakes, user actions
+ 4. Measure each state:
+    with a state signal    p1150_measure_states(60) while the target runs
+                           normally -- every state at once, and better than
+                           measuring them separately, since they then share a
+                           board, a session, a supply voltage and a build
+    without one            for each state, ask the developer to put the target
+                           in it, wait for it to settle, then
+                           p1150_measure_state(state=..., duration_s=...)
+ 5. For each event: capture one occurrence (p1150_capture_single, or
+    p1150_measure with connect_probe_during=True for a boot) and pass its
+    run_id to p1150_set_usage_event
+ 6. p1150_battery_life()
+ 7. Optimise the top contributor, re-measure that state, and run it again --
+    only the state that changed needs re-measuring.
+
+Measure every state at the SAME supply voltage, and at the battery's nominal
+voltage rather than its full-charge voltage.  Current draw varies with supply
+voltage, so a model built from states measured at different voltages is not
+weighing comparable things.
 """
 
 
@@ -526,6 +775,151 @@ move and do not need to.
     first, that is what happened, and the first number is the real one.
   * A JTAG debugger or any other supply feeding the target changes the picture
     entirely; the P1150 only sees what flows through its own probe.
+"""
+
+
+STATE_SIGNAL_GUIDE = """\
+# Letting the target say which state it is in
+
+## What this replaces
+Every state baseline rests on a claim that the target was in the state while it
+was measured.  Normally that claim comes from a person -- "put it into standby
+and tell me when" -- and it is the weakest step in the whole measurement: slow,
+impossible to repeat identically, and when it is wrong the capture looks
+completely normal and the error is multiplied by that state's whole share of the
+product's life.
+
+If the firmware drives two spare GPIOs with a code saying which state it is in,
+the claim becomes a fact recorded sample-for-sample beside the current.  A
+measurement can then be restricted to exactly the samples where the target said
+it was in the state, and a single capture of the device doing its real work
+yields a separate current for every state it passed through.
+
+If you are also writing the target's firmware, this is not a favour to ask of
+the developer.  It is an edit you can make, in about fifteen lines, and it makes
+every measurement after it exact.  Make it early.
+
+## The encoding
+Two digital inputs, D0 as bit 0 and D1 as bit 1, carry four states:
+
+    code  D1  D0   typical use
+      0    0   0   sleep / lowest power state
+      1    0   1   idle
+      2    1   0   active
+      3    1   1   transmitting
+
+Give code 0 to the LOWEST-POWER state.  Both pins then sit low while the target
+is asleep, which costs nothing, where a pin held high in sleep leaks a little
+current into the P1150's input and lands directly in the microamp figure you are
+trying to measure.
+
+The one ambiguity this creates is that a target which is unpowered, held in
+reset, or has not yet configured the pins also reads as code 0.  It is not worth
+avoiding: an unpowered target draws no current at all, which is unmistakable in
+the same capture, and the alternative -- reserving code 0 for "unknown" -- puts a
+pin high during sleep, which costs real current forever to avoid a confusion
+that lasts one boot.
+
+## The firmware
+Set the code where the mode ACTUALLY changes -- immediately before entering the
+sleep instruction, immediately after the radio comes up -- not at the top of the
+function that eventually gets there.  A code set early attributes the setup work
+to the state that follows it.
+
+    // P1150 state signal: D0 = bit 0, D1 = bit 1
+    #define P1150_D0   (1u << 12)      // pin wired to P1150 D0
+    #define P1150_D1   (1u << 13)      // pin wired to P1150 D1
+
+    typedef enum {
+        ST_SLEEP  = 0,
+        ST_IDLE   = 1,
+        ST_ACTIVE = 2,
+        ST_TX     = 3,
+    } state_t;
+
+    static inline void p1150_state(state_t s) {
+        NRF_P0->OUTCLR = P1150_D0 | P1150_D1;
+        NRF_P0->OUTSET = ((s & 1u) ? P1150_D0 : 0u)
+                       | ((s & 2u) ? P1150_D1 : 0u);
+    }
+
+    void app_init(void) {
+        NRF_P0->DIRSET = P1150_D0 | P1150_D1;   // push-pull outputs
+        p1150_state(ST_SLEEP);                  // known state from boot
+    }
+
+Vendor equivalents, all single-cycle and safe in an ISR:
+    STM32     GPIOx->BSRR = pins  /  GPIOx->BSRR = pins << 16
+    nRF5x     NRF_P0->OUTSET = pins  /  NRF_P0->OUTCLR = pins
+    ESP32     GPIO.out_w1ts = pins  /  GPIO.out_w1tc = pins
+    Zephyr    gpio_pin_set_dt(&d0, v)      (slower; fine at state scale)
+
+Clear both pins and set the code once in init, so a capture that begins mid-boot
+starts from a known code rather than from whatever the pads powered up as.
+
+## The one that will catch you
+CHECK THE PINS SURVIVE THE SLEEP MODE.  Several MCUs release GPIO drive in their
+deepest sleep states, or require the pad configuration to be explicitly retained
+(nRF5x RAM/GPIO retention, STM32 standby, ESP32 gpio_hold_en / deep-sleep hold).
+If the drive is released, the pins float during exactly the state you most want
+to measure, the code decodes as noise, and the sleep figure is drawn from
+whatever samples happened to read as 0.
+
+Verify it rather than assume it: p1150_state_check watches the pins for a few
+seconds and reports which codes it saw and how cleanly they held.  Run it with
+the target actually asleep, once, before trusting any state measurement.
+
+## Not the same thing as a region marker
+Both use the same inputs and the same instruction, and they answer different
+questions:
+
+    region marker (p1150_marker_guide)  asserted for microseconds to
+        milliseconds, many times, around one function.  Answers "what does this
+        piece of code cost".
+    state signal (this guide)           held for seconds to minutes, encoding
+        which of several modes the device is in.  Answers "what does the device
+        draw in each of its states".
+
+The state signal takes D0 and D1, which leaves A0 for a region marker.  A0
+accepts 0-17 V and needs an explicit threshold; the marker guide covers it.  If
+you need only two states, one pin is enough -- declare a single channel and code
+0/1 -- which frees the other for a marker.
+
+## Wiring
+One wire per bit from the target GPIO to the P1150's D0 and D1, with grounds in
+common (usually already shared through the probe at the battery terminals).
+D0 and D1 accept 1.2-3.3 V and no more: a 5 V or 12 V GPIO must not be connected
+to them.  Keep the leads short.  Do not leave a declared input floating.
+
+## The working order
+ 1. Add the state signal to the firmware and flash it.
+ 2. p1150_set_state_signal("sleep", code=0), and one call per state.  This also
+    starts recording D0/D1 in every capture.
+ 3. p1150_state_check() -- with the target running normally.  Confirms the pins
+    are driven, the codes decode, and nothing floats.  Do not skip it.
+ 4. p1150_measure_states(60) -- one capture, a current for every state the
+    target visited, plus how long it spent in each.
+    Or p1150_measure_state("sleep", 30) to wait until the target enters one
+    named state and measure only that.
+ 5. p1150_battery_life() as usual.
+
+## What the measured time fractions mean
+p1150_measure_states reports how long the target spent in each state DURING THE
+CAPTURE, and p1150_usage_from_capture can adopt those as the usage model.  Think
+before doing so.
+
+They are the product's real duty cycle only if the workload on the bench is the
+real workload.  That is true of a self-driven device -- a sensor node on a
+timer, a beacon, a tracker -- where the firmware's own schedule is the whole
+story and the bench behaviour is the field behaviour.
+
+It is false for anything a user drives.  A wearable measured for a minute on a
+desk spends none of that minute being looked at, and adopting the measured
+fractions would state that the product is never used.  For those, the currents
+come from the capture and the fractions still come from the developer.
+
+Ask which kind it is.  It is one question and it decides whether the model is
+measured or declared.
 """
 
 

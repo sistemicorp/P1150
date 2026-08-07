@@ -25,19 +25,37 @@ demo scripts while the MCP server holds the device.
 
 ## Read the guide tools before measuring
 
-`p1150_measurement_guide`, `p1150_inrush_guide` and `p1150_marker_guide` are
-written for you rather than for the user.  They carry the method — window
-lengths, what a sleep measurement actually requires, how to judge a voltage sag
-— none of which is derivable from the tool signatures.  Getting it wrong
-produces a capture that looks fine and means nothing: a 100 ms window that
-misses the wake burst, or a "sleep" figure taken while the target was still
-booting.  Call the relevant guide before the first measurement of a kind, not
-after a result looks strange.
+`p1150_measurement_guide`, `p1150_battery_life_guide`, `p1150_state_signal_guide`,
+`p1150_inrush_guide` and `p1150_marker_guide` are written for you rather than for
+the user.  They carry
+the method — window lengths, what a sleep measurement actually requires, how to
+judge a voltage sag — none of which is derivable from the tool signatures.
+Getting it wrong produces a capture that looks fine and means nothing: a 100 ms
+window that misses the wake burst, or a "sleep" figure taken while the target was
+still booting.  Call the relevant guide before the first measurement of a kind,
+not after a result looks strange.
+
+`p1150_start` reports where a project has got to and what to do next; prefer it
+to answering an open question about the instrument from general knowledge.
 
 Ask for the battery capacity once per project and record it with
 `p1150_set_battery`.  It cannot be inferred from a waveform, it is what turns
 milliamps into battery life, and it persists in `.p1150_runs/battery.json`, so
 it is asked once and not re-asked each session.
+
+Battery life needs a second thing that cannot be measured: how the product
+divides its time between its states.  That comes from the developer, persists in
+`.p1150_runs/usage.json` via `p1150_set_usage_state`, and is what lets a week be
+predicted from a minute — `p1150_battery_life_guide` has the method.  No single
+capture is a battery life, and the per-capture
+`projected_days_if_continuous` is named for its assumption for that reason.
+
+When you are also writing the target's firmware, add the state signal
+(`p1150_state_signal_guide`): about fifteen lines driving a 2-bit code on two
+spare GPIOs into D0/D1.  It turns "the target was in standby while this was
+measured" from something a person asserts into a fact recorded beside the
+current, and one capture then yields every state's current at once.  Raise it
+before spending a session staging baselines by hand.
 
 ## Captures are large
 

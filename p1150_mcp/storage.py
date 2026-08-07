@@ -77,6 +77,68 @@ def load(run_id: str):
     return i, meta
 
 
+def load_meta(run_id: str) -> dict:
+    """Metadata only, without reading the samples.
+
+    An npz is a zip of independently stored members, so pulling out the metadata
+    member costs a few hundred bytes where load_all() would bring a capture of
+    hundreds of megabytes into memory.  Anything that scans ACROSS runs -- the
+    listing, or finding the newest baseline for a usage state -- has to come
+    through here, or answering a question about labels reads the entire store.
+    """
+    path = os.path.join(runs_dir(), run_id + ".npz")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"No run '{run_id}'. Use p1150_list_runs to see stored runs.")
+    with np.load(path) as z:
+        return json.loads(bytes(z["meta"]).decode()) if "meta" in z else {}
+
+
+def _run_ids(limit: int = None) -> list:
+    """Stored run ids, newest first.  The id begins with a sortable timestamp,
+    so the filename order is the chronological order and no file needs opening
+    to establish it."""
+    d = runs_dir()
+    names = sorted((f[:-4] for f in os.listdir(d) if f.endswith(".npz")),
+                   reverse=True)
+    return names[:limit] if limit else names
+
+
+def latest_for_state(state: str) -> dict:
+    """Metadata of the newest capture measuring a named usage state, or None.
+
+    This is how a battery-life estimate finds its inputs without the agent
+    having to remember run ids across sessions: the newest run measuring a state
+    wins.  Re-measuring after a firmware change therefore supersedes the old
+    baseline automatically, which is what stops a stale sleep figure quietly
+    surviving into an estimate made a week later.
+
+    Two kinds of run qualify.  One captured for a single state carries its name
+    directly.  One taken while the target signalled its own state carries a
+    current for every state it passed through, and any of those counts -- so a
+    single sweep of the device doing its real work supplies every baseline at
+    once.  A sweep is reported with the state's own current substituted for the
+    whole-capture average, since that average is a mix of every state in it.
+    """
+    want = (state or "").strip().lower()
+    if not want:
+        return None
+    for run_id in _run_ids():
+        try:
+            meta = load_meta(run_id)
+        except Exception:
+            continue
+        if (meta.get("state") or "").strip().lower() == want:
+            return meta
+        for name, ma in (meta.get("state_currents") or {}).items():
+            if name.strip().lower() == want:
+                return dict(meta, state=name, avg_ma=ma,
+                            from_state_sweep=True,
+                            sweep_time_pct=(meta.get("state_times_pct")
+                                            or {}).get(name))
+    return None
+
+
 def load_full(run_id: str):
     """Return (i, isnk, metadata).  isnk is None for runs stored before the
     sink channel was retained, so charging analysis has to check for it."""
@@ -103,23 +165,26 @@ def load_all(run_id: str):
 
 
 def list_runs(limit: int = 25) -> list:
-    d = runs_dir()
-    names = sorted((f[:-4] for f in os.listdir(d) if f.endswith(".npz")),
-                   reverse=True)[:limit]
     out = []
-    for run_id in names:
+    for run_id in _run_ids(limit):
         try:
-            _, meta = load(run_id)
+            meta = load_meta(run_id)
         except Exception:
             meta = {}
-        out.append({
+        row = {
             "run_id": run_id,
             "label": meta.get("label"),
             "created": meta.get("created"),
             "duration_s": meta.get("duration_s"),
             "avg_ma": meta.get("avg_ma"),
             "charge_mah": meta.get("charge_mah"),
-        })
+        }
+        # Only present on captures taken as a usage-state baseline, and the
+        # reason one run out of a session's dozen is the one an estimate uses.
+        if meta.get("state"):
+            row["state"] = meta["state"]
+            row["baseline_verdict"] = meta.get("baseline_verdict")
+        out.append(row)
     return out
 
 

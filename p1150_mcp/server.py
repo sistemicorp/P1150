@@ -38,7 +38,8 @@ except ImportError:                                  # mcp < 2.0
 
 from . import analysis, storage, config
 from .device import SESSION, SAMPLE_RATE, scan
-from .scenarios import GUIDE, MARKER_GUIDE, INRUSH_GUIDE
+from .scenarios import (GUIDE, MARKER_GUIDE, INRUSH_GUIDE, BATTERY_LIFE_GUIDE,
+                        STATE_SIGNAL_GUIDE)
 
 mcp = _Server("p1150")
 
@@ -161,16 +162,25 @@ def _store(label: str, i_ma: np.ndarray, extra: dict = None,
     if aux:
         # Record the levels in force at capture time. They can be overridden
         # later, but a run must still be readable after the project's aux setup
-        # has moved on.
+        # has moved on -- and a state code decoded under a different pin
+        # assignment than it was captured with would name the wrong states.
         meta["aux_channels"] = list(aux)
         meta["aux_config"] = {c: config.aux_channel_cfg(c) for c in aux}
         meta["marker_channel"] = config.aux_primary()
+        signal = config.get_state_signal()
+        if signal.get("channels") and all(c in aux for c in signal["channels"]):
+            meta["state_signal"] = signal
     run_id = storage.save(label, i_ma, meta, isnk_ma=isnk_ma, aux=aux)
     out = {"run_id": run_id, "label": label}
     out.update(summary)
     out.update(extra or {})
     if aux:
-        out.update(_marker_headline(aux, meta, run_id))
+        if meta.get("state_signal"):
+            out.update(_state_headline(aux, meta, run_id))
+        if config.aux_marker_channels():
+            out.update(_marker_headline(aux, meta, run_id))
+        elif not meta.get("state_signal"):
+            out.update(_marker_headline(aux, meta, run_id))
     # Every capture is screened for an inrush surge, whatever it was taken for.
     # A developer measuring battery life has no reason to ask about inrush and
     # no way to see it without an instrument at the battery terminals -- so a
@@ -211,13 +221,70 @@ def _resolve_marker(aux: dict, channel: str = None, meta: dict = None):
             "This run has no auxiliary channel recorded. Declare one with "
             "p1150_set_aux and capture again -- aux channels are only retained "
             "when the project has asked for them.")
+    # A channel carrying the state signal is not a marker: it is asserted for
+    # minutes by design, so reading it as one yields a single assertion
+    # spanning the capture.
+    signal = set(_signal_channels(meta))
+    spare = [c for c in aux if c.upper() not in signal]
+    if not channel and not spare:
+        raise ValueError(
+            f"The only auxiliary channels in this run ({', '.join(aux)}) carry "
+            f"the state signal, not a region marker. For per-state current use "
+            f"p1150_state_split; for the cost of one function, wire a marker to "
+            f"A0 and see p1150_marker_guide.")
     ch = (channel or meta.get("marker_channel") or config.aux_primary()
-          or next(iter(aux))).upper()
+          or spare[0]).upper()
     if ch not in aux:
         raise ValueError(
             f"Run has no '{ch}' channel. Recorded: {', '.join(aux) or 'none'}.")
     cfg = config.aux_channel_cfg(ch) or (meta.get("aux_config") or {}).get(ch) or {}
     return ch, cfg, analysis.to_logic(aux[ch], cfg)
+
+
+def _signal_channels(meta: dict = None) -> list:
+    """Channels carrying the state signal for this run.
+
+    The run's own record wins: a capture taken before the encoding was changed
+    still has to decode under the encoding it was taken with.
+    """
+    sig = (meta or {}).get("state_signal") or config.get_state_signal()
+    return list(sig.get("channels") or [])
+
+
+def _state_codes(aux: dict, meta: dict = None):
+    """(code per sample, {code: name}) for a run carrying a state signal."""
+    sig = (meta or {}).get("state_signal") or config.get_state_signal()
+    channels = list(sig.get("channels") or [])
+    if not channels:
+        raise ValueError(
+            "No state signal is declared, so a capture cannot be split by "
+            "state. If the firmware can drive two spare GPIOs, "
+            "p1150_state_signal_guide has the fifteen lines it takes -- it "
+            "makes every state measurement exact instead of resting on someone "
+            "confirming the target was in the right mode.")
+    codes = analysis.decode_state_codes(aux, channels)
+    names = {int(c): n for n, c in (sig.get("codes") or {}).items()}
+    return codes, names
+
+
+def _state_headline(aux: dict, meta: dict = None, run_id: str = None) -> dict:
+    """The one line about states that belongs on a capture carrying a signal."""
+    try:
+        codes, names = _state_codes(aux, meta)
+        r = analysis.state_breakdown(np.zeros(codes.size, dtype=np.float32),
+                                     codes, names)
+    except Exception:
+        return {}
+    seen = [row["state"] or f"code {row['code']}" for row in r["states"]]
+    out = {"states_seen": seen, "state_transitions": r["transitions"]}
+    if r.get("unmapped_codes"):
+        out["unmapped_codes"] = r["unmapped_codes"]
+    if run_id:
+        out["state_hint"] = (
+            f"p1150_state_split('{run_id}') gives current, charge and time for "
+            f"each of these states." if len(seen) > 1 else
+            f"The target stayed in one state for this whole capture.")
+    return out
 
 
 def _marker_headline(aux: dict, meta: dict = None, run_id: str = None) -> dict:
@@ -241,6 +308,145 @@ def _marker_headline(aux: dict, meta: dict = None, run_id: str = None) -> dict:
             f"on the wrong pin, or the polarity may be inverted. Run "
             f"p1150_aux_check to see what the input is doing.")
     return out
+
+
+# ------------------------------------------------------------------ #
+# Orientation                                                          #
+# ------------------------------------------------------------------ #
+def _state_baselines() -> dict:
+    """The capture standing for each declared state, and whether it is sound.
+
+    Resolution order is: a run pinned to the state, else the newest capture
+    taken for it.  Both come back with the baseline verdict recorded at capture
+    time, so an estimate can warn about a shaky input without re-reading a
+    hundred megabytes of samples to find out.
+    """
+    out = {}
+    for key, s in config.get_usage()["states"].items():
+        meta = None
+        if s.get("run_id"):
+            try:
+                meta = storage.load_meta(s["run_id"])
+            except Exception:
+                meta = None
+        if meta is None:
+            meta = storage.latest_for_state(s.get("name") or key)
+        out[key] = meta
+    return out
+
+
+@mcp.tool()
+def p1150_start() -> dict:
+    """Where this project stands, and what to do next. Start here.
+
+    Call this at the beginning of a session, and whenever the developer asks an
+    open question -- "what can I do with this thing", "where do I start", "what
+    should I measure" -- rather than answering from general knowledge. It
+    reports the actual state of THIS project: what is connected, what the
+    battery is, what the usage model says, which states have a usable baseline
+    and which do not, and the single next action that moves the work forward.
+
+    The arc of a battery-current project runs:
+
+      1. Connect, and power the target at a voltage the DEVELOPER confirms. It
+         goes straight to the battery terminals and there is no undo.
+      2. Record the battery: capacity, and how long the product has to last.
+      3. Describe how the product is used -- its states and their share of the
+         time, and the things that happen a countable number of times a day.
+         This cannot be measured and has to be asked for.
+      4. Measure each state, once, with the developer putting the target into it.
+      5. Estimate battery life, and see which contributor actually dominates.
+      6. Optimise that one, re-measure that one state, estimate again.
+
+    Everything else the server does hangs off that spine: p1150_compare for
+    whether a change cost battery life, marker GPIOs (p1150_marker_guide) for
+    what one feature costs, and inrush (p1150_inrush_guide) for the reliability
+    problem that turns up in these captures unasked.
+    """
+    try:
+        battery = config.get()
+        usage = config.get_usage()
+        baselines = _state_baselines()
+        out = {
+            "connected": SESSION.is_connected(),
+            "powered": bool(SESSION.probe_on),
+            "voltage_mv": SESSION.vout_mv,
+            "ovc_ma": SESSION.ovc_ma,
+            "battery": battery or None,
+            "usage_states": {k: dict(v, measured=bool(baselines.get(k)))
+                             for k, v in usage["states"].items()},
+            "usage_events": usage["events"],
+            "runs_stored": len(storage.list_runs(1000)),
+        }
+        total = config.usage_fraction_total()
+        if usage["states"]:
+            out["usage_fraction_total_pct"] = round(total, 3)
+        unmeasured = [k for k in usage["states"] if not baselines.get(k)]
+
+        # One next action, not a menu.  An agent handed a list of five possible
+        # things will pick the one that needs nothing from the developer, and
+        # the steps that need the developer are the ones that cannot be skipped.
+        if not out["connected"]:
+            nxt = ("Connect the instrument: p1150_connect(). The first "
+                   "connection after plugging in takes about 15 seconds.")
+        elif not battery.get("capacity_mah"):
+            nxt = ("Ask the developer two questions and record the answers with "
+                   "p1150_set_battery: what capacity battery (mAh) the target "
+                   "runs on, and how long it has to last (target_days). "
+                   "Neither can be measured.")
+        elif not out["powered"]:
+            nxt = ("Ask the developer what supply voltage to use and CONFIRM IT "
+                   "before calling p1150_power_on -- it goes directly to the "
+                   "target's battery terminals and too high destroys the "
+                   "target. Never infer it.")
+        elif not usage["states"]:
+            nxt = ("Ask the developer how the product spends its time -- which "
+                   "states it has and roughly how many hours a day in each -- "
+                   "and declare them with p1150_set_usage_state. Read "
+                   "p1150_battery_life_guide first; it has the questions to ask "
+                   "and why a capture cannot answer them. If you are also "
+                   "writing the target's firmware, add a state signal at the "
+                   "same time (p1150_state_signal_guide): fifteen lines, and "
+                   "every state measurement afterwards is exact.")
+        elif abs(total - 100.0) > 0.5:
+            nxt = (f"The declared states account for {total:.1f}% of the time, "
+                   f"not 100%. Ask the developer what the device is doing for "
+                   f"the remaining {100.0 - total:.1f}% and declare it -- "
+                   f"unaccounted time cannot be assumed to be cheap.")
+        elif unmeasured:
+            s = unmeasured[0]
+            signal = config.get_state_signal()
+            nxt = (
+                f"Measure the remaining states ({', '.join(unmeasured)}). The "
+                f"target signals its own state, so p1150_measure_states(60) "
+                f"while it runs normally captures them all at once -- or "
+                f"p1150_measure_state(state='{s}') to wait for one and measure "
+                f"only that."
+                if signal.get("codes") else
+                f"Measure the '{s}' state: ask the developer to put the target "
+                f"into it, wait for it to settle, and confirm before you "
+                f"capture. Then p1150_measure_state(state='{s}', "
+                f"duration_s=30).")
+        else:
+            nxt = ("Every declared state has a baseline: run "
+                   "p1150_battery_life() for the estimate and the ranking of "
+                   "what is actually spending the battery.")
+        out["next_action"] = nxt
+        out["state_signal"] = config.get_state_signal() or None
+        out["guides"] = {
+            "p1150_battery_life_guide": "how long will the battery last, and "
+                                        "what should I optimise",
+            "p1150_measurement_guide": "how to measure well; the profiles worth "
+                                       "knowing",
+            "p1150_state_signal_guide": "have the firmware declare its own "
+                                        "state, so measurements stop depending "
+                                        "on anyone confirming it",
+            "p1150_inrush_guide": "surges that reset the target in the field",
+            "p1150_marker_guide": "what one function or feature costs",
+        }
+        return out
+    except Exception as e:
+        return _fail(e)
 
 
 # ------------------------------------------------------------------ #
@@ -298,6 +504,64 @@ def p1150_inrush_guide() -> str:
 
 
 @mcp.tool()
+def p1150_battery_life_guide() -> str:
+    """How to predict a week of battery life from a minute of measuring.
+
+    Read this whenever the question is how long the battery lasts, whether the
+    target will meet a battery-life requirement, or what to optimise to make it
+    last longer -- which is the first question of most projects, and the one no
+    single capture answers.
+
+    A capture measures the state the target happened to be in. A product moves
+    between states, and the weighting between them is a fact about how the
+    product is used, not about the board on the bench, so it has to come from
+    the developer. Life is capacity / SUM(fraction x current): the instrument
+    contributes the currents, in under a minute per state, and the developer
+    contributes the weights. That separation is what makes a week predictable
+    without waiting a week, and it is the entire method.
+
+    Covers: why extrapolating one capture is wrong and by how much; the
+    difference between states (weighted by time) and events (weighted by rate),
+    and why folding a boot into an average loses it; how to ask a developer for
+    a usage model, in words; how long to measure each state and the two ways a
+    baseline goes silently wrong -- a target still settling into a state, and a
+    state whose own duty cycle was undersampled; how to read the contribution
+    ranking and the optimisation payoff; how to tell whether the developer's
+    duty-cycle guess even affects the answer; and what the estimate leaves out
+    -- usable versus rated capacity, self-discharge, temperature, ageing.
+    """
+    return BATTERY_LIFE_GUIDE
+
+
+@mcp.tool()
+def p1150_state_signal_guide() -> str:
+    """How to make the target declare which state it is in, so a measurement
+    never rests on someone confirming it.
+
+    READ THIS IF YOU ARE ALSO WRITING THE TARGET'S FIRMWARE. It is the single
+    highest-value change available here: about fifteen lines to drive a 2-bit
+    code on two spare GPIOs, after which one capture of the device doing its
+    real work yields a separate, exact current for every state it passes
+    through, and a battery-life estimate stops depending on a human putting the
+    board into a mode and saying so.
+
+    Without it, every state baseline rests on a claim -- slow to arrange, not
+    repeatable, and when it is wrong the capture looks perfectly normal while
+    the error is multiplied by that state's whole share of the product's life.
+
+    Covers: the D0/D1 encoding and why code 0 should be the lowest-power state;
+    the firmware, with vendor register equivalents; where in the code to change
+    the state and where not to; the failure that catches everyone -- MCUs that
+    release GPIO drive in deep sleep unless pad retention is configured, so the
+    pins float during exactly the state most worth measuring; how a state signal
+    differs from a region marker and how to have both; the wiring and its 3.3 V
+    limit; and what the measured time-in-state does and does not tell you about
+    how the product is really used.
+    """
+    return STATE_SIGNAL_GUIDE
+
+
+@mcp.tool()
 def p1150_marker_guide() -> str:
     """How to mark a code region with a GPIO so its current can be measured
     exactly.
@@ -327,7 +591,7 @@ def p1150_marker_guide() -> str:
 @mcp.tool()
 def p1150_set_battery(capacity_mah: float = None, chemistry: str = None,
                       nominal_mv: int = None, esr_mohm: float = None,
-                      brownout_mv: int = None) -> dict:
+                      brownout_mv: int = None, target_days: float = None) -> dict:
     """Record what battery this target runs on, and what it needs of it.
 
     ASK THE DEVELOPER FOR THE CAPACITY at the start of a project, before the
@@ -337,6 +601,11 @@ def p1150_set_battery(capacity_mah: float = None, chemistry: str = None,
     what share of the battery one wake-up or one boot costs, how many times an
     operation can run before the pack is flat, and whether a measured charging
     current is a sensible C rate.
+
+    ASK FOR target_days IN THE SAME BREATH. "How long does it have to last" is
+    a question every developer of a battery product has an answer to, it is the
+    thing the whole exercise is ultimately judged against, and it costs nothing
+    to record while the capacity is being asked for anyway.
 
     Settings persist across sessions and are merged, not replaced, so each can
     be added when it comes up. Call p1150_get_battery to see what is set.
@@ -364,18 +633,27 @@ def p1150_set_battery(capacity_mah: float = None, chemistry: str = None,
         the sag a real battery would suffer can be calculated but not judged,
         and judging it is the entire question. Typically 3000-3300 mV for a
         3.3 V system on a Li-ion cell.
+
+    target_days: how long the product is required to run on one charge. Once
+        set, p1150_battery_life reports a PASS / MARGINAL / SHORT verdict
+        against it, and when it is short, what each contributor would have to
+        become to reach it -- "sleep current from 180 uA to 95 uA" rather than
+        "cut total current by 38%". Weeks and months are fine as days: 7, 30,
+        365.
     """
     try:
         if capacity_mah is not None and capacity_mah <= 0:
             return {"error": "capacity_mah must be greater than zero."}
+        if target_days is not None and target_days <= 0:
+            return {"error": "target_days must be greater than zero."}
         if not any(v is not None for v in
                    (capacity_mah, chemistry, nominal_mv, esr_mohm,
-                    brownout_mv)):
+                    brownout_mv, target_days)):
             return {"error": "Nothing to record. Pass at least one of "
                              "capacity_mah, chemistry, nominal_mv, esr_mohm, "
-                             "brownout_mv."}
+                             "brownout_mv, target_days."}
         cfg = config.set_battery(capacity_mah, chemistry, nominal_mv,
-                                 esr_mohm, brownout_mv)
+                                 esr_mohm, brownout_mv, target_days)
         notes = []
         if cfg.get("capacity_mah"):
             notes.append("Battery life, percentage-of-battery and C rate "
@@ -386,6 +664,15 @@ def p1150_set_battery(capacity_mah: float = None, chemistry: str = None,
         if cfg.get("brownout_mv"):
             notes.append("Inrush results now say whether a real cell would sag "
                          "below the target's operating voltage.")
+        if cfg.get("target_days"):
+            notes.append(f"Estimates are judged against "
+                         f"{cfg['target_days']:g} days.")
+        if cfg.get("capacity_mah") and not config.get_usage()["states"]:
+            notes.append("Next: ask the developer how the product spends its "
+                         "time and declare it with p1150_set_usage_state -- "
+                         "capacity alone cannot give a battery life for a "
+                         "device that has more than one state. "
+                         "p1150_battery_life_guide has the questions.")
         cfg["note"] = " ".join(notes)
         return cfg
     except Exception as e:
@@ -420,6 +707,405 @@ def p1150_get_battery() -> dict:
                 "needed only to judge an inrush surge -- ask for it if one "
                 "turns up.")
         return cfg
+    except Exception as e:
+        return _fail(e)
+
+
+# ------------------------------------------------------------------ #
+# Usage model                                                          #
+# ------------------------------------------------------------------ #
+@mcp.tool()
+def p1150_set_usage_state(name: str, fraction_pct: float = None,
+                          hours_per_day: float = None,
+                          description: str = None,
+                          run_id: str = None) -> dict:
+    """Declare a state the product spends part of its life in, and how much of
+    its life that is.
+
+    THIS HAS TO BE ASKED FOR. It is the half of a battery-life estimate that no
+    instrument can supply: a P1150 measures what the target draws in standby to
+    a fraction of a microamp in thirty seconds, and has no way whatever of
+    knowing the device is in standby 99% of the time. Do not infer the split
+    from the firmware source, from timer periods, or from what a comparable
+    product did -- a timer period says how often something runs, not how a
+    product nobody has finished designing yet will be used.
+
+    Ask it plainly: "what states does the device have -- asleep, awake but idle,
+    actively working -- and out of a typical day, how long is it in each?"
+    Two to four states is the useful range. Read p1150_battery_life_guide for
+    the full set of questions and why they matter.
+
+    THE FRACTIONS MUST TOTAL 100%. If they do not, some of the product's time is
+    unaccounted for and no estimate can be made from it -- unaccounted time
+    could be at any current at all, so it cannot be assumed to be cheap. The
+    usual omission is the resting state, left out because it felt too obvious
+    to mention.
+
+    An uncertain answer is fine. Take the developer's best guess: p1150_battery_
+    life reports how much the estimate moves if the split is out by 2x, and very
+    often the answer is "barely", because one state dominates. Chase precision
+    only when the tool says it matters.
+
+    name: what the developer calls it -- "standby", "connected", "streaming",
+        "deep-sleep". It appears in the report, and it is the name to pass to
+        p1150_measure_state when capturing this state's current.
+
+    fraction_pct: share of the product's time spent in this state, 0-100.
+
+    hours_per_day: the same thing in the units developers usually answer in.
+        Give one or the other, not both.
+
+    description: what the target is doing in this state, and anything needed to
+        get it there. Worth writing down -- it is what makes a baseline
+        reproducible weeks later.
+
+    run_id: pin this state to a particular capture. Not normally needed: the
+        newest p1150_measure_state capture for the state wins automatically, so
+        re-measuring after a firmware change supersedes the old baseline. Pin
+        one when the newest capture is an experiment and an older run is still
+        the reference.
+
+    THINGS THAT HAPPEN A COUNTABLE NUMBER OF TIMES A DAY ARE NOT STATES. A boot,
+    a user interaction, an upload, a wake-up: use p1150_set_usage_event. A
+    3-second boot is 0.003% of a day and vanishes as a fraction, while as 2 x
+    410 uAh it can be a fifth of the daily budget.
+    """
+    try:
+        cfg = config.set_usage_state(name, fraction_pct, hours_per_day,
+                                     description, run_id)
+        total = config.usage_fraction_total()
+        out = {"states": cfg["states"], "events": cfg["events"],
+               "fraction_total_pct": round(total, 3)}
+        if abs(total - 100.0) > 0.5:
+            out["action"] = (
+                f"The declared states now total {total:.1f}% of the time. They "
+                f"must total 100% before an estimate can be made -- ask the "
+                f"developer what the device is doing for the other "
+                f"{100.0 - total:.1f}%." if total < 100.0 else
+                f"The declared states total {total:.1f}%, which is more than "
+                f"the product has. Two states are overlapping, or one of the "
+                f"fractions is wrong.")
+        else:
+            key = (name or "").strip().lower()
+            out["note"] = (
+                f"The time model is complete. Measure each state with "
+                f"p1150_measure_state -- for this one, ask the developer to put "
+                f"the target into '{name}', wait for it to settle, and confirm "
+                f"before capturing: p1150_measure_state(state='{key}', "
+                f"duration_s=30).")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_set_usage_event(name: str, per_day: float = None,
+                          per_hour: float = None, charge_uah: float = None,
+                          run_id: str = None, description: str = None) -> dict:
+    """Declare something that happens a countable number of times a day and
+    costs charge each time it does.
+
+    Boots, user interactions, uploads, OTA updates, wake-ups from standby --
+    anything discrete. These are weighted by a RATE and cost a CHARGE, where a
+    state is weighted by time and costs a current, and keeping them apart is
+    what stops an estimate quietly losing them: a 3-second boot expressed as a
+    fraction of a day is 0.003% and rounds away, while at 2 x 410 uAh it is
+    plainly a fifth of a coin cell's daily budget.
+
+    TRANSITIONS BELONG HERE. Waking from standby into active is rarely free -- a
+    radio reconnects, a sensor warms up, a regulator starts -- and on a device
+    that wakes hundreds of times a day the transitions can cost more than either
+    state it moves between. If the developer says the device wakes 200 times a
+    day, measure one wake and declare it here rather than folding it into
+    either state's current, where it would be counted at the wrong rate.
+
+    name: "boot", "user-wake", "hourly-upload", "ota".
+
+    per_day / per_hour: how often it happens. Give one. Ask the developer; like
+        the state split, it is a fact about how the product is used. For
+        something monthly, use a fraction: per_day=0.033.
+
+    charge_uah: what one occurrence costs. Take it from a measurement:
+        p1150_marker_stats reports excess_uah per invocation when the target has
+        a marker GPIO (the exact figure), and p1150_summary's charge_mah x 1000
+        gives it for a capture containing one occurrence.
+
+    run_id: alternative to charge_uah -- a capture containing EXACTLY ONE
+        occurrence, whose total charge is then used. A boot capture
+        (p1150_measure with connect_probe_during=True) or a
+        p1150_capture_single of the event. A capture containing several
+        occurrences, or a lot of idle time either side, will overstate the cost;
+        prefer charge_uah from a marker where the event is small.
+
+    description: what triggers it, so the figure can be reproduced later.
+    """
+    try:
+        cfg = config.set_usage_event(name, per_day, per_hour, charge_uah,
+                                     run_id, description)
+        key = (name or "").strip().lower()
+        entry = cfg["events"][key]
+        out = {"states": cfg["states"], "events": cfg["events"]}
+        if entry.get("run_id") and entry.get("charge_uah") is None:
+            try:
+                meta = storage.load_meta(entry["run_id"])
+                out["cost_from_run"] = {
+                    "run_id": entry["run_id"], "label": meta.get("label"),
+                    "charge_uah": round((meta.get("charge_mah") or 0) * 1000, 4),
+                    "duration_s": meta.get("duration_s")}
+            except Exception as e:
+                out["warning"] = (f"Run '{entry['run_id']}' could not be read "
+                                  f"({e}), so this event has no cost yet.")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_set_state_signal(state: str, code: int,
+                           channels: list = None) -> dict:
+    """Declare that the target itself signals which state it is in, by driving a
+    code on the P1150's digital inputs.
+
+    IF YOU ARE ALSO WRITING THE TARGET'S FIRMWARE, DO THIS EARLY. It is about
+    fifteen lines -- read p1150_state_signal_guide for them -- and it removes
+    the weakest step in every battery measurement. Without it, a state baseline
+    rests on someone confirming the target was in the right mode: slow, not
+    repeatable, and when it is wrong the capture looks perfectly normal while
+    the error gets multiplied by that state's whole share of the product's life.
+    With it, the state is a fact the firmware records sample-for-sample beside
+    the current, and one capture of the device doing its real work yields a
+    separate current for every state it passes through.
+
+    D0 carries bit 0 and D1 bit 1, so two pins give four states:
+        0 = 00, 1 = 01, 2 = 10, 3 = 11
+
+    GIVE CODE 0 TO THE LOWEST-POWER STATE. Both pins then rest low while the
+    target sleeps; a pin held high in sleep leaks current into the P1150's
+    input and lands in the microamp figure being measured. The cost is that an
+    unpowered or not-yet-initialised target also reads as code 0 -- which is
+    unmistakable in the same capture, since it draws no current at all.
+
+    state: the name declared with p1150_set_usage_state. Using the same names
+        is what lets p1150_battery_life pick the measurement up automatically.
+
+    code: the integer the firmware drives for this state.
+
+    channels: defaults to ["D0", "D1"]. Pass ["D0"] alone for a two-state
+        device, which frees D1 for a region marker. All calls for one project
+        must use the same channels.
+
+    Declaring the signal starts recording those inputs in EVERY capture, so
+    ordinary p1150_measure results begin reporting which states the target
+    passed through as well.
+
+    AFTERWARDS, RUN p1150_state_check. Several MCUs release GPIO drive in their
+    deepest sleep mode unless pad retention is explicitly configured -- so the
+    pins float during exactly the state most worth measuring, and the codes
+    decode as noise. It is one call and it is the failure that otherwise wastes
+    a whole session.
+    """
+    try:
+        sig = config.set_state_signal(state, code, channels)
+        codes = sig.get("codes") or {}
+        out = {"channels": sig["channels"], "codes": codes,
+               "capacity": (1 << len(sig["channels"])),
+               "note": (f"{', '.join(sig['channels'])} are now recorded in "
+                        f"every capture. {len(codes)} state(s) declared.")}
+        undeclared = [n for n in codes if n not in config.get_usage()["states"]]
+        if undeclared:
+            out["usage_hint"] = (
+                f"These have a code but no share of the product's time yet: "
+                f"{', '.join(undeclared)}. An estimate needs both -- see "
+                f"p1150_set_usage_state.")
+        out["action"] = ("Run p1150_state_check with the target running "
+                         "normally, before measuring anything.")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_get_state_signal() -> dict:
+    """Show how the target encodes its state on the digital inputs, if it does.
+    """
+    try:
+        sig = config.get_state_signal()
+        if not sig.get("codes"):
+            return {"configured": False,
+                    "note": "The target does not signal its state, so a state "
+                            "baseline depends on someone confirming the target "
+                            "is in the right mode when the capture is taken. "
+                            "If the firmware can be edited -- and if you are "
+                            "writing it, it can -- p1150_state_signal_guide "
+                            "shows the fifteen lines that make it exact "
+                            "instead."}
+        return {"configured": True, "channels": sig["channels"],
+                "codes": sig["codes"]}
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_clear_state_signal() -> dict:
+    """Stop decoding a state signal, and stop recording its inputs.
+
+    Use when the instrumentation comes out of the firmware or the wires come
+    off. Stored runs keep the encoding they were captured with and still decode.
+    """
+    try:
+        config.clear_state_signal()
+        return {"configured": False,
+                "note": "State signal cleared; D0/D1 are no longer recorded."}
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_state_check(duration_s: float = 5.0) -> dict:
+    """Confirm the target really drives its state code, before relying on it.
+
+    RUN THIS ONCE AFTER p1150_set_state_signal, with the target running
+    normally, and ideally over a window in which it visits more than one state.
+
+    It catches the failures that otherwise produce a capture that looks entirely
+    normal and means nothing:
+      * pins never driven -- the firmware change did not take, or the leads are
+        on the wrong pads. Everything reads as code 0.
+      * GPIO drive released in deep sleep. Several MCUs do this unless pad
+        retention is configured explicitly (nRF5x retention, STM32 standby,
+        ESP32 gpio_hold_en), so the pins float during exactly the state most
+        worth measuring.
+      * a floating or ungrounded input, which decodes as rapid nonsense.
+      * a code the firmware drives that no state is declared for.
+
+    Reports the codes seen, how long each was held, how many transitions
+    occurred, and the per-channel signal survey. Watch for an implausible
+    transition count: a state code should change a handful of times in five
+    seconds, not thousands.
+    """
+    try:
+        sig = config.get_state_signal()
+        if not sig.get("channels"):
+            return {"error": "No state signal is declared. Call "
+                             "p1150_set_state_signal first "
+                             "(p1150_state_signal_guide has the firmware)."}
+        i, _, aux = SESSION.measure(duration_s)
+        codes, names = _state_codes(aux, None)
+        r = analysis.state_breakdown(i, codes, names, SAMPLE_RATE)
+        out = {"duration_s": duration_s, "channels": sig["channels"],
+               "states": r["states"], "transitions": r["transitions"],
+               "mean_current_ma": round(float(i.mean()), 6) if i.size else None}
+        for k in ("unmapped_codes", "unmapped_note"):
+            if r.get(k):
+                out[k] = r[k]
+        # Per-channel view, because "code 0 throughout" cannot distinguish a
+        # target genuinely asleep from a lead that is not connected, and the
+        # raw levels can.
+        out["channels_detail"] = {
+            ch: dict(analysis.marker_survey(aux[ch], config.aux_channel_cfg(ch),
+                                            SAMPLE_RATE, ch),
+                     bit=sig["channels"].index(ch))
+            for ch in sig["channels"] if ch in aux}
+
+        rate = r["transitions"] / duration_s if duration_s else 0
+        if rate > 1000:
+            out["verdict"] = "NOISY"
+            out["action"] = (
+                f"The code changed {r['transitions']} times in {duration_s:g} s, "
+                f"which is not a state machine. An input is floating or the "
+                f"grounds are not common. Check the wiring before anything "
+                f"else.")
+        elif len(r["states"]) == 1 and r["states"][0]["code"] == 0:
+            out["verdict"] = "STUCK_AT_ZERO"
+            out["action"] = (
+                "Every sample read code 0. Either the target genuinely stayed "
+                "in the code-0 state for the whole window -- exercise another "
+                "state and re-check -- or the pins are not being driven at all: "
+                "the firmware change did not take, the GPIOs were never "
+                "configured as outputs, or the leads are on the wrong pads. "
+                "channels_detail shows the levels actually seen.")
+        elif len(r["states"]) == 1:
+            out["verdict"] = "SINGLE_STATE"
+            out["action"] = (
+                f"Only code {r['states'][0]['code']} was seen. The signal is "
+                f"working; exercise the other states and re-check if you want "
+                f"them all confirmed.")
+        else:
+            out["verdict"] = "OK"
+            out["note"] = (
+                f"{len(r['states'])} states seen with {r['transitions']} "
+                f"transitions. Ready to measure -- p1150_measure_states "
+                f"captures them all at once.")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_get_usage() -> dict:
+    """Show the usage model: the product's states, their share of the time, the
+    events that happen on a rate, and which states have a measured baseline.
+
+    Reports whether the state fractions total 100% -- they must, before an
+    estimate can be made -- and which states still need measuring.
+    """
+    try:
+        usage = config.get_usage()
+        baselines = _state_baselines()
+        if not usage["states"] and not usage["events"]:
+            return {
+                "configured": False, "states": {}, "events": {},
+                "note": "No usage model, so battery life cannot be estimated "
+                        "-- only the current of whatever state a capture "
+                        "happens to catch. Ask the developer how the product "
+                        "spends its time and declare it with "
+                        "p1150_set_usage_state; p1150_battery_life_guide has "
+                        "the questions to ask and why they cannot be inferred."}
+        states = {}
+        for key, s in usage["states"].items():
+            meta = baselines.get(key)
+            row = dict(s)
+            if meta:
+                row.update({"run_id": meta.get("run_id"),
+                            "avg_ma": meta.get("avg_ma"),
+                            "measured": meta.get("created"),
+                            "baseline_verdict": meta.get("baseline_verdict"),
+                            "voltage_mv": meta.get("voltage_mv")})
+            else:
+                row["measured"] = None
+            states[key] = row
+        total = config.usage_fraction_total()
+        out = {"configured": True, "states": states, "events": usage["events"],
+               "fraction_total_pct": round(total, 3),
+               "fraction_total_ok": abs(total - 100.0) <= 0.5}
+        missing = [k for k, v in states.items() if not v.get("measured")]
+        if missing:
+            out["unmeasured_states"] = missing
+            out["action"] = (
+                f"No baseline yet for: {', '.join(missing)}. For each, ask the "
+                f"developer to put the target into the state, let it settle, "
+                f"and confirm -- then p1150_measure_state(state='{missing[0]}', "
+                f"duration_s=30).")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_clear_usage(name: str = None) -> dict:
+    """Remove one state or event from the usage model, or clear the whole thing.
+
+    Use when the product's usage model changes, or when a state turns out to be
+    two states. Stored captures are untouched -- only the model is cleared.
+    """
+    try:
+        cfg = config.clear_usage(name)
+        total = config.usage_fraction_total()
+        return {"states": cfg["states"], "events": cfg["events"],
+                "fraction_total_pct": round(total, 3),
+                "note": (f"'{name}' removed. The declared states now total "
+                         f"{total:.1f}% of the time."
+                         if name else "Usage model cleared.")}
     except Exception as e:
         return _fail(e)
 
@@ -848,6 +1534,380 @@ def p1150_measure(duration_s: float, label: str,
                       {"capture_type": "timed",
                        "connect_probe_during": bool(connect_probe_during)},
                       isnk_ma=isnk, aux=aux)
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_measure_state(state: str, duration_s: float = 30.0,
+                        label: str = None, wait_s: float = 60.0) -> dict:
+    """Capture the representative current of one state the product lives in,
+    and check the capture is actually fit to stand for it.
+
+    This is the building block of a battery-life estimate and where a new
+    project starts. Life is capacity / SUM(fraction x current): this tool
+    measures the currents, p1150_set_usage_state records the fractions, and
+    p1150_battery_life combines them. Read p1150_battery_life_guide before the
+    first one.
+
+    IF THE TARGET SIGNALS ITS OWN STATE (p1150_set_state_signal), none of the
+    next two paragraphs applies: this waits until the firmware declares it is in
+    the state, keeps only the samples where it says so, and discards the rest.
+    The state becomes a fact rather than a claim. When the firmware can be
+    edited -- and if you are writing it, it can -- adding that signal is worth
+    more than anything else here; p1150_state_signal_guide has the fifteen lines.
+
+    OTHERWISE, ASK THE DEVELOPER TO PUT THE TARGET INTO THE STATE, AND WAIT FOR
+    THEM TO CONFIRM IT IS THERE. Only they can do it -- press the button, close
+    the app, stop the stream -- and a capture of the wrong state is not a small
+    error: it gets multiplied by that state's whole share of the product's life.
+    Say which state you are about to measure and wait.
+
+    THEN LET IT SETTLE. Targets descend into their lowest state in steps over
+    minutes rather than at once -- an inactivity timeout drops a radio link at
+    30 s, supervision intervals widen, a sensor cools, a regulator changes mode.
+    A standby capture taken straight after boot commonly reads several times the
+    real figure, and nothing about it looks wrong. Wait a few minutes for a
+    sleep state, then measure.
+
+    Unlike p1150_measure, the capture is judged as a baseline and the verdict is
+    stored with it:
+      USABLE       steady, and long enough. Good to build an estimate on.
+      NOT_SETTLED  the current drifted steadily across the capture, so the
+                   target was still on its way into the state. Reports the
+                   current it was converging on -- wait longer and re-measure.
+      TOO_SHORT    the state has a duty cycle of its own (a "standby" that
+                   advertises once a second is not flat) and too few periods
+                   were captured for the average to be stable. Reports the
+                   duration to use instead.
+      UNSTABLE     the average moved a lot without a consistent trend. Either
+                   the workload varies -- capture long enough to average over it
+                   -- or this is really two states and should be declared as
+                   two.
+
+    state: the name declared with p1150_set_usage_state, e.g. "standby". A state
+        not yet in the usage model can still be measured; it just needs its
+        share of the time before an estimate can use it.
+
+    duration_s: 10-30 s for a genuinely flat sleep; 30-60 s for a state
+        duty-cycled around 1 Hz; at least twelve periods for anything slower.
+        Longer is not better -- past the point where the average stops moving,
+        it only makes a larger file.
+
+    label: defaults to the state name. Set it when keeping several captures of
+        the same state, e.g. "standby-after-fix". The newest capture of a state
+        is the one an estimate uses, whatever it is labelled.
+
+    wait_s: only used when the target signals its own state
+        (p1150_set_state_signal). The capture then WAITS until the target
+        declares it is in this state and keeps only the samples where it says
+        so, discarding the rest -- so the measurement is of the state by
+        construction rather than by anyone's say-so, and nobody has to press
+        anything. This is how to measure a state whose entry you cannot time by
+        hand. Give up after wait_s seconds.
+    """
+    try:
+        name = (state or "").strip()
+        if not name:
+            return {"error": "A state name is required, e.g. 'standby'."}
+
+        signal = config.get_state_signal()
+        code = (signal.get("codes") or {}).get(name.lower())
+        gate = {}
+        if code is None:
+            i, isnk, aux = SESSION.measure(duration_s)
+        else:
+            # The target says when it is in the state, so wait for it to say so
+            # and then keep only what it vouches for.  Both halves matter: the
+            # wait removes the operator, and the gate removes the samples either
+            # side of the state that a fixed window would otherwise average in.
+            channels = signal["channels"]
+            seen = set()
+
+            def _code_of(chunk):
+                c = analysis.decode_state_codes(
+                    {ch: chunk[ch] for ch in channels}, channels)
+                return int(c[-1]) if c.size else None
+
+            def _match(chunk):
+                return _code_of(chunk) == int(code)
+
+            def _note(chunk):
+                c = _code_of(chunk)
+                if c is not None:
+                    seen.add(c)
+
+            try:
+                i, isnk, aux, waited = SESSION.measure_when(
+                    duration_s, _match, wait_s, on_reject=_note)
+            except Exception as e:
+                names = {int(c): n for n, c in signal["codes"].items()}
+                return {"error": str(e),
+                        "wanted": {"state": name, "code": int(code)},
+                        "codes_seen_while_waiting":
+                            sorted(f"{c} ({names.get(c) or 'undeclared'})"
+                                   for c in seen),
+                        "action": (
+                            "The target never entered this state. Either it "
+                            "does not reach it under the current conditions, or "
+                            "the firmware does not set the code for it. If the "
+                            "codes seen are all 0, check the pins are actually "
+                            "driven with p1150_state_check.")}
+            codes = analysis.decode_state_codes(aux, channels)
+            mask = codes == int(code)
+            kept = int(mask.sum())
+            if not kept:
+                return {"error": f"The target left the '{name}' state before "
+                                 f"any of it could be recorded."}
+            starts, _ = analysis.intervals(mask)
+            gate = {"gated_on": channels, "state_code": int(code),
+                    "waited_s": round(waited, 2),
+                    "kept_s": round(kept / SAMPLE_RATE, 4),
+                    "discarded_s": round((mask.size - kept) / SAMPLE_RATE, 4),
+                    "visits": int(starts.size)}
+            # Everything is masked with the same mask, so the stored run is the
+            # state and nothing else: its duration and average are the state's,
+            # and a later re-analysis cannot accidentally include the approach
+            # to it.
+            i, isnk = i[mask], (isnk[mask] if isnk is not None else None)
+            aux = {k: v[mask] for k, v in aux.items()}
+
+        check = analysis.baseline_check(i, SAMPLE_RATE)
+        out = _store(label or name, i,
+                     dict({"capture_type": "state_baseline",
+                           "state": name,
+                           "baseline_verdict": check.get("verdict")}, **gate),
+                     isnk_ma=isnk, aux=aux)
+        if "error" in out:
+            return out
+        out["baseline"] = check
+        if gate:
+            out["gate"] = gate
+            if gate["visits"] > 1:
+                out["gate"]["note"] = (
+                    f"The target entered and left this state {gate['visits']} "
+                    f"times during the capture; the kept samples are joined end "
+                    f"to end, so the average is right but the timing across a "
+                    f"join is not. If the state is meant to be held "
+                    f"continuously, something is interrupting it.")
+        declared = config.get_usage()["states"].get(name.lower())
+        if not declared:
+            out["usage_hint"] = (
+                f"'{name}' is not in the usage model yet, so this measurement "
+                f"cannot be weighted. Ask the developer what share of the "
+                f"product's time is spent in it and call "
+                f"p1150_set_usage_state('{name}', hours_per_day=...).")
+        elif check.get("verdict") == "USABLE":
+            baselines = _state_baselines()
+            missing = [k for k in config.get_usage()["states"]
+                       if not baselines.get(k)]
+            out["usage_hint"] = (
+                f"Still to measure: {', '.join(missing)}."  if missing else
+                "Every declared state now has a baseline -- run "
+                "p1150_battery_life() for the estimate.")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_measure_states(duration_s: float = 60.0,
+                         label: str = "states",
+                         exclude_entry_transient: bool = False) -> dict:
+    """Measure every state at once, from one capture of the target doing its
+    real work.
+
+    Requires the target to signal its own state (p1150_set_state_signal). Let it
+    run normally for long enough to pass through everything it does, and this
+    splits the capture by the code the firmware was driving: a current, a
+    charge, a peak and a time for each state, from a single measurement, with no
+    one having to put the target into anything.
+
+    This is the fastest route to a battery-life estimate that exists here, and
+    it is more accurate than measuring the states one at a time -- every state
+    is measured on the same board, in the same session, at the same supply
+    voltage, with the same firmware build, so the terms being added together are
+    genuinely comparable.
+
+    Each state's current is filed as its baseline, so p1150_battery_life picks
+    them all up afterwards. Only the time weighting is still needed; if the
+    device is self-driven (a sensor node, a beacon, a tracker) the measured
+    times may be the weighting too -- see p1150_usage_from_capture, and read its
+    caveat before adopting them.
+
+    duration_s: long enough to contain several full cycles of whatever the
+        target does. 60 s is a reasonable start; a device that wakes once a
+        minute needs several minutes. A state the target never enters during
+        the capture simply will not appear.
+
+    exclude_entry_transient: leave False unless the transitions BETWEEN states
+        are declared separately with p1150_set_usage_event. Entering a state
+        costs something -- a radio shutting down, a regulator changing mode --
+        and by default that cost stays inside the state, which is the safe
+        choice because it can only overstate drain. Setting True moves it out,
+        and it then belongs to a transition event that has to exist, or the
+        cost silently disappears from the estimate.
+    """
+    try:
+        signal = config.get_state_signal()
+        if not signal.get("channels"):
+            return {"error":
+                    "No state signal is declared, so a capture cannot be split "
+                    "by state. This needs about fifteen lines in the target's "
+                    "firmware to drive a code on two spare GPIOs -- "
+                    "p1150_state_signal_guide has them. Without it, measure the "
+                    "states one at a time with p1150_measure_state, asking the "
+                    "developer to put the target into each."}
+        i, isnk, aux = SESSION.measure(duration_s)
+        codes, names = _state_codes(aux, None)
+        r = analysis.state_breakdown(i, codes, names, SAMPLE_RATE,
+                                     config.capacity_mah())
+
+        key = "settled_mean_ma" if exclude_entry_transient else "mean_ma"
+        currents, times = {}, {}
+        for row in r["states"]:
+            if not row["state"]:
+                continue
+            currents[row["state"]] = row.get(key) or row["mean_ma"]
+            times[row["state"]] = row["time_pct"]
+
+        out = _store(label, i,
+                     {"capture_type": "state_sweep",
+                      "state_currents": currents,
+                      "state_times_pct": times,
+                      "state_current_basis": key},
+                     isnk_ma=isnk, aux=aux)
+        if "error" in out:
+            return out
+        out["states"] = r["states"]
+        out["transitions"] = r["transitions"]
+        for k in ("unmapped_codes", "unmapped_note", "dominant_state"):
+            if r.get(k):
+                out[k] = r[k]
+
+        declared = set(config.get_usage()["states"])
+        seen = {s.lower() for s in currents}
+        never = sorted(declared - seen)
+        if never:
+            out["states_not_seen"] = never
+            out["action"] = (
+                f"The target never entered: {', '.join(never)}. Either it does "
+                f"not reach those states under the conditions of this capture "
+                f"-- exercise them and re-run, or measure each with "
+                f"p1150_measure_state -- or the firmware does not set a code "
+                f"for them.")
+        elif declared:
+            out["action"] = ("Every declared state was measured. "
+                             "p1150_battery_life() will use these.")
+        if not declared:
+            out["usage_hint"] = (
+                "None of these states has a share of the product's time yet, "
+                "so no estimate can be made from them. Either ask the developer "
+                "for the split (p1150_set_usage_state), or, if this capture is "
+                "representative of how the product actually runs, adopt the "
+                f"measured times with p1150_usage_from_capture('{out['run_id']}')"
+                " -- read its caveat first.")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_state_split(run_id: str, exclude_entry_transient: bool = False) -> dict:
+    """Split any stored capture by the state the target said it was in.
+
+    Works on any run taken while a state signal was declared -- including an
+    ordinary p1150_measure or a background capture, which record the code
+    alongside the current whether or not anyone was thinking about states at the
+    time. A capture taken to look at something else will often answer "and what
+    does it draw in each mode" for free.
+
+    Reports per state: time held, share of the capture, mean and settled mean
+    current, peak, floor, charge, how many times it was visited, and how much
+    the entry transient lifts the average. Plus the number of transitions and
+    any code the firmware drove that no state is declared for.
+    """
+    try:
+        i, _, aux, meta = storage.load_all(run_id)
+        codes, names = _state_codes(aux, meta)
+        out = analysis.state_breakdown(i, codes, names, _fs(meta),
+                                       config.capacity_mah())
+        out["run_id"] = run_id
+        out["label"] = meta.get("label")
+        if exclude_entry_transient:
+            out["current_basis"] = "settled_mean_ma"
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_usage_from_capture(run_id: str, adopt: bool = False) -> dict:
+    """Read the time spent in each state from a capture, and optionally adopt it
+    as the product's usage model.
+
+    THINK BEFORE ADOPTING. What this measures is how the target behaved DURING
+    THE CAPTURE. That is the product's real duty cycle only if the workload on
+    the bench is the workload in the field:
+
+      Self-driven devices -- a sensor node on a timer, a beacon, a tracker, a
+      logger -- yes. The firmware's own schedule is the whole story, and what it
+      does on the bench is what it does in service. Adopting the measured times
+      is better than any estimate a person would give.
+
+      User-driven devices -- a wearable, a handheld, anything with a button or
+      an app -- no. A device measured for a minute on a desk spends none of that
+      minute being used, and adopting these fractions would state that the
+      product is never used, giving a battery life far longer than the truth.
+
+    ASK THE DEVELOPER WHICH KIND IT IS. It is one question, and it decides
+    whether the usage model is measured or declared. Do not adopt on your own
+    judgement.
+
+    adopt: False (default) reports the measured fractions without changing
+        anything. True writes them into the usage model, replacing whatever
+        fractions were there.
+    """
+    try:
+        i, _, aux, meta = storage.load_all(run_id)
+        codes, names = _state_codes(aux, meta)
+        r = analysis.state_breakdown(i, codes, names, _fs(meta))
+        rows = [s for s in r["states"] if s["state"]]
+        if not rows:
+            return {"error": f"Run '{run_id}' contains no named states. "
+                             f"Codes seen: {r.get('codes_seen')}."}
+        measured = {s["state"]: s["time_pct"] for s in rows}
+        out = {"run_id": run_id, "duration_s": r["duration_s"],
+               "measured_fractions_pct": measured,
+               "unnamed_time_pct": round(
+                   100.0 - sum(measured.values()), 3),
+               "adopted": False}
+        if r.get("unmapped_codes"):
+            out["unmapped_codes"] = r["unmapped_codes"]
+        if not adopt:
+            out["caveat"] = (
+                "These are the fractions the target actually spent during this "
+                "capture. They are the product's duty cycle only if this "
+                "workload is the real one -- true for a self-driven device, "
+                "false for anything a user drives. Ask the developer which it "
+                "is, then call again with adopt=True.")
+            return out
+        if abs(out["unnamed_time_pct"]) > 0.5:
+            return dict(out, error=(
+                f"{out['unnamed_time_pct']:.1f}% of the capture was in a code "
+                f"with no state declared, so adopting these fractions would "
+                f"leave that time unaccounted for and no estimate could be "
+                f"made. Declare the missing code(s) first."))
+        for name, pct in measured.items():
+            config.set_usage_state(name, fraction_pct=pct)
+        out["adopted"] = True
+        out["fraction_total_pct"] = round(config.usage_fraction_total(), 3)
+        out["note"] = (
+            f"Adopted as the usage model, from {r['duration_s']} s of measured "
+            f"behaviour. Tell the developer these fractions came from a bench "
+            f"capture, not from them -- they are the one person who can say "
+            f"whether that is how the product really runs.")
+        return out
     except Exception as e:
         return _fail(e)
 
@@ -1297,6 +2357,196 @@ def p1150_summary(run_id: str) -> dict:
         out = analysis.summarize(i, _fs(meta), config.capacity_mah())
         out["run_id"] = run_id
         out["label"] = meta.get("label")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_baseline_check(run_id: str) -> dict:
+    """Judge whether a stored capture is fit to represent a state in a
+    battery-life estimate.
+
+    p1150_measure_state runs this automatically; use it directly on an older
+    capture, or after re-analysing one. It catches the two ways a baseline goes
+    wrong without looking wrong: a target that had not finished settling into
+    the state (targets step down into low-power modes over minutes), and a
+    capture too short to cover enough of the state's own repetitions for its
+    average to be stable. Verdicts are USABLE, NOT_SETTLED, TOO_SHORT and
+    UNSTABLE, each with what to do about it.
+    """
+    try:
+        i, meta = storage.load(run_id)
+        out = analysis.baseline_check(i, _fs(meta))
+        out["run_id"] = run_id
+        out["label"] = meta.get("label")
+        out["state"] = meta.get("state")
+        return out
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_battery_life(target_days: float = None) -> dict:
+    """Estimate how long the battery lasts, from the measured states and the
+    declared usage model -- and say what to optimise.
+
+    This is the answer to "how long will the battery last", and the reason none
+    of the per-capture numbers are. A capture measures the state the target
+    happened to be in; a product moves between states, so life is
+    capacity / SUM(fraction x current) plus the events amortised over the day.
+    The instrument supplies the currents and the developer supplies the
+    weights.
+
+    Needs, and reports what is missing: a battery capacity (p1150_set_battery),
+    states totalling 100% of the time (p1150_set_usage_state), and one capture
+    per state (p1150_measure_state). Each state uses its newest capture, so
+    after optimising something, re-measure only the state that changed and run
+    this again.
+
+    Beyond the headline figure it returns the four things that decide what
+    happens next:
+
+      contributors        what is actually spending the battery, ranked. This
+                          routinely contradicts intuition -- a state occupying
+                          99% of the time can be a third of the drain, and a
+                          40 mA burst lasting 8 ms can be irrelevant. Work on
+                          anything but the top row or two is wasted.
+
+      optimisation_payoff for each contributor, the life if its cost were
+                          halved and if it were removed entirely. The second is
+                          the ceiling on what any amount of work on it can
+                          achieve, and it is much cheaper to read before the
+                          work than after.
+
+      duty_cycle_sensitivity
+                          how much the answer moves if the developer's time
+                          split is out by 2x. Read it before quoting a figure
+                          to anyone. Often it barely moves, and then the guess
+                          never needed to be precise -- which is worth saying.
+
+      target              PASS / MARGINAL / SHORT against the required life,
+                          and when short, what each contributor would have to
+                          become to get there: "sleep current from 180 uA to
+                          95 uA", or "boots from 20 a day to 6". A contributor
+                          marked unreachable cannot get there even at zero,
+                          because the others already exceed the budget -- a
+                          design finding rather than a firmware one.
+
+    target_days: override the required life for this call. Better recorded once
+        with p1150_set_battery(target_days=...).
+
+    The estimate uses RATED capacity and excludes self-discharge, temperature
+    and ageing, so it is optimistic -- a target that browns out at 3.3 V may
+    reach that with 15-25% of the rated charge left in the cell. Where the
+    number has to be defensible rather than indicative, quote it again with 20%
+    off the capacity and give the range.
+    """
+    try:
+        usage = config.get_usage()
+        if not usage["states"] and not usage["events"]:
+            return {"error":
+                    "No usage model, so battery life cannot be estimated. Ask "
+                    "the developer how the product spends its time -- which "
+                    "states it has and how many hours a day in each -- and "
+                    "declare them with p1150_set_usage_state. It cannot be "
+                    "measured or inferred from the firmware; "
+                    "p1150_battery_life_guide has the questions to ask."}
+
+        total_pct = config.usage_fraction_total()
+        if usage["states"] and abs(total_pct - 100.0) > 0.5:
+            return {"error":
+                    f"The declared states account for {total_pct:.1f}% of the "
+                    f"product's time, not 100%, so an estimate is undefined: "
+                    f"the unaccounted time could be at any current and cannot "
+                    f"be assumed to be cheap. "
+                    + (f"Ask the developer what the device is doing for the "
+                       f"other {100.0 - total_pct:.1f}% -- most often it is the "
+                       f"resting state, left out because it felt too obvious "
+                       f"to mention." if total_pct < 100.0 else
+                       "Two states are overlapping, or one fraction is wrong."),
+                    "states": usage["states"],
+                    "fraction_total_pct": round(total_pct, 3)}
+
+        baselines = _state_baselines()
+        states, missing, shaky, voltages, stamps = [], [], [], set(), []
+        for key, s in usage["states"].items():
+            meta = baselines.get(key)
+            if not meta:
+                missing.append(s.get("name") or key)
+                continue
+            if meta.get("baseline_verdict") not in (None, "USABLE"):
+                shaky.append(f"{s.get('name') or key} "
+                             f"({meta['baseline_verdict']})")
+            if meta.get("voltage_mv"):
+                voltages.add(meta["voltage_mv"])
+            if meta.get("created"):
+                stamps.append(meta["created"])
+            states.append({"name": s.get("name") or key,
+                           "fraction_pct": s.get("fraction_pct"),
+                           "avg_ma": meta.get("avg_ma"),
+                           "run_id": meta.get("run_id"),
+                           "measured": meta.get("created"),
+                           "baseline_verdict": meta.get("baseline_verdict")})
+        if missing:
+            return {"error":
+                    f"No measurement yet for: {', '.join(missing)}. For each, "
+                    f"ask the developer to put the target into the state, let "
+                    f"it settle, and confirm -- then "
+                    f"p1150_measure_state(state='{missing[0]}', "
+                    f"duration_s=30).",
+                    "measured_states": [s["name"] for s in states]}
+
+        events = []
+        for key, e in usage["events"].items():
+            q = e.get("charge_uah")
+            if q is None and e.get("run_id"):
+                try:
+                    q = (storage.load_meta(e["run_id"]).get("charge_mah")
+                         or 0.0) * 1000.0
+                except Exception:
+                    q = None
+            if q is None:
+                missing.append(e.get("name") or key)
+                continue
+            events.append({"name": e.get("name") or key,
+                           "per_day": e.get("per_day"),
+                           "charge_uah": round(q, 4),
+                           "run_id": e.get("run_id")})
+        if missing:
+            return {"error": f"These events have no cost recorded: "
+                             f"{', '.join(missing)}. Give charge_uah, or a "
+                             f"run_id of a capture containing one occurrence."}
+
+        capacity = config.capacity_mah()
+        out = analysis.battery_life(states, events, capacity,
+                                    target_days or config.target_days())
+        out["states_declared"] = len(states)
+        out["events_declared"] = len(events)
+
+        warnings = []
+        if shaky:
+            warnings.append(
+                f"Built on baselines that did not pass their own check: "
+                f"{'; '.join(shaky)}. NOT_SETTLED overstates a state's current, "
+                f"often several-fold. Re-measure with p1150_measure_state "
+                f"before relying on this figure.")
+        if len(voltages) > 1:
+            warnings.append(
+                f"States were measured at different supply voltages "
+                f"({', '.join(str(v) for v in sorted(voltages))} mV). Current "
+                f"draw varies with supply voltage, so these are not comparable "
+                f"terms to add together. Re-measure them all at the same "
+                f"voltage, preferably the battery's nominal.")
+        if stamps and (max(stamps)[:10] != min(stamps)[:10]):
+            warnings.append(
+                f"The state baselines were not captured on the same day "
+                f"({min(stamps)[:10]} to {max(stamps)[:10]}), so some may "
+                f"predate firmware changes since made. Re-measure any state "
+                f"whose code has moved on -- p1150_list_runs shows when each "
+                f"was taken.")
+        if warnings:
+            out["warnings"] = warnings
         return out
     except Exception as e:
         return _fail(e)

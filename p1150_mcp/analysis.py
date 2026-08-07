@@ -79,11 +79,23 @@ def summarize(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
         "min_ma":         _f(float(i64.min())),
     }
     if battery_mah:
-        # Only meaningful when the capture is representative of steady-state
-        # duty cycle -- a 2 s capture of a boot sequence projects nonsense.
         out["battery_mah"] = battery_mah
-        out["projected_hours"] = _f(battery_mah / avg, 2) if avg > 0 else None
-        out["projected_days"] = _f(battery_mah / avg / 24, 2) if avg > 0 else None
+        # Named for its assumption.  capacity/avg is only the product's battery
+        # life if the product never leaves whatever state this capture caught,
+        # and a capture of an active state projects a life shorter than the real
+        # one by the whole duty cycle -- often by a factor of a hundred.  It was
+        # previously called projected_hours, which invited exactly that reading,
+        # and it is the first number a developer new to the instrument seizes
+        # on.  A real estimate needs the time weighting, which no capture
+        # contains: see battery_life() and p1150_battery_life.
+        out["projected_hours_if_continuous"] = \
+            _f(battery_mah / avg, 2) if avg > 0 else None
+        out["projected_days_if_continuous"] = \
+            _f(battery_mah / avg / 24, 2) if avg > 0 else None
+        out["projection_note"] = (
+            "projected_*_if_continuous assumes the target stays in this state "
+            "for the whole life of the battery. For a device that has more than "
+            "one state, use p1150_battery_life instead.")
         # What this capture actually cost, as a share of the pack.  Turns an
         # abstract mAh into "that boot sequence costs 0.002% of the battery".
         out["battery_used_pct"] = _f(100.0 * q_mah / battery_mah, 6)
@@ -200,6 +212,353 @@ def find_events(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
         # Duty cycle drives battery life more directly than peak current does.
         out["duty_cycle_pct"] = _f(
             100.0 * float(durations_s.mean()) / float(periods_s.mean()), 3)
+    return out
+
+
+# ------------------------------------------------------------------ #
+# Baseline quality                                                     #
+# ------------------------------------------------------------------ #
+# A capture used as a state baseline is multiplied by a fraction of the
+# product's whole life, so an error in it is not a small error.  The two ways it
+# goes wrong are both invisible in the summary and both detectable here.
+#
+# NOT SETTLED.  The target had not reached the state yet.  Boot tails, a radio
+# still connected before an inactivity timeout drops it, a sensor cooling, a
+# supervisory interval that widens over minutes -- targets very often descend
+# into their lowest state in steps over several minutes, and a 30 s capture
+# taken immediately after power-on catches a shallow intermediate state.  The
+# signature is a mean that drifts monotonically across the capture, and it
+# overstates drain by whatever the step was.
+#
+# TOO SHORT.  The state is itself duty-cycled -- a "standby" that advertises
+# once a second is not flat -- and the capture caught a handful of periods, so
+# the average depends on how many bursts happened to fall inside the window.
+# Ten periods is the point past which that stops moving much.
+BASELINE_CHUNKS = 10
+BASELINE_DRIFT_PCT = 20.0        # end-to-end change worth objecting to
+BASELINE_MONOTONE_FRAC = 0.7     # ...that is a trend rather than a wobble
+BASELINE_UNSTABLE_PCT = 50.0     # a non-monotone swing this large is a caution
+BASELINE_MIN_EVENTS = 10
+BASELINE_SETTLED_TAIL = 3        # chunks averaged for the settled estimate
+
+
+def baseline_check(i_ma: np.ndarray, fs: int = SAMPLE_RATE,
+                   min_events: int = BASELINE_MIN_EVENTS) -> dict:
+    """Judge whether a capture is fit to represent a state for a whole week.
+
+    Returns a verdict and, when it is a bad one, what to do instead -- including
+    the current the capture appears to be converging on, so a re-measurement can
+    be judged against it rather than guessed at.
+    """
+    i64 = i_ma.astype(np.float64, copy=False)
+    n = i64.size
+    if n < BASELINE_CHUNKS:
+        return {"verdict": "TOO_SHORT", "issues": ["TOO_SHORT"],
+                "reason": "capture contains almost no samples"}
+
+    duration_s = n / fs
+    mean = float(i64.mean())
+    trim = (n // BASELINE_CHUNKS) * BASELINE_CHUNKS
+    chunks = i64[:trim].reshape(BASELINE_CHUNKS, -1).mean(axis=1)
+    first, last = float(chunks[0]), float(chunks[-1])
+    settled = float(chunks[-BASELINE_SETTLED_TAIL:].mean())
+
+    drift_pct = 100.0 * (last - first) / mean if mean > 0 else 0.0
+    diffs = np.diff(chunks)
+    # How much of the change went the same way as the overall change: a target
+    # still settling moves in one direction, a varying workload does not.
+    direction = np.sign(last - first)
+    monotone = (float(np.mean(np.sign(diffs) == direction))
+                if direction and diffs.size else 0.0)
+    spread_pct = (100.0 * (float(chunks.max()) - float(chunks.min())) / mean
+                  if mean > 0 else 0.0)
+
+    out = {
+        "duration_s": _f(duration_s, 3),
+        "mean_ma": _f(mean),
+        "settled_ma": _f(settled),
+        "start_ma": _f(first),
+        "end_ma": _f(last),
+        # Normalised by the mean rather than by the starting value, so a state
+        # that settles from 1 mA to 1 uA does not report a drift of -99900%.
+        # It can still exceed 100%: it is a fraction of the average, not of a
+        # starting point, which is why the text below quotes both currents.
+        "drift_pct": _f(drift_pct, 2),
+        "trend_consistency": _f(monotone, 2),
+        "spread_pct": _f(spread_pct, 2),
+        "chunk_means_ma": [_f(c) for c in chunks],
+    }
+
+    issues = []
+    if abs(drift_pct) > BASELINE_DRIFT_PCT and monotone >= BASELINE_MONOTONE_FRAC:
+        issues.append("NOT_SETTLED")
+        falling = drift_pct < 0
+        out["action"] = (
+            f"Current {'fell' if falling else 'rose'} steadily across the "
+            f"capture, from {first:.4g} mA at the start to {last:.4g} mA at the "
+            f"end, so the target was still "
+            f"{'settling into' if falling else 'leaving'} this state rather "
+            f"than sitting in it. "
+            + (f"It was heading towards about {settled:.6g} mA. Let the target "
+               f"sit in the state for a few minutes -- inactivity timeouts and "
+               f"connection supervision often step the current down well after "
+               f"boot -- then measure again, for longer, and expect a figure "
+               f"near that." if falling else
+               "Something is ramping up: check the target really is in the "
+               "state being measured, and that nothing else was started during "
+               "the capture."))
+
+    ev = find_events(i_ma, fs)
+    count = int(ev.get("events") or 0)
+    period = ev.get("mean_period_s")
+    if count and period:
+        out["repetitions"] = count
+        out["period_s"] = period
+        if count < min_events:
+            issues.append("TOO_SHORT")
+            want = period * (min_events + 2)
+            out.setdefault("action", "")
+            out["action"] = ((out["action"] + " ") if out["action"] else "") + (
+                f"This state repeats every {period:.4g} s and only {count} "
+                f"repetitions were captured, so the average depends on how many "
+                f"bursts happened to fall inside the window. Re-measure for at "
+                f"least {want:.3g} s.")
+    if "NOT_SETTLED" not in issues and spread_pct > BASELINE_UNSTABLE_PCT:
+        issues.append("UNSTABLE")
+        out.setdefault("action", (
+            f"The average moved by {spread_pct:.0f}% across the capture without "
+            f"a consistent trend, so this is not one steady state. Either the "
+            f"workload varies -- in which case capture long enough to average "
+            f"over that variation -- or the target passed through more than one "
+            f"state and they should be declared and measured separately."))
+
+    out["issues"] = issues
+    out["verdict"] = issues[0] if issues else "USABLE"
+    if not issues:
+        out["action"] = None
+        out["note"] = ("Steady and long enough to stand for this state in a "
+                       "battery-life estimate.")
+    return out
+
+
+# ------------------------------------------------------------------ #
+# Battery life                                                         #
+# ------------------------------------------------------------------ #
+# Life is capacity divided by the time-weighted average of the states, plus the
+# events amortised over the day.  The arithmetic is trivial; what earns its
+# place here is everything around it -- which contributor actually dominates,
+# what optimising each one would buy, and whether the answer even depends on the
+# duty-cycle split the developer guessed at.
+HOURS_PER_DAY = 24.0
+DAYS_PER_YEAR = 365.0
+# Above about a year of projected life, cell self-discharge and PMIC leakage are
+# comparable to the load itself and capacity/current stops being the answer.
+SELF_DISCHARGE_NOTE_DAYS = 365.0
+# Passing by less than this is inside the uncertainty of the duty-cycle model
+# and should not be reported as a pass without saying so.
+TARGET_MARGIN = 1.15
+# A duty-cycle split only matters if halving or doubling it moves the answer
+# more than this.
+SENSITIVITY_MATTERS_PCT = 10.0
+
+
+def _life_days(battery_mah: float, total_ma: float):
+    if not battery_mah or total_ma <= 0:
+        return None
+    return battery_mah / total_ma / HOURS_PER_DAY
+
+
+def battery_life(states: list, events: list, battery_mah: float = None,
+                 target_days: float = None) -> dict:
+    """Combine measured state currents with a declared usage model.
+
+    states: [{"name", "fraction_pct", "avg_ma", ...}]  -- the ... is carried
+        through to the report untouched, so run ids and baseline verdicts
+        recorded by the caller stay attached to the row they describe.
+    events: [{"name", "per_day", "charge_uah", ...}]
+    """
+    rows = []
+    for s in states:
+        frac = float(s.get("fraction_pct") or 0.0)
+        ma = float(s.get("avg_ma") or 0.0)
+        rows.append(dict(s, kind="state", contribution_ma=frac / 100.0 * ma))
+    for e in events:
+        rate = float(e.get("per_day") or 0.0)
+        q_uah = float(e.get("charge_uah") or 0.0)
+        # uAh per day -> mA: /1000 for mAh, /24 for an hourly average.
+        rows.append(dict(e, kind="event",
+                         contribution_ma=q_uah * rate / 1000.0 / HOURS_PER_DAY))
+
+    total = sum(r["contribution_ma"] for r in rows)
+    for r in rows:
+        r["contribution_ma"] = _f(r["contribution_ma"])
+        r["contribution_pct"] = _f(100.0 * r["contribution_ma"] / total, 2) \
+            if total > 0 else 0.0
+    rows.sort(key=lambda r: r["contribution_ma"], reverse=True)
+
+    life = _life_days(battery_mah, total)
+    out = {
+        "average_ma": _f(total),
+        "contributors": rows,
+        "dominant": rows[0]["name"] if rows else None,
+    }
+    if battery_mah:
+        out["battery_mah"] = battery_mah
+    if life is not None:
+        out.update({"projected_days": _f(life, 2),
+                    "projected_hours": _f(life * HOURS_PER_DAY, 1),
+                    "projected_years": _f(life / DAYS_PER_YEAR, 2)})
+
+    # --- what optimising each contributor would buy ------------------ #
+    # The question that follows the first estimate is always "so what do I work
+    # on", and contribution_pct alone answers it only for the top row.  Removing
+    # a contributor entirely is the ceiling on what any amount of work on it can
+    # achieve, which is the number that stops effort going into a rail that
+    # cannot pay for itself however well it is optimised.
+    if life is not None and total > 0:
+        payoff = []
+        for r in rows:
+            c = r["contribution_ma"]
+            halved = _life_days(battery_mah, total - c / 2.0)
+            removed = _life_days(battery_mah, total - c)
+            payoff.append({
+                "name": r["name"],
+                "kind": r["kind"],
+                "days_if_halved": _f(halved, 2) if halved else None,
+                "days_if_eliminated": _f(removed, 2) if removed else None,
+                "gain_days_if_halved": _f(halved - life, 2) if halved else None,
+            })
+        payoff.sort(key=lambda p: p["gain_days_if_halved"] or 0, reverse=True)
+        out["optimisation_payoff"] = payoff
+
+    # --- does the duty-cycle guess even matter ----------------------- #
+    # The currents are instrument-accurate; the fractions are a developer's
+    # estimate of how the product gets used.  Reporting three significant
+    # figures off the back of "about 5% active" is false precision, so say
+    # outright how much the answer moves when that guess is wrong by 2x.  It
+    # frequently does not move at all, and knowing that is worth as much as
+    # knowing it does.
+    state_rows = [r for r in rows if r["kind"] == "state"]
+    if life is not None and len(state_rows) >= 2:
+        # Time taken from or given to a state has to come from somewhere, and
+        # the state holding most of the time is where it comes from -- it is the
+        # resting state the product falls back to.  That state is not itself
+        # varied: "the device might be asleep 50% of the time rather than 99.9%"
+        # is not a developer misestimating a duty cycle, it is a different
+        # product, and reporting it would swamp the rows that describe a real
+        # uncertainty.  The quantity actually being guessed at is always the
+        # small fraction.
+        other = max(state_rows,
+                    key=lambda o: float(o.get("fraction_pct") or 0.0))
+        f_o = float(other.get("fraction_pct") or 0.0)
+        sens, worst = [], 0.0
+        for r in state_rows:
+            if r is other:
+                continue
+            f_r = float(r.get("fraction_pct") or 0.0)
+            row = {"state": r["name"], "fraction_pct": _f(f_r, 3),
+                   "time_taken_from": other["name"]}
+            for tag, mult in (("at_half_the_time", 0.5),
+                              ("at_double_the_time", 2.0)):
+                delta = f_r * (mult - 1.0)
+                clamped = delta > f_o
+                if clamped:
+                    delta = f_o
+                shifted = total \
+                    + delta / 100.0 * float(r.get("avg_ma") or 0.0) \
+                    - delta / 100.0 * float(other.get("avg_ma") or 0.0)
+                d = _life_days(battery_mah, shifted)
+                cell = {"days": _f(d, 2) if d else None}
+                if clamped:
+                    cell["note"] = (f"limited by the time available in "
+                                    f"'{other['name']}'")
+                row[tag] = cell
+                if d:
+                    worst = max(worst, abs(d - life) / life * 100.0)
+            sens.append(row)
+        if sens:
+            out["duty_cycle_sensitivity"] = sens
+            out["duty_cycle_sensitivity_note"] = (
+                f"Halving or doubling how much time the product spends in any "
+                f"state other than '{other['name']}' moves the estimate by at "
+                f"most {worst:.0f}%, so the split does not need to be precise "
+                f"-- the measured currents dominate it."
+                if worst < SENSITIVITY_MATTERS_PCT else
+                f"The estimate moves by up to {worst:.0f}% when a state's share "
+                f"of the time is out by 2x, so it is only as good as that "
+                f"split. If the developer was estimating it, ask what bounds "
+                f"they are confident in and quote the range rather than the "
+                f"single figure.")
+
+    # --- against the requirement ------------------------------------- #
+    if target_days and life is not None:
+        required_ma = battery_mah / (target_days * HOURS_PER_DAY)
+        verdict = ("PASS" if life >= target_days * TARGET_MARGIN else
+                   "MARGINAL" if life >= target_days else "SHORT")
+        tgt = {
+            "target_days": target_days,
+            "verdict": verdict,
+            "projected_days": _f(life, 2),
+            "required_average_ma": _f(required_ma),
+            "actual_average_ma": _f(total),
+            "margin_pct": _f(100.0 * (life - target_days) / target_days, 1),
+        }
+        if verdict == "MARGINAL":
+            tgt["note"] = (
+                f"It clears {target_days:g} days by "
+                f"{100.0 * (life - target_days) / target_days:.0f}%, which is "
+                f"inside the uncertainty of the usage model itself. Treat it as "
+                f"not yet proven rather than as a pass.")
+        if verdict == "SHORT":
+            # Stated as what each contributor would have to become, holding the
+            # others fixed.  "Cut the sleep floor to 40 uA" is actionable where
+            # "cut total current by 38%" is not, and an unreachable row says
+            # plainly that this one is not the way to the target.
+            need = []
+            for r in rows:
+                c = r["contribution_ma"]
+                headroom = required_ma - (total - c)
+                item = {"name": r["name"], "kind": r["kind"]}
+                if headroom <= 0:
+                    item["required"] = "unreachable"
+                    item["note"] = (
+                        "Everything else already exceeds the budget, so this "
+                        "contributor cannot reach the target even at zero.")
+                elif r["kind"] == "state":
+                    frac = float(r.get("fraction_pct") or 0.0)
+                    if frac > 0:
+                        item["present_ma"] = r.get("avg_ma")
+                        item["required_ma"] = _f(headroom / (frac / 100.0))
+                        item["reduction_pct"] = _f(100.0 * (1 - headroom / c), 1)
+                else:
+                    rate = float(r.get("per_day") or 0.0)
+                    if rate > 0:
+                        item["present_charge_uah"] = r.get("charge_uah")
+                        item["required_charge_uah"] = _f(
+                            headroom * 1000.0 * HOURS_PER_DAY / rate)
+                        item["reduction_pct"] = _f(100.0 * (1 - headroom / c), 1)
+                        item["or_reduce_rate_to_per_day"] = _f(
+                            headroom * 1000.0 * HOURS_PER_DAY /
+                            float(r.get("charge_uah") or 1.0), 2)
+                need.append(item)
+            tgt["to_reach_target"] = need
+        out["target"] = tgt
+
+    notes = []
+    if life is not None and life > SELF_DISCHARGE_NOTE_DAYS:
+        notes.append(
+            f"At {life / DAYS_PER_YEAR:.1f} years the load is comparable to the "
+            f"cell's own self-discharge, which this figure does not include. "
+            f"For a design at this level, take the self-discharge rate from the "
+            f"cell datasheet (a few percent a year for lithium primaries, much "
+            f"more for NiMH) and treat the shelf life as the real ceiling.")
+    if not battery_mah:
+        notes.append(
+            "No battery capacity is configured, so only the weighted average "
+            "current could be computed. Ask the developer for the pack's mAh "
+            "rating and record it with p1150_set_battery.")
+    if notes:
+        out["notes"] = notes
     return out
 
 
@@ -1299,6 +1658,148 @@ def to_logic(x: np.ndarray, cfg: dict = None) -> np.ndarray:
     return high if cfg.get("active_high", True) else ~high
 
 
+# ------------------------------------------------------------------ #
+# State signal                                                         #
+# ------------------------------------------------------------------ #
+# The target driving a code on the digital inputs to say which state it is in,
+# decoded here into per-state current.  D0 is bit 0 and D1 is bit 1, so two
+# pins carry four states.
+#
+# The samples immediately after a state is entered are the transition into it,
+# not the state: a radio shutting down, a regulator changing mode, a sensor
+# powering off.  Those belong to the transition, which the usage model counts
+# separately as an event, so counting them in the state's average would charge
+# for them twice -- and on a target that switches often, the entry transient can
+# be most of what a "sleep" average contains.  Both figures are reported: the
+# mean over everything, and the mean with a settling window after each entry
+# discarded.
+STATE_SETTLE_MS = 20.0
+STATE_ENTRY_SIGNIFICANT_PCT = 20.0
+# A visit too short to survive the settling window contributes nothing to the
+# settled figure, which is correct but silent, so it is counted and reported.
+STATE_MIN_VISIT_MS = 1.0
+
+
+def decode_state_codes(aux: dict, channels: list) -> np.ndarray:
+    """Per-sample integer state code from the bit channels, LSB first."""
+    code = None
+    for bit, ch in enumerate(channels):
+        arr = aux.get(ch)
+        if arr is None:
+            raise ValueError(
+                f"This run has no '{ch}' channel, so the state signal cannot "
+                f"be decoded. The channel has to be declared before the "
+                f"capture, not after -- p1150_set_state_signal does that, and "
+                f"the run must be captured after it.")
+        # active_high is not configurable here: the code is a number, and
+        # inverting a bit would silently renumber every state.
+        bits = to_logic(arr, {"active_high": True}).astype(np.uint8)
+        code = bits << bit if code is None else code | (bits << bit)
+    if code is None:
+        raise ValueError("No state-signal channels are declared.")
+    return code
+
+
+def state_breakdown(i_ma: np.ndarray, codes: np.ndarray, names: dict,
+                    fs: int = SAMPLE_RATE, battery_mah: float = None,
+                    settle_ms: float = STATE_SETTLE_MS) -> dict:
+    """Split a capture into the states the target said it was in.
+
+    names maps code -> state name.  Codes present in the capture but not named
+    are reported rather than dropped: an undeclared code means the firmware has
+    a state the model does not, which is worth knowing before an estimate is
+    built on the states it does have.
+    """
+    i64 = i_ma.astype(np.float64, copy=False)
+    n = min(i64.size, codes.size)
+    i64, codes = i64[:n], codes[:n]
+    if n == 0:
+        return {"error": "capture contains no samples"}
+
+    settle = max(0, int(settle_ms * 1e-3 * fs))
+    min_visit = max(1, int(STATE_MIN_VISIT_MS * 1e-3 * fs))
+    rows, unmapped = [], []
+    for code in sorted(int(c) for c in np.unique(codes)):
+        mask = codes == code
+        cnt = int(mask.sum())
+        if cnt == 0:
+            continue
+        name = names.get(code)
+        sel = i64[mask]
+        starts, ends = _intervals(mask)
+        # Trim a settling window off the front of every visit.  Visits too
+        # short to survive it are excluded from the settled figure entirely,
+        # which is why they are counted separately.
+        settled = None
+        skipped = 0
+        if settle and starts.size:
+            keep = np.zeros(n, dtype=bool)
+            for a, b in zip(starts, ends):
+                if b - a > settle:
+                    keep[a + settle:b] = True
+                else:
+                    skipped += 1
+            if keep.any():
+                settled = float(i64[keep].mean())
+        mean = float(sel.mean())
+        row = {
+            "code": code,
+            "state": name,
+            "time_s": _f(cnt / fs, 4),
+            "time_pct": _f(100.0 * cnt / n, 3),
+            "mean_ma": _f(mean),
+            "settled_mean_ma": _f(settled) if settled is not None else None,
+            "peak_ma": _f(float(sel.max())),
+            "floor_ma": _f(float(np.percentile(sel, 5))),
+            "charge_mah": _f(float(sel.sum() / fs / 3600.0)),
+            "visits": int(starts.size),
+        }
+        if starts.size:
+            visits_ms = (ends - starts) / fs * 1000.0
+            row["mean_visit_ms"] = _f(float(visits_ms.mean()), 3)
+            row["longest_visit_ms"] = _f(float(visits_ms.max()), 3)
+        if skipped:
+            row["visits_too_short_to_settle"] = skipped
+        if settled is not None and settled > 0:
+            entry = 100.0 * (mean - settled) / settled
+            row["entry_transient_pct"] = _f(entry, 1)
+            if entry > STATE_ENTRY_SIGNIFICANT_PCT:
+                row["entry_note"] = (
+                    f"Entering this state costs enough that it lifts the "
+                    f"average {entry:.0f}% above the settled current. Use "
+                    f"settled_mean_ma as the state's current and declare the "
+                    f"transition into it with p1150_set_usage_event, or the "
+                    f"cost is attributed to time the target spends resting "
+                    f"rather than to the {row['visits']} transitions that "
+                    f"actually caused it.")
+        if battery_mah:
+            row["battery_pct"] = _f(100.0 * row["charge_mah"] / battery_mah, 6)
+        if name is None:
+            unmapped.append(code)
+        rows.append(row)
+
+    out = {
+        "duration_s": _f(n / fs, 4),
+        "states": rows,
+        # Every code change, so the count of transitions the firmware made.
+        "transitions": int(np.count_nonzero(np.diff(codes))),
+        "codes_seen": sorted(int(c) for c in np.unique(codes)),
+    }
+    if unmapped:
+        out["unmapped_codes"] = unmapped
+        out["unmapped_note"] = (
+            f"The target drove code(s) {unmapped} that no state is declared "
+            f"for. Either the firmware has a state the usage model does not, "
+            f"or the pins were not driven -- an uninitialised or unpowered "
+            f"target reads as code 0. Declare them with p1150_set_state_signal, "
+            f"or find out what the firmware is doing there before building an "
+            f"estimate that ignores it.")
+    named = [r for r in rows if r["state"]]
+    if named:
+        out["dominant_state"] = max(named, key=lambda r: r["time_s"])["state"]
+    return out
+
+
 def _intervals(mask: np.ndarray) -> tuple:
     """Start (inclusive) and end (exclusive) indices of each True run."""
     edges = np.diff(np.concatenate(([0], mask.view(np.int8), [0])))
@@ -1916,7 +2417,11 @@ def compare(base: np.ndarray, cand: np.ndarray, fs: int = SAMPLE_RATE,
             f"has been omitted; avg_ma remains valid. For a defensible "
             f"regression number, re-run both over the same duration and the "
             f"same workload.")
-    if battery_mah and sm_b.get("projected_hours") and sm_c.get("projected_hours"):
-        out["projected_battery_life"] = _delta(sm_b["projected_hours"],
-                                               sm_c["projected_hours"])
+    key = "projected_hours_if_continuous"
+    if battery_mah and sm_b.get(key) and sm_c.get(key):
+        # A ratio of two same-assumption projections, so the assumption cancels:
+        # this is a valid statement about how much the two runs differ, but not
+        # about the product's battery life unless the workload is the whole
+        # duty cycle.  p1150_battery_life is the tool for the latter.
+        out["projected_life_if_continuous"] = _delta(sm_b[key], sm_c[key])
     return out
