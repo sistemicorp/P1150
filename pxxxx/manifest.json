@@ -1,10 +1,10 @@
 {
-  "version": "0.2",
-  "commit": "6c78e06ebf5231e1b33ce42750a750acaaf634d7",
-  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.2",
+  "version": "0.3",
+  "commit": "4fc082e3ec1b94350d23ec9c4683920dd7f9db02",
+  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.3",
   "built_utc": {
-    "linux-x64": "2026-09-04T02:39:42Z",
-    "windows-x64": "2026-09-04T03:21:48Z"
+    "linux-x64": "2026-09-04T17:11:26Z",
+    "windows-x64": "2026-09-04T17:32:20Z"
   },
   "signed": {
     "linux-x64": false,
@@ -76,13 +76,13 @@
     {
       "name": "libpxxxx.so",
       "leg": "linux-x64",
-      "sha256": "0700868ebe979c2ce8f87c0180045278feff1eb430ad5bd0034bc30c991aecd3",
+      "sha256": "ec1c33a4295fe050085037ef13011c7f62af305a4fec01be7944480783611534",
       "size": 673696
     },
     {
       "name": "pxxxx.dll",
       "leg": "windows-x64",
-      "sha256": "02cde54ff933b7640347cd11ac33a88981205a1d96d23009ffdfb59205dd450e",
+      "sha256": "f0d00f6aab8f3dd224e346c568012e8422902fad5cf5c382ef5f2a7e2f3b9ee6",
       "size": 643552
     },
     {
