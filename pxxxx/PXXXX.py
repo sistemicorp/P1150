@@ -747,8 +747,11 @@ class PXXXX:
     def ez_connect(self, calibrate=True, progress_callback=None):
         """Connect, auto-download firmware if needed, calibrate.
 
-        Signature intentionally mirrors P1150.ez_connect so p1150_hello.py
-        needs only the 'calibrate' parameter (any truthy value = True).
+        Signature intentionally mirrors the old P1150.ez_connect so an
+        application ports with an import change and nothing else. That is why
+        the first parameter is positional and any truthy value means True:
+        callers written against the old driver passed a serial number here, and
+        they must keep working.
         """
         result = PxxxxConnectResult()
         prog_c = None

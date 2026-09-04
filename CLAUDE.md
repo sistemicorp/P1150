@@ -109,6 +109,35 @@ The driver is a prebuilt shared library loaded with ctypes (`pxxxx/pxxxx.dll`,
 `.gitignore` carries a deliberate `!pxxxx/libpxxxx.so` exception — do not drop
 it, or Linux customers get a repo with no driver in it.
 
+**The binaries stay in git here, and that is the deliberate exception.** The
+other two consumers of this driver (`a53-P1150DLL`, `a73-PxxxxWASMGUI`) untrack
+theirs and fetch from an `a72-PxDLL` release at build time.  They can: they are
+private and have CI.  This repository is **public** and its README tells
+customers to clone it, while `a72-PxDLL` is **private** — a customer cannot
+fetch its release assets.  Untracking `pxxxx/` here would break every clone.
+Do not "finish the job" by applying the other repos' rule to this one.
+
+What was wrong was never the tracking; it was the drift.  Measured 2026-09-03,
+`libpxxxx.so` was at a72 `0.1-40` and `pxxxx.dll` at `0.1-41` **in the same
+directory**, about twenty commits behind, and `PXXXX.py` differed from a72's by
+seven lines — so a P1150 user on Linux and one on Windows were running
+different drivers.  So how they arrive is now fixed instead:
+
+```bash
+tools/sync_from_a72.sh 0.3        # or no argument: the tag in PXXXX_VERSION
+```
+
+It pulls the `linux-x64` **and** `windows-x64` legs of one a72 release, refuses
+to write anything unless both report the same commit and the same firmware set,
+writes `PXXXX_VERSION` and `pxxxx/manifest.json`, and leaves the result staged
+for one commit.  Both platforms move together or neither does.  `PXXXX.py` comes
+from the bundle too — stop hand-maintaining it.
+
+Read the header comment before editing it; in particular, each file has a
+designated leg because the two legs' shared text files differ by line endings
+(the signing box checks out CRLF), so taking a text file from whichever leg was
+read last would flip a thousand lines of `PXXXX.py` on alternate syncs.
+
 ## Conventions
 
 Every file opens with the MIT header block.  Keep it.

@@ -54,6 +54,12 @@ The `pxxxx` driver itself is a prebuilt shared library loaded with ctypes, so th
 nothing to compile.  `matplotlib` is the only requirement, and only the plotting examples
 need it.
 
+`PXXXX_VERSION` names the driver release this repository ships, and
+`pxxxx/manifest.json` records the rest of it -- the exact build, and the instrument
+firmware images embedded in it.  So "which driver am I running?" is a file to read, and
+worth quoting in a bug report.  Maintainers: `tools/sync_from_a72.sh` is what updates
+them, and it moves the Linux and Windows drivers together on purpose.
+
 ## Run "hello, P1150"
 
 In keeping with tradition, a "Hello, World" program, `p1150_hello.py`, is given as an example
