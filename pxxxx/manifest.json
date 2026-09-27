@@ -1,10 +1,10 @@
 {
-  "version": "0.5",
-  "commit": "a1ca0d78e4c099ad6df8341b7bbf60ef5677ca4e",
-  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.5",
+  "version": "0.6",
+  "commit": "c9651888ad76186920eceaf5b484329eea907c17",
+  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.6",
   "built_utc": {
-    "linux-x64": "2026-09-05T18:13:27Z",
-    "windows-x64": "2026-09-05T18:29:07Z"
+    "linux-x64": "2026-09-27T21:06:27Z",
+    "windows-x64": "2026-09-27T21:19:37Z"
   },
   "signed": {
     "linux-x64": false,
@@ -76,20 +76,20 @@
     {
       "name": "libpxxxx.so",
       "leg": "linux-x64",
-      "sha256": "c7580ac1c67bc64e318307342a5dd38658ea72e13a736926542b0113d9796b86",
-      "size": 673696
+      "sha256": "2fd717122ab6f29a520265470e4114aa5677aa3c9893b05273ad8cbc21212edd",
+      "size": 686744
     },
     {
       "name": "pxxxx.dll",
       "leg": "windows-x64",
-      "sha256": "e07a36eb23950b2125a8bad6e212223fa10686f1f54e28c93ed5dde4f10d5e62",
-      "size": 644064
+      "sha256": "7fbf7a0f4e04e628d63d57337f8cf1c368e341e7f9250403addf672508341ded",
+      "size": 654304
     },
     {
       "name": "PXXXX.py",
       "leg": "linux-x64",
-      "sha256": "11984e8d0f52c554cea74ceacb389ddaef030b16acbc76ebb4bd15bc4f0ce039",
-      "size": 41560
+      "sha256": "dc0674395da03793b294156cb94e4d7d4511c21290e21fe2abfc6408b401d3ad",
+      "size": 46148
     },
     {
       "name": "__init__.py",

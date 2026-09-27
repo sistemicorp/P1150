@@ -121,6 +121,18 @@ class PxxxxVoutMetrics(ctypes.Structure):
         ("max",  ctypes.c_int),
         ("min",  ctypes.c_int),
         ("step", ctypes.c_int),
+        ("num_ch", ctypes.c_int),
+    ]
+
+PROBE_SEQ_STEPS = 3
+
+class PxxxxProbeSeq(ctypes.Structure):
+    _fields_ = [
+        ("en",    ctypes.c_int),
+        ("valid", ctypes.c_int),
+        ("busy",  ctypes.c_int),
+        ("seq",   ctypes.c_int * PROBE_SEQ_STEPS),
+        ("ms",    ctypes.c_int * PROBE_SEQ_STEPS),
     ]
 
 class PxxxxConnectResult(ctypes.Structure):
@@ -138,6 +150,7 @@ CB_ACQ_T      = ctypes.CFUNCTYPE(None, ctypes.POINTER(PxxxxAcqData), ctypes.c_vo
 CB_ASYNC_T    = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 CB_PROGRESS_T = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
 CB_LOG_T      = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
+CB_SHELL_T    = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_char), ctypes.c_int, ctypes.c_void_p)
 
 # ------------------------------------------------------------------ #
 # Library function signatures                                          #
@@ -160,6 +173,9 @@ def _setup_lib(lib):
 
     lib.pxxxx_set_cb_log.restype  = None
     lib.pxxxx_set_cb_log.argtypes = [void_p, CB_LOG_T, void_p]
+
+    lib.pxxxx_set_cb_shell.restype  = None
+    lib.pxxxx_set_cb_shell.argtypes = [void_p, CB_SHELL_T, void_p]
 
     lib.pxxxx_find_port.restype  = int_t
     lib.pxxxx_find_port.argtypes = [ctypes.c_char_p, ctypes.c_char_p, int_t]
@@ -205,22 +221,22 @@ def _setup_lib(lib):
     lib.pxxxx_ping.argtypes = [void_p, ctypes.POINTER(PxxxxPing)]
 
     lib.pxxxx_status.restype  = int_t
-    lib.pxxxx_status.argtypes = [void_p, ctypes.POINTER(PxxxxStatus)]
+    lib.pxxxx_status.argtypes = [void_p, int_t, ctypes.POINTER(PxxxxStatus)]
 
     lib.pxxxx_vout_metrics.restype  = int_t
-    lib.pxxxx_vout_metrics.argtypes = [void_p, ctypes.POINTER(PxxxxVoutMetrics)]
+    lib.pxxxx_vout_metrics.argtypes = [void_p, int_t, ctypes.POINTER(PxxxxVoutMetrics)]
 
     lib.pxxxx_temperature_update.restype  = int_t
     lib.pxxxx_temperature_update.argtypes = [void_p]
 
     lib.pxxxx_set_vout.restype  = int_t
-    lib.pxxxx_set_vout.argtypes = [void_p, int_t]
+    lib.pxxxx_set_vout.argtypes = [void_p, int_t, int_t]
 
     lib.pxxxx_set_vout_rs.restype  = int_t
-    lib.pxxxx_set_vout_rs.argtypes = [void_p, int_t]
+    lib.pxxxx_set_vout_rs.argtypes = [void_p, int_t, int_t]
 
     lib.pxxxx_set_ovc.restype  = int_t
-    lib.pxxxx_set_ovc.argtypes = [void_p, int_t]
+    lib.pxxxx_set_ovc.argtypes = [void_p, int_t, int_t]
 
     lib.pxxxx_set_cal_load.restype  = int_t
     lib.pxxxx_set_cal_load.argtypes = [void_p, ctypes.c_uint32]
@@ -229,7 +245,17 @@ def _setup_lib(lib):
     lib.pxxxx_set_cal_sweep.argtypes = [void_p, int_t]
 
     lib.pxxxx_probe.restype  = int_t
-    lib.pxxxx_probe.argtypes = [void_p, int_t, int_t, int_t]
+    lib.pxxxx_probe.argtypes = [void_p, int_t, int_t, int_t, int_t]
+
+    steps_t = ctypes.POINTER(int_t)
+    lib.pxxxx_probe_seq_set.restype  = int_t
+    lib.pxxxx_probe_seq_set.argtypes = [void_p, int_t, steps_t, steps_t]
+
+    lib.pxxxx_probe_seq_get.restype  = int_t
+    lib.pxxxx_probe_seq_get.argtypes = [void_p, ctypes.POINTER(PxxxxProbeSeq)]
+
+    lib.pxxxx_probe_seq_run.restype  = int_t
+    lib.pxxxx_probe_seq_run.argtypes = [void_p, int_t]
 
     lib.pxxxx_clear_error.restype  = int_t
     lib.pxxxx_clear_error.argtypes = [void_p]
@@ -275,6 +301,12 @@ def _setup_lib(lib):
 
     lib.pxxxx_cmd.restype  = int_t
     lib.pxxxx_cmd.argtypes = [void_p, ctypes.c_char_p, ctypes.c_char_p, int_t]
+
+    lib.pxxxx_shell_write.restype  = int_t
+    lib.pxxxx_shell_write.argtypes = [void_p, ctypes.c_char_p, int_t]
+
+    lib.pxxxx_uclog_load.restype  = int_t
+    lib.pxxxx_uclog_load.argtypes = [void_p, ctypes.c_char_p, int_t]
 
     lib.pxxxx_version.restype  = ctypes.c_char_p
     lib.pxxxx_version.argtypes = []
@@ -396,10 +428,11 @@ PXXXX_USB_PID = 0xa430
 # ------------------------------------------------------------------ #
 @dataclass(frozen=True)
 class PxxxxAPI:
-    # Channel selection ("ch" field, integer). Single-channel hardware
-    # (P1150/P1150D) ignores it; the multi-channel P3260 uses it to address a
-    # specific channel. Channels are 1-based, so the API default is ch=1.
-    # PROBE_ALL_CHANNELS tells probe() to act on every channel at once.
+    # Channel selection. Every channel-addressed call takes a 1-based ch,
+    # default 1, which is what single-channel hardware (P1150/P1150D) is; the
+    # DLL puts it on the wire. vout_metrics()["num_ch"] says how many there are.
+    # PROBE_ALL_CHANNELS tells probe() to act on every channel at once, on
+    # firmware that supports it.
     PROBE_ALL_CHANNELS = 0
 
     ACQUIRE_MODE_RUN    = "ACQUIRE_MODE_RUN"
@@ -666,6 +699,10 @@ class PXXXX:
         self._c_async = CB_ASYNC_T(self._on_async)
         self._lib.pxxxx_set_cb_async(self._dev, self._c_async, None)
 
+        self._user_cb_shell = None
+        self._c_shell = CB_SHELL_T(self._on_shell)
+        self._lib.pxxxx_set_cb_shell(self._dev, self._c_shell, None)
+
         if logger:
             self._c_log = CB_LOG_T(self._on_log)
             self._lib.pxxxx_set_cb_log(self._dev, self._c_log, None)
@@ -688,6 +725,13 @@ class PXXXX:
             try:
                 data = json.loads(json_bytes.decode("utf-8", errors="replace"))
                 self._user_cb_async(data)
+            except Exception:
+                pass
+
+    def _on_shell(self, data_ptr, length, _user):
+        if data_ptr and length > 0 and self._user_cb_shell:
+            try:
+                self._user_cb_shell(ctypes.string_at(data_ptr, length))
             except Exception:
                 pass
 
@@ -818,10 +862,11 @@ class PXXXX:
 
     # ---- status ---------------------------------------------------- #
 
-    def status(self):
+    def status(self, ch: int = 1):
+        # vout, probe and ovc_ma are ch's; the rest is device-wide
         with self._lock:
             s = PxxxxStatus()
-            rc = self._lib.pxxxx_status(self._dev, ctypes.byref(s))
+            rc = self._lib.pxxxx_status(self._dev, int(ch), ctypes.byref(s))
             if rc != 0: return False, None
             d = {
                 "f": "cmd_status", "s": True,
@@ -834,12 +879,13 @@ class PXXXX:
 
     # ---- vout_metrics ---------------------------------------------- #
 
-    def vout_metrics(self):
+    def vout_metrics(self, ch: int = 1):
+        # ch's range; the device may report one for all channels or one each
         with self._lock:
             m = PxxxxVoutMetrics()
-            rc = self._lib.pxxxx_vout_metrics(self._dev, ctypes.byref(m))
+            rc = self._lib.pxxxx_vout_metrics(self._dev, int(ch), ctypes.byref(m))
             if rc != 0: return False, None
-            return True, [{"f": "cmd_vout_metrics", "s": True,
+            return True, [{"f": "cmd_vout_metrics", "s": True, "num_ch": m.num_ch,
                            "max": m.max, "min": m.min, "step": m.step}]
 
     # ---- temperature_update ---------------------------------------- #
@@ -849,43 +895,26 @@ class PXXXX:
             rc = self._lib.pxxxx_temperature_update(self._dev)
             return rc == 0, [{"f": "cmd_temp102_trigger", "s": rc == 0}]
 
-    # ---- internal: channel-aware raw command send ------------------ #
-
-    def _send_raw(self, payload: dict) -> int:
-        """Send a flat command dict to the device via the raw pass-through
-        (pxxxx_cmd) and return the DLL return code (0 == OK).
-
-        Channel-aware commands use this so the integer "ch" field reaches the
-        device unchanged: the DLL forwards the whole map and single-channel
-        hardware (P1150/P1150D) simply ignores the extra field. This keeps
-        multi-channel support entirely in the PXXXX class - no DLL change.
-        """
-        json_cmd = json.dumps(payload)
-        rsp_buf = ctypes.create_string_buffer(4096)
-        with self._lock:
-            return self._lib.pxxxx_cmd(
-                self._dev, json_cmd.encode(), rsp_buf, len(rsp_buf))
-
     # ---- set_vout -------------------------------------------------- #
 
     def set_vout(self, value_mv: int, ch: int = 1):
-        # ch: 1-based channel (default 1); ignored by single-channel hardware
-        rc = self._send_raw({"f": "cmd_vout", "mv": int(value_mv), "ch": int(ch)})
-        return rc == 0, [{"f": "cmd_vout", "s": rc == 0}]
+        with self._lock:
+            rc = self._lib.pxxxx_set_vout(self._dev, int(ch), int(value_mv))
+            return rc == 0, [{"f": "cmd_vout", "s": rc == 0}]
 
     # ---- set_vout_remote_sense ------------------------------------- #
 
     def set_vout_remote_sense(self, en: bool = False, ch: int = 1):
-        # ch: 1-based channel (default 1); ignored by single-channel hardware
-        rc = self._send_raw({"f": "cmd_vout_rs", "en": bool(en), "ch": int(ch)})
-        return rc == 0, [{"f": "cmd_vout_rs", "s": rc == 0}]
+        with self._lock:
+            rc = self._lib.pxxxx_set_vout_rs(self._dev, int(ch), int(bool(en)))
+            return rc == 0, [{"f": "cmd_vout_rs", "s": rc == 0}]
 
     # ---- set_ovc --------------------------------------------------- #
 
     def set_ovc(self, value_ma: int, ch: int = 1):
-        # ch: 1-based channel (default 1); ignored by single-channel hardware
-        rc = self._send_raw({"f": "cmd_ovrcur", "ma": int(value_ma), "ch": int(ch)})
-        return rc == 0, [{"f": "cmd_ovrcur", "s": rc == 0}]
+        with self._lock:
+            rc = self._lib.pxxxx_set_ovc(self._dev, int(ch), int(value_ma))
+            return rc == 0, [{"f": "cmd_ovrcur", "s": rc == 0}]
 
     # ---- set_cal_load ---------------------------------------------- #
 
@@ -910,14 +939,53 @@ class PXXXX:
 
     def probe(self, connect: bool = True, hard_connect: bool = False,
               rs_comp: bool = False, ch: int = 1):
-        # ch: 1-based channel (default 1). Pass PxxxxAPI.PROBE_ALL_CHANNELS to
-        # act on every channel at once. Ignored by single-channel hardware.
-        rc = self._send_raw({"f":    "cmd_probe",
-                             "v":    bool(connect),
-                             "hard": bool(hard_connect),
-                             "comp": bool(rs_comp),
-                             "ch":   int(ch)})
-        return rc == 0, [{"f": "cmd_probe", "s": rc == 0}]
+        # ch: 1-based channel (default 1), or PxxxxAPI.PROBE_ALL_CHANNELS.
+        with self._lock:
+            rc = self._lib.pxxxx_probe(self._dev, int(ch), int(bool(connect)),
+                                       int(bool(hard_connect)), int(bool(rs_comp)))
+            return rc == 0, [{"f": "cmd_probe", "s": rc == 0}]
+
+    # ---- probe sequence (multi-channel only) ----------------------- #
+    # probe_seq_set / probe_seq_get / probe_seq_run are only valid on
+    # multi-channel PXXXX devices: P3xxx (e.g. P3260) supports them, P1xxx
+    # (P1150, P1150D) does not, and they return False there.
+
+    def probe_seq_set(self, en: bool = None, seq: list = None, ms: list = None):
+        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
+        # Stores the sequence the front panel edits. None leaves that part as
+        # it is; seq and ms are PROBE_SEQ_STEPS entries each, seq 1-based with
+        # 0 for an unused step, ms the delay before each step (ms[0] is always
+        # stored as 0). The device refuses duplicates, bad channels, delays
+        # over 100 ms, and en=True against a sequence that is not valid.
+        def steps(v):
+            if v is None: return None
+            if len(v) != PROBE_SEQ_STEPS:
+                raise ValueError(f"expected {PROBE_SEQ_STEPS} steps, got {len(v)}")
+            return (ctypes.c_int * PROBE_SEQ_STEPS)(*[int(x) for x in v])
+        c_seq, c_ms = steps(seq), steps(ms)
+        with self._lock:
+            rc = self._lib.pxxxx_probe_seq_set(self._dev, -1 if en is None else int(bool(en)),
+                                               c_seq, c_ms)
+            return rc == 0, [{"f": "cmd_probe_seq_set", "s": rc == 0}]
+
+    def probe_seq_get(self):
+        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
+        # en: enabled; valid: would run; busy: a sequence is running now.
+        with self._lock:
+            q = PxxxxProbeSeq()
+            rc = self._lib.pxxxx_probe_seq_get(self._dev, ctypes.byref(q))
+            if rc != 0: return False, None
+            return True, [{"f": "cmd_probe_seq_get", "s": True,
+                           "en": bool(q.en), "valid": bool(q.valid), "busy": bool(q.busy),
+                           "seq": list(q.seq), "ms": list(q.ms)}]
+
+    def probe_seq_run(self, connect: bool = True):
+        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
+        # True once queued, not once done: the outcome arrives through
+        # cb_uclog_async as {"f": "asc_probe_seq", "s", "v", "step", "err"}.
+        with self._lock:
+            rc = self._lib.pxxxx_probe_seq_run(self._dev, int(bool(connect)))
+            return rc == 0, [{"f": "cmd_probe_seq_run", "s": rc == 0}]
 
     # ---- clear_error ----------------------------------------------- #
 
@@ -1044,6 +1112,40 @@ class PXXXX:
             rc = self._lib.pxxxx_reset(self._dev, int(bool(to_a70loader)))
             self.connected = False
         return rc == 0
+
+    # ---- shell (ucLog port 61) ------------------------------------- #
+
+    def set_shell_callback(self, cb) -> None:
+        """Receive the device shell's output as ``cb(data: bytes)``, in the
+        chunks the firmware sent. None detaches. Called from the reader thread.
+        """
+        self._user_cb_shell = cb
+
+    def shell_write(self, text) -> bool:
+        """Send text to the device shell (P3260 / a61; the P1150 has none).
+
+        Sent as given — a command line needs its own ``\\r``. Returns
+        immediately; the reply arrives through ``set_shell_callback``.
+        """
+        data = text.encode() if isinstance(text, str) else bytes(text)
+        rc = self._lib.pxxxx_shell_write(self._dev, data, len(data))
+        return rc == 0
+
+    # ---- ucLog symbol table ---------------------------------------- #
+
+    def uclog_load(self, data) -> int:
+        """Decode this device's ucLog with the .logdata table ``data`` (bytes,
+        or a path to read) — for firmware whose table is not embedded, e.g. a
+        P3260 in bring-up. Nothing checks it against the firmware: a table from
+        another build decodes into the wrong messages.
+
+        :return: formats loaded (> 0), or a negative error code
+        """
+        if isinstance(data, (str, os.PathLike)):
+            with open(data, 'rb') as f:
+                data = f.read()
+        data = bytes(data)
+        return self._lib.pxxxx_uclog_load(self._dev, data, len(data))
 
     # ---- cmd ------------------------------------------------------- #
 
