@@ -114,6 +114,7 @@ class PxxxxCalStatus(ctypes.Structure):
         ("dacc",      ctypes.c_int),
         ("err",       ctypes.c_uint32),
         ("err_act",   ctypes.c_uint32),
+        ("running",   ctypes.c_int),
     ]
 
 class PxxxxVoutMetrics(ctypes.Structure):
@@ -1013,6 +1014,7 @@ class PXXXX:
                 "cal_done": bool(cs.cal_done), "progress": cs.progress,
                 "vout_set": cs.vout_set, "vout": cs.vout, "dacc": cs.dacc,
                 "err": cs.err, "err_act": cs.err_act,
+                "running": bool(cs.running),
             }
             return True, [d]
 
@@ -1105,7 +1107,8 @@ class PXXXX:
     def reset(self, to_a70loader: bool = False) -> bool:
         """Reset the device; it reboots and re-enumerates over USB.
 
-        to_a70loader=True reboots a P1150D into its a70 fallback loader.
+        to_a70loader=True reboots a P1150D into its a70 fallback loader, and a
+        P3260 into its a74 fw_loader (same flag; a61 keeps the a70 name).
         The connection is always closed (the device does not reply).
         """
         with self._lock:
@@ -1136,7 +1139,7 @@ class PXXXX:
     def uclog_load(self, data) -> int:
         """Decode this device's ucLog with the .logdata table ``data`` (bytes,
         or a path to read) — for firmware whose table is not embedded, e.g. a
-        P3260 in bring-up. Nothing checks it against the firmware: a table from
+        P3260 development build. Nothing checks it against the firmware: a table from
         another build decodes into the wrong messages.
 
         :return: formats loaded (> 0), or a negative error code
