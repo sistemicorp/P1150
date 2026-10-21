@@ -117,6 +117,16 @@ class PxxxxCalStatus(ctypes.Structure):
         ("running",   ctypes.c_int),
     ]
 
+MAX_CHANNELS = 6
+
+class PxxxxError(ctypes.Structure):
+    _fields_ = [
+        ("err",        ctypes.c_uint32),
+        ("err_act",    ctypes.c_uint32),
+        ("err_ch",     ctypes.c_uint32 * MAX_CHANNELS),
+        ("has_err_ch", ctypes.c_int),
+    ]
+
 class PxxxxVoutMetrics(ctypes.Structure):
     _fields_ = [
         ("max",  ctypes.c_int),
@@ -266,6 +276,9 @@ def _setup_lib(lib):
 
     lib.pxxxx_led_blink.restype  = int_t
     lib.pxxxx_led_blink.argtypes = [void_p]
+
+    lib.pxxxx_error_status.restype  = int_t
+    lib.pxxxx_error_status.argtypes = [void_p, ctypes.POINTER(PxxxxError)]
 
     lib.pxxxx_cal_status.restype  = int_t
     lib.pxxxx_cal_status.argtypes = [void_p, ctypes.POINTER(PxxxxCalStatus)]
@@ -1001,6 +1014,18 @@ class PXXXX:
         with self._lock:
             rc = self._lib.pxxxx_probe_seq_run(self._dev, int(bool(connect)))
             return rc == 0, [{"f": "cmd_probe_seq_run", "s": rc == 0}]
+
+    # ---- error_status ---------------------------------------------- #
+
+    def error_status(self):
+        # err_ch[n] is channel n+1's; empty when the device sends none (a43)
+        with self._lock:
+            e = PxxxxError()
+            rc = self._lib.pxxxx_error_status(self._dev, ctypes.byref(e))
+            if rc != 0: return False, None
+            return True, [{"f": "cmd_status", "s": True,
+                           "err": e.err, "err_act": e.err_act,
+                           "err_ch": list(e.err_ch) if e.has_err_ch else []}]
 
     # ---- clear_error ----------------------------------------------- #
 
