@@ -236,6 +236,9 @@ def _setup_lib(lib):
     lib.pxxxx_set_vout_rs.restype  = int_t
     lib.pxxxx_set_vout_rs.argtypes = [void_p, int_t, int_t]
 
+    lib.pxxxx_set_vout_hard_connect.restype  = int_t
+    lib.pxxxx_set_vout_hard_connect.argtypes = [void_p, int_t, int_t]
+
     lib.pxxxx_set_ovc.restype  = int_t
     lib.pxxxx_set_ovc.argtypes = [void_p, int_t, int_t]
 
@@ -909,6 +912,17 @@ class PXXXX:
         with self._lock:
             rc = self._lib.pxxxx_set_vout_rs(self._dev, int(ch), int(bool(en)))
             return rc == 0, [{"f": "cmd_vout_rs", "s": rc == 0}]
+
+    # ---- set_vout_hard_connect ------------------------------------- #
+
+    def set_vout_hard_connect(self, en: bool = False, ch: int = 1):
+        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
+        # Stores ch's Hard Connect for its next connect that does not say -
+        # a probe_seq_run, or the front panel. probe() always says, so this is
+        # how Hard Connect is set on a probe-sequence member.
+        with self._lock:
+            rc = self._lib.pxxxx_set_vout_hard_connect(self._dev, int(ch), int(bool(en)))
+            return rc == 0, [{"f": "cmd_vout_hard_connect", "s": rc == 0}]
 
     # ---- set_ovc --------------------------------------------------- #
 

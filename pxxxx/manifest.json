@@ -1,10 +1,10 @@
 {
-  "version": "0.8",
-  "commit": "79262aa8a739147f2ba4055da81f35fc7c0be0d0",
-  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.8",
+  "version": "0.9",
+  "commit": "6881e40c87046b6fae88be22a0f779d47bb17a79",
+  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.9",
   "built_utc": {
-    "linux-x64": "2026-10-13T19:00:07Z",
-    "windows-x64": "2026-10-13T23:13:09Z"
+    "linux-x64": "2026-10-21T17:05:26Z",
+    "windows-x64": "2026-10-21T21:15:24Z"
   },
   "signed": {
     "linux-x64": false,
@@ -63,21 +63,21 @@
     },
     {
       "file": "a61_app.logdata",
-      "sha256": "3a73c019b7ca4466ec975855ef9dcfc9dc9aa6c447931fe801da8b928a498bd0",
+      "sha256": "b488ed2eba23ca1b4c5d891a60467eed7e050ceccec44d4dec8acc9b785ff7a9",
       "source": "a61-P3260Z",
       "what": []
     },
     {
       "file": "a61_app.signed.bin",
-      "sha256": "824925983dd8ddd430151ee221c281d416183da2e6854d464bc32c24d540a878",
+      "sha256": "7c66cd4868605a9db283c765f59953ec81b40fde4614e9cb217a29f766cb468c",
       "source": "a61-P3260Z",
       "what": [
-        "@(#)0.2-2-ga373100, afi, p3260@, 2026-10-07T21:00:20-04:00, AFI"
+        "@(#)0.2-22-gd6ab054, afi, p3260@, 2026-10-21T12:38:19-04:00, AFI"
       ]
     },
     {
       "file": "a74_fwl.logdata",
-      "sha256": "c8eb1561d467f770fcb5a070150f3682fc004fc31c88665779dda51e41e993ff",
+      "sha256": "14f547cf4a032ac9e0a52d1233e21cd95a312a46c39e68eea2a2d3037b2b640b",
       "source": "a61-P3260Z",
       "what": []
     }
@@ -92,10 +92,10 @@
       "toolchain": "arm-none-eabi-gcc (GNU Tools for STM32 14.3.rel1.20251027-0700) 14.3.1 20250623"
     },
     "a61-P3260Z": {
-      "commit": "a37310074d262f6bf4237e93da8e6bb75f2313a8",
-      "describe": "0.2-2-ga373100",
+      "commit": "d6ab054125ab8d7bd54206657433c1eb57c2edf8",
+      "describe": "0.2-22-gd6ab054",
       "branch": "main",
-      "version_string": "@(#)0.2-2-ga373100, afi, p3260@, 2026-10-07T21:00:20-04:00, AFI",
+      "version_string": "@(#)0.2-22-gd6ab054, afi, p3260@, 2026-10-21T12:38:19-04:00, AFI",
       "toolchain": "arm-zephyr-eabi-gcc (Zephyr SDK 1.0.1) 14.3.0"
     }
   },
@@ -103,20 +103,20 @@
     {
       "name": "libpxxxx.so",
       "leg": "linux-x64",
-      "sha256": "c8fe23e656a88c0ab866af419df880a9db2ff14baa3bceb3459ad386bc5f49c6",
-      "size": 1751840
+      "sha256": "dfab4bfcf65a2d41e21910dd77c2ac17505be03dc593e948b12816338a6b2243",
+      "size": 1764176
     },
     {
       "name": "pxxxx.dll",
       "leg": "windows-x64",
-      "sha256": "2a11ef3dfb00e561561822039a38914fb5cb1f601adc246e7e5a239e50d0cc1e",
-      "size": 1720800
+      "sha256": "1725140760baf631a7659744d07e8f0233c626d627680bc5074b489e6277a752",
+      "size": 1731560
     },
     {
       "name": "PXXXX.py",
       "leg": "linux-x64",
-      "sha256": "f0f0688bcde9ef89236240108dbb60bfe29b59112daea7035f734ca1a964f68d",
-      "size": 46316
+      "sha256": "51c3be894b9f303ffde4f234d45118f0b4a92769748d73e5f25c503c3af9d6e4",
+      "size": 47063
     },
     {
       "name": "__init__.py",
