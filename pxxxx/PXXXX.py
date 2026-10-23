@@ -1278,20 +1278,31 @@ class PXXXX:
 
     def capture_status(self):
         """state (idle, filling, armed, triggered, done, timeout, measuring,
-        measured), trig (625, or -1 for none), n, pre, gap, and the trigger."""
-        return self._capture_cmd("cmd_adc_internal_status")
+        measured, error), trig (625, or -1 for none), n, pre, and the trigger.
+
+        "error" is a capture that finished with a dropped ADC block in its
+        buffer, a firmware fault: its samples are discarded, the script does not
+        run on it, and read and meas refuse with err "gap". The status reply
+        carries that err too; here it describes the state rather than refusing
+        the command, so it does not make ok False (capture_wait does)."""
+        return self._capture_cmd("cmd_adc_internal_status", allow_err=True)
 
     def capture_wait(self, timeout_s: float = 10.0, poll_s: float = 0.02):
         """Poll capture_status until the capture and its measurement are over:
         "measured", or "done"/"timeout" when no script is loaded, or "idle" after
         an abort. ok is False, with the last status, if timeout_s passes first;
-        the capture is left running (capture_abort ends it)."""
+        the capture is left running (capture_abort ends it). ok is also False
+        for "error", a capture with a gap, which is over but has nothing to
+        read or measure."""
         t_end = time.monotonic() + timeout_s
         while True:
             ok, rsp = self.capture_status()
             if not ok:
                 return ok, rsp
-            if rsp[0].get("state") not in self._CAPTURE_RUNNING:
+            state = rsp[0].get("state")
+            if state == "error":
+                return False, rsp
+            if state not in self._CAPTURE_RUNNING:
                 return True, rsp
             if time.monotonic() >= t_end:
                 return False, rsp
@@ -1389,7 +1400,7 @@ class PXXXX:
         return self._capture_cmd("cmd_adc_internal_script_info", allow_err=True)
 
     def capture_meas(self, rerun: bool = False):
-        """The script's results on the last capture: script_crc, script_ver, gap,
+        """The script's results on the last capture: script_crc, script_ver,
         and each metric the script returns as [CH1, CH2, CH3], None for NaN.
 
         rerun=True runs the script again on the same capture and returns at
