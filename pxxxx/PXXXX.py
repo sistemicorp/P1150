@@ -13,6 +13,7 @@ import sys
 import json
 import struct
 import platform
+import time
 from dataclasses import dataclass
 from threading import Lock, Event
 import hashlib
@@ -573,6 +574,36 @@ _LOAD_MAP = {
 ACQ_FORMAT_LIST  = "list"
 ACQ_FORMAT_NUMPY = "numpy"
 ACQ_FORMAT_LIST_ALL = [ACQ_FORMAT_LIST, ACQ_FORMAT_NUMPY]
+
+
+# pxxxx_cmd's answer to an s:false reply, which it still hands back
+_ERR_PROTOCOL = -4
+
+
+# ------------------------------------------------------------------ #
+# CRC-32C, for a Pulse Capture script's script_crc                     #
+# ------------------------------------------------------------------ #
+def _crc32c_table():
+    t = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+        t.append(c)
+    return t
+
+
+_CRC32C = _crc32c_table()
+
+
+def crc32c(data: bytes) -> int:
+    """CRC-32C (Castagnoli, reflected, init and final XOR 0xFFFFFFFF): what a P3260
+    reports as script_crc for a script of these bytes. crc32c(b"123456789") is
+    0xE3069283."""
+    c = 0xFFFFFFFF
+    for b in data:
+        c = (c >> 8) ^ _CRC32C[(c ^ b) & 0xFF]
+    return c ^ 0xFFFFFFFF
 
 
 # ------------------------------------------------------------------ #
@@ -1189,23 +1220,211 @@ class PXXXX:
         data = bytes(data)
         return self._lib.pxxxx_uclog_load(self._dev, data, len(data))
 
+    # ---- Pulse Capture (P3260, a61) -------------------------------- #
+    #
+    # A 20 ms capture into device RAM (2500 samples at 125 kSPS, 625 before the
+    # trigger), measured on the device by a Lua script the test system uploads.
+    # The script lives in RAM only: upload it after every power-up, and again
+    # whenever a result's script_crc is not the one capture_script_load returned.
+    # Design, commands and the script's `cap` API: a61-P3260Z
+    # docs/Pulse Capture.md; the measurement template is pulseCapture/lua/.
+    #
+    # Every method returns (ok, [reply]) like cmd(), and the reply is there
+    # whenever the device sent one. ok is False for a command the device could
+    # not take (s:false, with reply["error"] and reply["errno"]) and for one it
+    # took and could not do (s:true, with reply["err"] and reply["errno"]):
+    # busy, no capture, no script, a script that does not compile.
+
+    CAPTURE_SCRIPT_CHUNK = 127      # script bytes per upload command: the firmware takes 254 hex chars
+    CAPTURE_SCRIPT_MAX   = 32768
+    CAPTURE_READ_BYTES   = 640      # most sample bytes in one cmd_adc_internal_read reply
+    # numpy dtype per stream: currents float32 nA, a0 uint16 mV, d01 uint8 (D0 bit 0, D1 bit 1)
+    CAPTURE_DTYPE = {"i": "<f4", "i2": "<f4", "i3": "<f4", "a0": "<u2", "d01": "u1"}
+    _CAPTURE_BYTES = {"i": 4, "i2": 4, "i3": 4, "a0": 2, "d01": 1}
+    _CAPTURE_RUNNING = ("filling", "armed", "triggered", "measuring")
+
+    def _capture_cmd(self, f: str, allow_err: bool = False, **kw):
+        ok, rsp = self.cmd({"f": f, **kw})
+        if rsp is None:
+            return False, None
+        return ok and (allow_err or not rsp[0].get("err")), rsp
+
+    def capture_trigger(self, src: str = "none", level: int = None, edge: str = "rise"):
+        """Set the trigger for the next captures (it persists, in RAM, until power-off).
+
+        :param src: "none", "i", "i2", "i3", "a0", "d0" or "d1"
+        :param level: an integer, uA for i/i2/i3 and mV for a0; not used for d0/d1
+        :param edge: "rise" or "fall"
+        """
+        kw = {"src": src}
+        if src != "none":
+            kw["edge"] = edge
+            if level is not None:
+                kw["level"] = int(level)
+        return self._capture_cmd("cmd_adc_internal_trigger", **kw)
+
+    def capture_start(self, to_ms: int = None):
+        """Start a capture. With a trigger set, to_ms ends a capture that never
+        triggers as "timeout"; without it, the capture waits until aborted.
+        Refused while cmd_adc streaming is on (acquisition_start), and that in turn
+        is refused while a capture runs."""
+        kw = {"en": True}
+        if to_ms is not None:
+            kw["to_ms"] = int(to_ms)
+        return self._capture_cmd("cmd_adc_internal", **kw)
+
+    def capture_abort(self):
+        return self._capture_cmd("cmd_adc_internal", en=False)
+
+    def capture_status(self):
+        """state (idle, filling, armed, triggered, done, timeout, measuring,
+        measured), trig (625, or -1 for none), n, pre, gap, and the trigger."""
+        return self._capture_cmd("cmd_adc_internal_status")
+
+    def capture_wait(self, timeout_s: float = 10.0, poll_s: float = 0.02):
+        """Poll capture_status until the capture and its measurement are over:
+        "measured", or "done"/"timeout" when no script is loaded, or "idle" after
+        an abort. ok is False, with the last status, if timeout_s passes first;
+        the capture is left running (capture_abort ends it)."""
+        t_end = time.monotonic() + timeout_s
+        while True:
+            ok, rsp = self.capture_status()
+            if not ok:
+                return ok, rsp
+            if rsp[0].get("state") not in self._CAPTURE_RUNNING:
+                return True, rsp
+            if time.monotonic() >= t_end:
+                return False, rsp
+            time.sleep(poll_s)
+
+    def capture_read(self, src: str, off: int = 0, n: int = None):
+        """One cmd_adc_internal_read: n samples of stream src from sample off, at
+        most CAPTURE_READ_BYTES of them. The reply's "d" is the device's lowercase
+        hex; capture_read_stream reads a whole stream and decodes it."""
+        if n is None:
+            n = self.CAPTURE_READ_BYTES // self._CAPTURE_BYTES[src]
+        return self._capture_cmd("cmd_adc_internal_read", src=src, off=int(off), n=int(n))
+
+    def capture_read_stream(self, src: str, n: int = None):
+        """Read stream src of the last capture and decode it.
+
+        :param src: "i", "i2", "i3" (float32, nA), "a0" (uint16, mV) or "d01"
+                    (uint8, D0 bit 0, D1 bit 1)
+        :param n: samples to read; default the capture's own count
+        :return: (True, [{"f", "s", "src", "off": 0, "n", "data": numpy array}]),
+                 or (False, [the reply that failed])
+        """
+        import numpy as np  # deferred: only numpy clients pay the dependency
+        if n is None:
+            ok, rsp = self.capture_status()
+            if not ok:
+                return ok, rsp
+            n = int(rsp[0].get("n", 0))
+            if n == 0:
+                # No capture to read, or an aborted one: a read is how the
+                # device says which ("no capture"), not an empty success
+                ok, rsp = self.capture_read(src)
+                if not ok:
+                    return ok, rsp
+        dtype = np.dtype(self.CAPTURE_DTYPE[src])
+        per_read = self.CAPTURE_READ_BYTES // dtype.itemsize
+        chunks, off = [], 0
+        while off < n:
+            ok, rsp = self.capture_read(src, off, min(per_read, n - off))
+            if not ok:
+                return ok, rsp
+            r = rsp[0]
+            d = bytes.fromhex(r.get("d", ""))
+            if r.get("off") != off or not r.get("n") or len(d) != r["n"] * dtype.itemsize:
+                return False, rsp
+            chunks.append(np.frombuffer(d, dtype=dtype))
+            off += r["n"]
+        data = np.concatenate(chunks) if chunks else np.zeros(0, dtype=dtype)
+        return True, [{"f": "cmd_adc_internal_read", "s": True, "src": src,
+                       "off": 0, "n": len(data), "data": data}]
+
+    def capture_script_load(self, script):
+        """Upload a Lua measurement script, which replaces the one loaded.
+
+        :param script: the script's text (str or bytes), or a path to it (a str
+                       naming an existing file, or a path-like)
+        :return: (ok, [the last reply]). It carries the device's script_crc and
+                 len, and script_crc_expected, the CRC-32C of the text sent; ok
+                 is False if the two differ. A script that does not compile
+                 gives ok False with Lua's message in reply["err"], and the
+                 previous script stays loaded.
+
+        Sent as hex, CAPTURE_SCRIPT_CHUNK bytes a command, in order from offset 0;
+        the chunk that reaches the end compiles it. Refused while measuring.
+        """
+        if isinstance(script, os.PathLike) or (
+                isinstance(script, str) and "\n" not in script and os.path.isfile(script)):
+            with open(script, "rb") as f:
+                src = f.read()
+        elif isinstance(script, str):
+            src = script.encode("utf-8")
+        else:
+            src = bytes(script)
+        if not src or len(src) > self.CAPTURE_SCRIPT_MAX:
+            raise ValueError(f"script is {len(src)} bytes, must be 1..{self.CAPTURE_SCRIPT_MAX}")
+        for off in range(0, len(src), self.CAPTURE_SCRIPT_CHUNK):
+            chunk = src[off:off + self.CAPTURE_SCRIPT_CHUNK]
+            ok, rsp = self._capture_cmd("cmd_adc_internal_script",
+                                        off=off, len=len(src), hex=chunk.hex())
+            if not ok:
+                return ok, rsp
+            nxt = off + len(chunk)
+            # A middle chunk's reply names the offset the device expects next
+            if nxt < len(src) and rsp[0].get("off", nxt) != nxt:
+                return False, rsp
+        expected = crc32c(src)
+        rsp[0]["script_crc_expected"] = expected
+        return rsp[0].get("script_crc") == expected, rsp
+
+    def capture_script_info(self):
+        """script_crc, script_ver, len, api, and the last run's cost (open_us,
+        load_us, run_us, cpu_us, close_us, insns, lua_heap_b, heap_b,
+        heap_size_b, stack_b). Its err is the last run's error, kept as
+        information, so it does not make ok False."""
+        return self._capture_cmd("cmd_adc_internal_script_info", allow_err=True)
+
+    def capture_meas(self, rerun: bool = False):
+        """The script's results on the last capture: script_crc, script_ver, gap,
+        and each metric the script returns as [CH1, CH2, CH3], None for NaN.
+
+        rerun=True runs the script again on the same capture and returns at
+        once: capture_wait() until "measured", then capture_meas()."""
+        if rerun:
+            return self._capture_cmd("cmd_adc_internal_meas", rerun=True)
+        return self._capture_cmd("cmd_adc_internal_meas")
+
     # ---- cmd ------------------------------------------------------- #
 
     def cmd(self, cmd: dict) -> tuple[bool, list[dict] | None]:
         """Send raw command to target.
 
-        :param cmd: {'f': 'cmd_*', 'key': value, ...}  (primitive values only)
+        :param cmd: {'f': 'cmd_*', 'key': value, ...}  (str, int, float, bool
+                    and None values; no lists or dicts)
         :return: success <True/False>, result <list[dict]|None>
+
+        A reply of s:false is (False, [reply]), with the device's reason in
+        reply["error"] and reply["errno"]. (False, None) is no reply at all: a
+        timeout, a lost link, or a command that could not be encoded. True means
+        s:true, which is not always success: some commands (a61's Pulse Capture)
+        reply s:true with "err" and "errno" when they ran and could not do what
+        was asked.
         """
         json_cmd = json.dumps(cmd)
-        rsp_buf = ctypes.create_string_buffer(4096)
+        rsp_buf = ctypes.create_string_buffer(16384)
         with self._lock:
             rc = self._lib.pxxxx_cmd(
                 self._dev, json_cmd.encode(), rsp_buf, len(rsp_buf))
-        if rc != 0:
+        if rc not in (0, _ERR_PROTOCOL):
             return False, None
         try:
             data = json.loads(rsp_buf.value.decode("utf-8"))
-            return True, [data]
         except Exception:
             return False, None
+        if rc != 0:
+            return False, [data] if data else None
+        return True, [data]

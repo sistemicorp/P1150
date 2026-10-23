@@ -1,10 +1,10 @@
 {
-  "version": "0.11",
-  "commit": "5285f3514f22c6601cfe94de7c8e8982b3fd01a4",
-  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.11",
+  "version": "0.12",
+  "commit": "62ded27f16dcb1b46fa832103fc18afd6d2584df",
+  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.12",
   "built_utc": {
-    "linux-x64": "2026-10-21T21:07:06Z",
-    "windows-x64": "2026-10-21T21:15:38Z"
+    "linux-x64": "2026-10-23T18:55:44Z",
+    "windows-x64": "2026-10-23T19:01:52Z"
   },
   "signed": {
     "linux-x64": false,
@@ -63,16 +63,16 @@
     },
     {
       "file": "a61_app.logdata",
-      "sha256": "a217b6adec03817ba9dc08c8cf54da1591f07c39a45a5bdc6c66ad8b1eda1a7d",
+      "sha256": "31d07089cbda1e00207f149a4a2f3e233abcbeca407d8db4ce6228fbfbe6ac92",
       "source": "a61-P3260Z",
       "what": []
     },
     {
       "file": "a61_app.signed.bin",
-      "sha256": "f8d428b180ca2d7e7f427d8841271504b3bf5b9872cdfee2aff7e14f7e7967da",
+      "sha256": "17afc8d9fc6f8a7c5b642705ebc6d675e921124270a3d52d4fcfbb907d0aa7e1",
       "source": "a61-P3260Z",
       "what": [
-        "@(#)0.2-23-g48c3a37, afi, p3260@, 2026-10-21T16:46:01-04:00, AFI"
+        "@(#)0.2-39-g020848b, afi, p3260@, 2026-10-23T14:29:36-04:00, AFI"
       ]
     },
     {
@@ -92,10 +92,10 @@
       "toolchain": "arm-none-eabi-gcc (GNU Tools for STM32 14.3.rel1.20251027-0700) 14.3.1 20250623"
     },
     "a61-P3260Z": {
-      "commit": "48c3a377a3fca74278a8d6c930947c7a533abd7b",
-      "describe": "0.2-23-g48c3a37",
+      "commit": "020848b2bf6a4e77adededb68268231b5919667f",
+      "describe": "0.2-39-g020848b",
       "branch": "main",
-      "version_string": "@(#)0.2-23-g48c3a37, afi, p3260@, 2026-10-21T16:46:01-04:00, AFI",
+      "version_string": "@(#)0.2-39-g020848b, afi, p3260@, 2026-10-23T14:29:36-04:00, AFI",
       "toolchain": "arm-zephyr-eabi-gcc (Zephyr SDK 1.0.1) 14.3.0"
     }
   },
@@ -103,26 +103,26 @@
     {
       "name": "libpxxxx.so",
       "leg": "linux-x64",
-      "sha256": "8dffccbeafd66180d3460dec5f9eeec047a1e0075451c09a74b5715b65b3f8bf",
-      "size": 1768576
+      "sha256": "b1765f8819149e9ff9170d5777083ed75277133f9e528060533bd83f77640929",
+      "size": 1920336
     },
     {
       "name": "pxxxx.dll",
       "leg": "windows-x64",
-      "sha256": "6f283e8b6ff45f61abd74e7583a6fbb8e7317e7543f81ad98720bb4036af17b7",
-      "size": 1733088
+      "sha256": "0db78bfaba5a286660c4b03309f0e1a4d884d08eba807b1292a85d549221e0cb",
+      "size": 1886696
     },
     {
       "name": "PXXXX.py",
       "leg": "linux-x64",
-      "sha256": "0e45b06b223f31eeec413bedb05d4d908d9ee2dc65da04de7b5b2404d53c823f",
-      "size": 47986
+      "sha256": "455c0152186afae6a9040660755cf03d5293365031e35ccfc4df2df3d2753ded",
+      "size": 58407
     },
     {
       "name": "__init__.py",
       "leg": "linux-x64",
-      "sha256": "03d92b94323bad622d783b92d652d1e4afde92ba01be0d6db4eb183830eff2bd",
-      "size": 177
+      "sha256": "53fbf5ab4a96b6cf85f072f923be29c2b1db558f1ba82d34fa3e619a053bb39e",
+      "size": 185
     }
   ]
 }
