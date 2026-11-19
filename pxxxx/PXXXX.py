@@ -684,6 +684,9 @@ class PXXXX:
                      cb_uclog_async=my_async_cb,
                      cb_acquisition_get_data=my_acq_cb)
         success, details = dev.ez_connect(calibrate=True)
+
+    The methods at the end of the class, from the "P3260 only" banner on, are
+    for the P3260 and are not supported on a P1150 or P1150D.
     """
 
     @staticmethod
@@ -957,17 +960,6 @@ class PXXXX:
             rc = self._lib.pxxxx_set_vout_rs(self._dev, int(ch), int(bool(en)))
             return rc == 0, [{"f": "cmd_vout_rs", "s": rc == 0}]
 
-    # ---- set_vout_hard_connect ------------------------------------- #
-
-    def set_vout_hard_connect(self, en: bool = False, ch: int = 1):
-        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
-        # Stores ch's Hard Connect for its next connect that does not say -
-        # a probe_seq_run, or the front panel. probe() always says, so this is
-        # how Hard Connect is set on a probe-sequence member.
-        with self._lock:
-            rc = self._lib.pxxxx_set_vout_hard_connect(self._dev, int(ch), int(bool(en)))
-            return rc == 0, [{"f": "cmd_vout_hard_connect", "s": rc == 0}]
-
     # ---- set_ovc --------------------------------------------------- #
 
     def set_ovc(self, value_ma: int, ch: int = 1):
@@ -1003,48 +995,6 @@ class PXXXX:
             rc = self._lib.pxxxx_probe(self._dev, int(ch), int(bool(connect)),
                                        int(bool(hard_connect)), int(bool(rs_comp)))
             return rc == 0, [{"f": "cmd_probe", "s": rc == 0}]
-
-    # ---- probe sequence (multi-channel only) ----------------------- #
-    # probe_seq_set / probe_seq_get / probe_seq_run are only valid on
-    # multi-channel PXXXX devices: P3xxx (e.g. P3260) supports them, P1xxx
-    # (P1150, P1150D) does not, and they return False there.
-
-    def probe_seq_set(self, en: bool = None, seq: list = None, ms: list = None):
-        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
-        # Stores the sequence the front panel edits. None leaves that part as
-        # it is; seq and ms are PROBE_SEQ_STEPS entries each, seq 1-based with
-        # 0 for an unused step, ms the delay before each step (ms[0] is always
-        # stored as 0). The device refuses duplicates, bad channels, delays
-        # over 100 ms, and en=True against a sequence that is not valid.
-        def steps(v):
-            if v is None: return None
-            if len(v) != PROBE_SEQ_STEPS:
-                raise ValueError(f"expected {PROBE_SEQ_STEPS} steps, got {len(v)}")
-            return (ctypes.c_int * PROBE_SEQ_STEPS)(*[int(x) for x in v])
-        c_seq, c_ms = steps(seq), steps(ms)
-        with self._lock:
-            rc = self._lib.pxxxx_probe_seq_set(self._dev, -1 if en is None else int(bool(en)),
-                                               c_seq, c_ms)
-            return rc == 0, [{"f": "cmd_probe_seq_set", "s": rc == 0}]
-
-    def probe_seq_get(self):
-        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
-        # en: enabled; valid: would run; busy: a sequence is running now.
-        with self._lock:
-            q = PxxxxProbeSeq()
-            rc = self._lib.pxxxx_probe_seq_get(self._dev, ctypes.byref(q))
-            if rc != 0: return False, None
-            return True, [{"f": "cmd_probe_seq_get", "s": True,
-                           "en": bool(q.en), "valid": bool(q.valid), "busy": bool(q.busy),
-                           "seq": list(q.seq), "ms": list(q.ms)}]
-
-    def probe_seq_run(self, connect: bool = True):
-        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
-        # True once queued, not once done: the outcome arrives through
-        # cb_uclog_async as {"f": "asc_probe_seq", "s", "v", "step", "err"}.
-        with self._lock:
-            rc = self._lib.pxxxx_probe_seq_run(self._dev, int(bool(connect)))
-            return rc == 0, [{"f": "cmd_probe_seq_run", "s": rc == 0}]
 
     # ---- error_status ---------------------------------------------- #
 
@@ -1186,6 +1136,128 @@ class PXXXX:
             self.connected = False
         return rc == 0
 
+    # ---- ucLog symbol table ---------------------------------------- #
+
+    def uclog_load(self, data) -> int:
+        """Decode this device's ucLog with the .logdata table ``data`` (bytes,
+        or a path to read) — for firmware whose table is not embedded, e.g. a
+        P3260 development build. Nothing checks it against the firmware: a table from
+        another build decodes into the wrong messages.
+
+        :return: formats loaded (> 0), or a negative error code
+        """
+        if isinstance(data, (str, os.PathLike)):
+            with open(data, 'rb') as f:
+                data = f.read()
+        data = bytes(data)
+        return self._lib.pxxxx_uclog_load(self._dev, data, len(data))
+
+    # ---- cmd ------------------------------------------------------- #
+
+    def cmd(self, cmd: dict) -> tuple[bool, list[dict] | None]:
+        """Send raw command to target.
+
+        :param cmd: {'f': 'cmd_*', 'key': value, ...}  (str, int, float, bool
+                    and None values; no lists or dicts)
+        :return: success <True/False>, result <list[dict]|None>
+
+        A reply of s:false is (False, [reply]), with the device's reason in
+        reply["error"] and reply["errno"]. (False, None) is no reply at all: a
+        timeout, a lost link, or a command that could not be encoded. True means
+        s:true, which is not always success: some commands (a61's Pulse Capture)
+        reply s:true with "err" and "errno" when they ran and could not do what
+        was asked.
+        """
+        json_cmd = json.dumps(cmd)
+        rsp_buf = ctypes.create_string_buffer(16384)
+        with self._lock:
+            rc = self._lib.pxxxx_cmd(
+                self._dev, json_cmd.encode(), rsp_buf, len(rsp_buf))
+        if rc not in (0, _ERR_PROTOCOL):
+            return False, None
+        try:
+            data = json.loads(rsp_buf.value.decode("utf-8"))
+        except Exception:
+            return False, None
+        if rc != 0:
+            return False, [data] if data else None
+        return True, [data]
+
+
+    # ================================================================== #
+    # P3260 only (multi-channel, a61 firmware)                            #
+    # ================================================================== #
+    #
+    # Everything below this point is for the P3260 and does nothing useful
+    # on a P1150 or P1150D (a43 firmware). Methods above it work on every
+    # PXXXX model; on a P1150 the channel argument they take is always 1.
+    #
+    # What a P1150 does when asked anyway:
+    #   set_vout_hard_connect, probe_seq_*  - a43 has no such command: ok False
+    #   set_shell_callback, shell_write     - a43 has no shell on port 61. The
+    #                                         write is sent and returns True, a43
+    #                                         logs "invalid port: 61", and the
+    #                                         callback is never called
+    #   capture_*                           - a43 has no Pulse Capture: ok False
+    #
+    # Kept together so a P1150 user can see where the shared API ends, and
+    # so a new P3260-only method has an obvious place to go: add it here,
+    # not among the shared methods above.
+
+
+    # ---- set_vout_hard_connect ------------------------------------- #
+
+    def set_vout_hard_connect(self, en: bool = False, ch: int = 1):
+        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
+        # Stores ch's Hard Connect for its next connect that does not say -
+        # a probe_seq_run, or the front panel. probe() always says, so this is
+        # how Hard Connect is set on a probe-sequence member.
+        with self._lock:
+            rc = self._lib.pxxxx_set_vout_hard_connect(self._dev, int(ch), int(bool(en)))
+            return rc == 0, [{"f": "cmd_vout_hard_connect", "s": rc == 0}]
+
+    # ---- probe sequence (multi-channel only) ----------------------- #
+    # probe_seq_set / probe_seq_get / probe_seq_run are only valid on
+    # multi-channel PXXXX devices: P3xxx (e.g. P3260) supports them, P1xxx
+    # (P1150, P1150D) does not, and they return False there.
+
+    def probe_seq_set(self, en: bool = None, seq: list = None, ms: list = None):
+        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
+        # Stores the sequence the front panel edits. None leaves that part as
+        # it is; seq and ms are PROBE_SEQ_STEPS entries each, seq 1-based with
+        # 0 for an unused step, ms the delay before each step (ms[0] is always
+        # stored as 0). The device refuses duplicates, bad channels, delays
+        # over 100 ms, and en=True against a sequence that is not valid.
+        def steps(v):
+            if v is None: return None
+            if len(v) != PROBE_SEQ_STEPS:
+                raise ValueError(f"expected {PROBE_SEQ_STEPS} steps, got {len(v)}")
+            return (ctypes.c_int * PROBE_SEQ_STEPS)(*[int(x) for x in v])
+        c_seq, c_ms = steps(seq), steps(ms)
+        with self._lock:
+            rc = self._lib.pxxxx_probe_seq_set(self._dev, -1 if en is None else int(bool(en)),
+                                               c_seq, c_ms)
+            return rc == 0, [{"f": "cmd_probe_seq_set", "s": rc == 0}]
+
+    def probe_seq_get(self):
+        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
+        # en: enabled; valid: would run; busy: a sequence is running now.
+        with self._lock:
+            q = PxxxxProbeSeq()
+            rc = self._lib.pxxxx_probe_seq_get(self._dev, ctypes.byref(q))
+            if rc != 0: return False, None
+            return True, [{"f": "cmd_probe_seq_get", "s": True,
+                           "en": bool(q.en), "valid": bool(q.valid), "busy": bool(q.busy),
+                           "seq": list(q.seq), "ms": list(q.ms)}]
+
+    def probe_seq_run(self, connect: bool = True):
+        # Multi-channel (P3xxx) devices only; P1xxx does not support it.
+        # True once queued, not once done: the outcome arrives through
+        # cb_uclog_async as {"f": "asc_probe_seq", "s", "v", "step", "err"}.
+        with self._lock:
+            rc = self._lib.pxxxx_probe_seq_run(self._dev, int(bool(connect)))
+            return rc == 0, [{"f": "cmd_probe_seq_run", "s": rc == 0}]
+
     # ---- shell (ucLog port 61) ------------------------------------- #
 
     def set_shell_callback(self, cb) -> None:
@@ -1204,28 +1276,14 @@ class PXXXX:
         rc = self._lib.pxxxx_shell_write(self._dev, data, len(data))
         return rc == 0
 
-    # ---- ucLog symbol table ---------------------------------------- #
-
-    def uclog_load(self, data) -> int:
-        """Decode this device's ucLog with the .logdata table ``data`` (bytes,
-        or a path to read) — for firmware whose table is not embedded, e.g. a
-        P3260 development build. Nothing checks it against the firmware: a table from
-        another build decodes into the wrong messages.
-
-        :return: formats loaded (> 0), or a negative error code
-        """
-        if isinstance(data, (str, os.PathLike)):
-            with open(data, 'rb') as f:
-                data = f.read()
-        data = bytes(data)
-        return self._lib.pxxxx_uclog_load(self._dev, data, len(data))
-
     # ---- Pulse Capture (P3260, a61) -------------------------------- #
     #
     # A 20 ms capture into device RAM (2500 samples at 125 kSPS, 625 before the
     # trigger), measured on the device by a Lua script the test system uploads.
-    # The script lives in RAM only: upload it after every power-up, and again
-    # whenever a result's script_crc is not the one capture_script_load returned.
+    # The script is held in RAM. Upload it after every power-up, unless it was
+    # written to flash with capture_script_save (a61 769eff1), which loads it
+    # at boot; and upload it again whenever a result's script_crc is not the
+    # one capture_script_load returned.
     # Design, commands and the script's `cap` API: a61-P3260Z
     # docs/Pulse Capture.md; the measurement template is pulseCapture/lua/.
     #
@@ -1395,9 +1453,25 @@ class PXXXX:
     def capture_script_info(self):
         """script_crc, script_ver, len, api, and the last run's cost (open_us,
         load_us, run_us, cpu_us, close_us, insns, lua_heap_b, heap_b,
-        heap_size_b, stack_b). Its err is the last run's error, kept as
-        information, so it does not make ok False."""
+        heap_size_b, stack_b). saved is True when the loaded script is the one
+        saved in flash; saved_crc and saved_len describe what is in the flash
+        (0 for nothing), whether it loaded or not. Its err is the last run's
+        error, kept as information, so it does not make ok False."""
         return self._capture_cmd("cmd_adc_internal_script_info", allow_err=True)
+
+    def capture_script_save(self):
+        """Write the loaded script to the device's flash, so it is loaded at
+        every boot without an upload (a61 769eff1). The reply carries
+        script_crc, script_ver and len, like an upload's. Saving the script
+        that is already saved writes nothing. ok is False, with err, for
+        "no script", "measuring" or "flash write failed"; a failed save leaves
+        nothing saved."""
+        return self._capture_cmd("cmd_adc_internal_script_save")
+
+    def capture_script_erase(self):
+        """Remove the saved script, so the next boot comes up with none. The
+        loaded script stays until then."""
+        return self._capture_cmd("cmd_adc_internal_script_erase")
 
     def capture_meas(self, rerun: bool = False):
         """The script's results on the last capture: script_crc, script_ver,
@@ -1408,34 +1482,3 @@ class PXXXX:
         if rerun:
             return self._capture_cmd("cmd_adc_internal_meas", rerun=True)
         return self._capture_cmd("cmd_adc_internal_meas")
-
-    # ---- cmd ------------------------------------------------------- #
-
-    def cmd(self, cmd: dict) -> tuple[bool, list[dict] | None]:
-        """Send raw command to target.
-
-        :param cmd: {'f': 'cmd_*', 'key': value, ...}  (str, int, float, bool
-                    and None values; no lists or dicts)
-        :return: success <True/False>, result <list[dict]|None>
-
-        A reply of s:false is (False, [reply]), with the device's reason in
-        reply["error"] and reply["errno"]. (False, None) is no reply at all: a
-        timeout, a lost link, or a command that could not be encoded. True means
-        s:true, which is not always success: some commands (a61's Pulse Capture)
-        reply s:true with "err" and "errno" when they ran and could not do what
-        was asked.
-        """
-        json_cmd = json.dumps(cmd)
-        rsp_buf = ctypes.create_string_buffer(16384)
-        with self._lock:
-            rc = self._lib.pxxxx_cmd(
-                self._dev, json_cmd.encode(), rsp_buf, len(rsp_buf))
-        if rc not in (0, _ERR_PROTOCOL):
-            return False, None
-        try:
-            data = json.loads(rsp_buf.value.decode("utf-8"))
-        except Exception:
-            return False, None
-        if rc != 0:
-            return False, [data] if data else None
-        return True, [data]
