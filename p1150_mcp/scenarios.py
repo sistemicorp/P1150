@@ -45,14 +45,19 @@ duty-cycled device it is wrong by the duty cycle -- routinely by 100x.
 ## The normal working order
 1. p1150_connect(sn)                       -- ~15 s the first time (firmware +
                                               self-calibration), fast after
-2. p1150_power_on(voltage_mv, ovc_ma)      -- sets voltage, over-current limit,
-                                              then closes the probe relay
-3. ... developer edits and re-flashes firmware over JTAG, power stays on ...
-4. p1150_measure(...) or capture_start/stop -- as many times as wanted
-5. p1150_compare(baseline, candidate)
+2. p1150_set_voltage_range(...)            -- once per project: the battery's
+                                              range, confirmed with the
+                                              developer from type and cell count
+3. p1150_power_on(voltage_mv, ovc_ma,      -- after the developer confirms the
+                  battery_removed=True)       target's battery is OUT; sets
+                                              voltage, over-current limit, then
+                                              closes the probe relay
+4. ... developer edits and re-flashes firmware over JTAG, power stays on ...
+5. p1150_measure(...) or capture_start/stop -- as many times as wanted
+6. p1150_compare(baseline, candidate)
 
-For battery life specifically, step 4 becomes p1150_measure_state once per
-declared state and step 5 becomes p1150_battery_life.
+For battery life specifically, step 5 becomes p1150_measure_state once per
+declared state and step 6 becomes p1150_battery_life.
 
 Leave the power on between measurements.  Cutting it forces the target to
 reboot, and a reboot is a large current event that contaminates the next

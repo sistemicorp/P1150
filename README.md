@@ -273,7 +273,8 @@ have measured it, and `brownout_mv` — the lowest terminal voltage the target
 still runs at, being the regulator's dropout or the MCU's brown-out reset level,
 whichever is higher.  Settings merge, so each can be added when it comes up.
 
-A typical session: `p1150_connect` → `p1150_power_on(3700, 500)` → the target
+A typical session: `p1150_connect` → `p1150_power_on(3700, 500,
+battery_removed=True)` → the target
 stays powered while you edit and re-flash over JTAG →
 `p1150_capture_start("baseline")` … run the workload …  `p1150_capture_stop` →
 change code, repeat → `p1150_compare(baseline, candidate)`.
@@ -791,7 +792,17 @@ average alone would hide.
 `p1150_power_on` puts the requested voltage straight onto the target's battery
 terminals, and the agent chooses that value.  Confirm it before the first call
 in a session; too high will destroy the target and there is no undo.  Setting
-`P1150_SN` does not constrain voltage — nothing does.
+`P1150_SN` does not constrain voltage.
+
+Two checks back that confirmation up.  `p1150_set_voltage_range` records, once
+per project and confirmed with you, the range your battery spans — proposed from
+its type and the cells in series (1.0–1.5 V per AA/AAA alkaline cell; 3.0 V to
+4.0, 4.1 or 4.2 V per Li-ion cell, whichever your charger terminates at).
+`p1150_power_on` and `p1150_inrush_test` refuse any voltage above its maximum,
+and refuse to run at all until it is recorded.  And the first power-on of each
+session needs `battery_removed=True`, passed once you have confirmed the target's
+own battery is out: the P1150 replaces the battery and must never be connected to
+a system that also has one connected.
 
 Only one program can own a P1150 at a time, so disconnect the P1150 from the web
 GUI before using the MCP server, and call `p1150_disconnect` to hand it back.

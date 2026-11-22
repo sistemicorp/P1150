@@ -14,7 +14,9 @@ every session.
   wake-up costs, whether a measured charge current is a sensible C rate.  The
   cell's chemistry and internal resistance, alongside the voltage the target
   stops working at, turn a measured current surge into the question that
-  matters -- would the real battery sag far enough to reset it.
+  matters -- would the real battery sag far enough to reset it.  The voltage
+  range the battery spans, confirmed by the developer, bounds what
+  p1150_power_on will put on the target.
 
 * The usage model -- how the product's time divides between its states, and how
   often its one-off events happen -- is the other half of a battery-life
@@ -115,6 +117,101 @@ def capacity_mah():
 def target_days():
     """Battery life the product is required to achieve, in days, or None."""
     return get().get("target_days") or None
+
+
+# ------------------------------------------------------------------ #
+# Supply voltage range                                                 #
+# ------------------------------------------------------------------ #
+# The P1150 stands in for the battery, so the only safe voltages are the ones
+# the real battery could put on the same terminals.  That range is a property
+# of the battery -- its chemistry and how many cells are in series -- and is
+# fixed for the life of the project, which is why it is recorded here once,
+# beside the capacity, rather than re-derived every session.
+#
+# Per-cell figures, as (min_mv, max_mv).  Only chemistries whose range is
+# unambiguous enough to propose are listed; anything else needs the developer
+# to state min and max outright, because a guessed maximum is exactly the
+# failure this exists to prevent.
+#
+# * AA / AAA alkaline: 1.5 V per cell is the ceiling a fresh cell presents.
+#   The 1.0 V floor is a typical end-of-life point, not a hard limit -- under
+#   it is harmless to the target, merely not a voltage the product would see
+#   for long.  NiMH rechargeables in the same sizes sit lower (~1.4 V full)
+#   and lithium primary AAs (Li-FeS2) sit HIGHER, ~1.8 V fresh -- so the
+#   1.5 V figure is only proposed after asking which kind it is.
+#
+# * Li-ion / LiPo: 3.0 V to the charge termination voltage, which is 4.2 V for
+#   most cells but 4.1 V or 4.0 V where the charger is set conservatively for
+#   cycle life.  The maximum is therefore never assumed: it is one of three
+#   values, and which one is the developer's answer.
+CELL_RANGE_MV = {
+    "alkaline": (1000, 1500),
+    "liion": (3000, 4200),
+}
+LIION_MAX_CELL_MV = (4000, 4100, 4200)
+
+_RANGE_ALIASES = {
+    "aa": "alkaline", "aaa": "alkaline", "alkaline": "alkaline",
+    "alkalineaa": "alkaline", "alkalineaaa": "alkaline",
+    "liion": "liion", "lion": "liion", "lithiumion": "liion",
+    "lipo": "liion", "lipoly": "liion", "lithiumpolymer": "liion",
+    "18650": "liion", "21700": "liion",
+}
+
+
+def range_family(battery_type: str):
+    """'alkaline', 'liion', or None when there is no range to propose."""
+    flat = "".join(ch for ch in str(battery_type or "").lower() if ch.isalnum())
+    return _RANGE_ALIASES.get(flat)
+
+
+def suggest_voltage_range(battery_type: str, cells_series: int = 1,
+                          cell_max_mv: int = None) -> dict:
+    """Propose a pack range from the battery type and series cell count.
+
+    A proposal only -- nothing is written.  The caller is expected to put it to
+    the developer and record what they confirm with set_voltage_range().
+    """
+    fam = range_family(battery_type)
+    if fam is None:
+        return {"known": False}
+    lo, hi = CELL_RANGE_MV[fam]
+    if fam == "liion" and cell_max_mv:
+        if int(cell_max_mv) not in LIION_MAX_CELL_MV:
+            raise ValueError(
+                f"cell_max_mv for Li-ion should be one of "
+                f"{', '.join(str(v) for v in LIION_MAX_CELL_MV)}, "
+                f"not {cell_max_mv}.")
+        hi = int(cell_max_mv)
+    n = int(cells_series)
+    return {"known": True, "family": fam, "cell_min_mv": lo,
+            "cell_max_mv": hi, "min_mv": lo * n, "max_mv": hi * n,
+            "max_needs_choice": fam == "liion" and not cell_max_mv}
+
+
+def set_voltage_range(battery_type: str, cells_series: int,
+                      min_mv: int, max_mv: int) -> dict:
+    """Record the developer-confirmed range of the target's battery voltage."""
+    cfg = get()
+    cfg["battery_type"] = battery_type
+    cfg["cells_series"] = int(cells_series)
+    cfg["voltage_min_mv"] = int(min_mv)
+    cfg["voltage_max_mv"] = int(max_mv)
+    # The type doubles as the chemistry the inrush ESR model keys on when no
+    # chemistry has been given separately -- "AA" and "LiPo" both resolve.
+    if not cfg.get("chemistry"):
+        cfg["chemistry"] = battery_type
+    with open(_path(), "w") as f:
+        json.dump(cfg, f, indent=2)
+    return cfg
+
+
+def voltage_range():
+    """(min_mv, max_mv) the developer confirmed, or None if never recorded."""
+    cfg = get()
+    if cfg.get("voltage_min_mv") and cfg.get("voltage_max_mv"):
+        return cfg["voltage_min_mv"], cfg["voltage_max_mv"]
+    return None
 
 
 def battery_model() -> dict:

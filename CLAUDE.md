@@ -11,12 +11,26 @@ Two things live here, for two audiences:
 ## This drives real hardware and can destroy the user's board
 
 `p1150_power_on` puts the voltage you choose straight onto the target's battery
-terminals.  Nothing clamps it — not `P1150_SN`, not the driver.  Too high kills
-the target and there is no undo.
+terminals.  Neither `P1150_SN` nor the driver clamps it.  Too high kills the
+target and there is no undo.
 
 **Ask the developer for the voltage and confirm it before the first
 `p1150_power_on` of a session.  Never infer it from context, from the firmware
 source, or from what a previous project used.**
+
+The server adds two backstops, and neither replaces that question:
+
+* `p1150_set_voltage_range` — the battery's range, from its type and the cells in
+  series, proposed and then confirmed with the developer and persisted in
+  `battery.json`.  AA/AAA alkaline is 1.5 V max per cell; Li-ion tops out at 4.0,
+  4.1 or 4.2 V per cell and which one is never assumed.  `p1150_power_on` and
+  `p1150_inrush_test` refuse to run without it and refuse anything above its
+  maximum.  Below the minimum is allowed with a warning, because brown-out
+  testing needs it.
+* `battery_removed=True` on `p1150_power_on` — the developer's confirmation that
+  the target's own battery is out.  A P1150 must never be connected to a system
+  that also has a battery connected.  It is held per process, not persisted, and
+  `p1150_disconnect` clears it: the board may have been handled since.
 
 Only one program can own a P1150 at a time.  The user must disconnect the
 instrument in the web GUI before the server can take it, and `p1150_disconnect`

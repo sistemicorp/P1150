@@ -520,9 +520,13 @@ def p1150_start() -> dict:
 
     The arc of a battery-current project runs:
 
-      1. Connect, and power the target at a voltage the DEVELOPER confirms. It
-         goes straight to the battery terminals and there is no undo.
-      2. Record the battery: capacity, and how long the product has to last.
+      1. Connect.
+      2. Record the battery: capacity, how long the product has to last, and
+         -- confirmed with the developer -- the voltage range it spans, from
+         its type and the cells in series (p1150_set_voltage_range).
+         Then, with the developer confirming the target's own battery is
+         REMOVED, power the target at a voltage they confirm inside that
+         range. It goes straight to the battery terminals; there is no undo.
       3. Describe how the product is used -- its states and their share of the
          time, and the things that happen a countable number of times a day.
          This cannot be measured and has to be asked for.
@@ -549,6 +553,8 @@ def p1150_start() -> dict:
             "voltage_mv": SESSION.vout_mv,
             "ovc_ma": SESSION.ovc_ma,
             "battery": battery or None,
+            "voltage_range_mv": config.voltage_range(),
+            "battery_removed_confirmed": _BATTERY_ABSENT_CONFIRMED,
             "usage_states": {k: dict(v, measured=bool(baselines.get(k)))
                              for k, v in usage["states"].items()},
             "usage_events": usage["events"],
@@ -577,11 +583,22 @@ def p1150_start() -> dict:
                    "p1150_set_battery: what capacity battery (mAh) the target "
                    "runs on, and how long it has to last (target_days). "
                    "Neither can be measured.")
+        elif not out["voltage_range_mv"]:
+            nxt = ("Ask the developer what type of battery the target runs on "
+                   "(AA/AAA alkaline, Li-ion/LiPo, ...) and how many cells are "
+                   "in series, then call p1150_set_voltage_range to get the "
+                   "proposed range and the question to confirm it with. Never "
+                   "answer either from the firmware or from what is typical.")
         elif not out["powered"]:
-            nxt = ("Ask the developer what supply voltage to use and CONFIRM IT "
-                   "before calling p1150_power_on -- it goes directly to the "
-                   "target's battery terminals and too high destroys the "
-                   "target. Never infer it.")
+            lo, hi = out["voltage_range_mv"]
+            nxt = ("Before calling p1150_power_on, ask the developer two "
+                   "things and wait for both answers: that the target's "
+                   "battery is removed or disconnected (the P1150 must never "
+                   "drive a system with a battery connected -- pass "
+                   "battery_removed=True once they confirm), and what supply "
+                   f"voltage to use within the confirmed {lo}-{hi} mV range. "
+                   "It goes directly to the battery terminals and too high "
+                   "destroys the target. Never infer it.")
         elif not usage["states"]:
             nxt = ("Ask the developer how the product spends its time -- which "
                    "states it has and roughly how many hours a day in each -- "
@@ -911,8 +928,9 @@ def p1150_set_battery(capacity_mah: float = None, chemistry: str = None,
 def p1150_get_battery() -> dict:
     """Show the battery settings configured for this project.
 
-    Reports capacity, chemistry, internal resistance and the target's brown-out
-    voltage, and the internal-resistance figures that would be assumed for an
+    Reports capacity, chemistry, the confirmed battery voltage range
+    (voltage_min_mv / voltage_max_mv, cells_series), internal resistance and
+    the target's brown-out voltage, and the internal-resistance figures that would be assumed for an
     inrush assessment given what is set.
 
     If nothing is set, ask the developer for the pack's mAh rating and record it
@@ -929,6 +947,10 @@ def p1150_get_battery() -> dict:
                              "the target runs on, then call p1150_set_battery.")
             return cfg
         cfg["configured"] = True
+        if not config.voltage_range():
+            cfg["voltage_range_hint"] = (
+                "No battery voltage range is confirmed, so p1150_power_on will "
+                "refuse to run. Establish it with p1150_set_voltage_range.")
         if not cfg.get("brownout_mv"):
             cfg["brownout_hint"] = (
                 "The target's minimum operating voltage is not recorded. It is "
@@ -1819,7 +1841,10 @@ def p1150_disconnect() -> dict:
     finished, or to hand the P1150 back to the desktop GUI -- only one program
     can own the unit at a time.
     """
+    global _BATTERY_ABSENT_CONFIRMED
     try:
+        # Whoever handles the board next may refit its battery.
+        _BATTERY_ABSENT_CONFIRMED = False
         return SESSION.disconnect()
     except Exception as e:
         return _fail(e)
@@ -1975,8 +2000,182 @@ def p1150_self_test() -> dict:
         return _fail(e)
 
 
+# Whether the developer has said, in THIS process, that no battery is fitted
+# to the target.  Deliberately not persisted: the range below is a property of
+# the project and does not change, but whether a cell is sitting in the holder
+# is a property of the bench this morning, and the board may have been taken
+# away and used on its battery since the last session.  Cleared by
+# p1150_disconnect for the same reason -- a disconnect is usually followed by
+# someone handling the board.
+_BATTERY_ABSENT_CONFIRMED = False
+
+
+def _supply_check(voltage_mv: int):
+    """Refuse a supply voltage the developer has not sanctioned.
+
+    Returns (error_dict_or_None, warning_or_None).  The asymmetry is deliberate:
+    above the battery's maximum is what destroys targets, so it is refused;
+    below its minimum is harmless to the hardware and is exactly what a
+    brown-out or weak-cell test needs, so it is allowed with a warning that the
+    result is not representative of normal operation.
+    """
+    if not _BATTERY_ABSENT_CONFIRMED:
+        return ({"error": "Not confirmed that the target has no battery fitted. "
+                          "Ask the developer to remove the battery (or "
+                          "disconnect it) from the system under test, and to "
+                          "confirm it is out -- the P1150 must never drive "
+                          "terminals a battery is also connected to. Then "
+                          "call p1150_power_on(..., battery_removed=True)."},
+                None)
+    rng = config.voltage_range()
+    if rng is None:
+        return ({"error": "The target's battery voltage range has not been "
+                          "confirmed with the developer, so there is nothing to "
+                          "check this voltage against. Ask what battery the "
+                          "target runs on and how many cells are in series, "
+                          "then use p1150_set_voltage_range to propose a range, "
+                          "confirm it with the developer, and record it."},
+                None)
+    lo, hi = rng
+    if voltage_mv > hi:
+        return ({"error": f"{voltage_mv} mV is above the {hi} mV maximum the "
+                          f"developer confirmed for this battery "
+                          f"({lo}-{hi} mV). Nothing was applied. If the range "
+                          f"itself is wrong, re-confirm it with the developer "
+                          f"and record it again with p1150_set_voltage_range."},
+                None)
+    if voltage_mv < lo:
+        return (None, f"{voltage_mv} mV is below the battery's {lo} mV minimum. "
+                      f"Fine for a brown-out or weak-cell test, but currents "
+                      f"measured here are not those of normal operation.")
+    return None, None
+
+
 @mcp.tool()
-def p1150_power_on(voltage_mv: int, ovc_ma: int = 500) -> dict:
+def p1150_set_voltage_range(battery_type: str, cells_series: int = 1,
+                            cell_max_mv: int = None, min_mv: int = None,
+                            max_mv: int = None,
+                            developer_confirmed: bool = False) -> dict:
+    """Establish, WITH THE DEVELOPER, the voltage range the target's battery
+    spans. p1150_power_on refuses to run until this is recorded, and refuses
+    any voltage above its maximum.
+
+    The P1150 replaces the battery, so the safe supply voltages are exactly the
+    ones the real battery could present. That is fixed by the battery type and
+    how many cells are in series, which is why it is asked once per project and
+    persists (in .p1150_runs/battery.json) rather than every session. It is not
+    a substitute for confirming the specific voltage before the first
+    p1150_power_on of a session -- it is the fence that voltage has to sit
+    inside.
+
+    Use it in two steps. NEVER skip the first, and never fill in the
+    developer's answers yourself -- not from the firmware, the schematic, a
+    previous project, or what is typical:
+
+      1. Ask the developer what battery the target runs on and how many cells
+         are in series. Call this with developer_confirmed=False (the default).
+         Nothing is recorded; it returns a proposed range and the exact
+         question to put to the developer.
+      2. Put that range to the developer. When they agree -- or correct it --
+         call again with developer_confirmed=True, passing min_mv/max_mv if
+         they changed anything.
+
+    The ranges proposed:
+      AA / AAA alkaline  1.5 V max per cell (1.0 V per cell taken as flat),
+                         times the cells in series: 2xAA is 2000-3000 mV.
+                         ASK whether they are alkaline: NiMH rechargeables run
+                         lower (~1.4 V full) and lithium primary AAs HIGHER
+                         (~1.8 V fresh) -- for those, pass min_mv/max_mv.
+      Li-ion / LiPo      3.0 V to the charge termination voltage, which is
+                         4.2 V on most cells but 4.0 V or 4.1 V where the
+                         charger is set conservatively. ASK WHICH: it is never
+                         assumed, and recording a Li-ion range requires
+                         cell_max_mv (4000/4100/4200) or an explicit max_mv.
+      anything else      no proposal -- the developer gives min_mv and max_mv.
+
+    battery_type: what the developer called it, e.g. "AA", "AAA", "alkaline",
+        "Li-ion", "LiPo", "18650", "CR2032". Also recorded as the chemistry
+        for the inrush model if no chemistry has been given.
+    cells_series: number of cells in series (not in parallel -- parallel cells
+        add capacity, not voltage).
+    cell_max_mv: Li-ion only, the per-cell maximum: 4000, 4100 or 4200.
+    min_mv / max_mv: the pack range in millivolts, overriding the proposal.
+        Required for a battery type with no proposal.
+    developer_confirmed: True only once the developer has agreed to the range
+        in their own words in this conversation.
+    """
+    try:
+        if not cells_series or int(cells_series) < 1:
+            return {"error": "cells_series must be 1 or more."}
+        try:
+            sug = config.suggest_voltage_range(battery_type, cells_series,
+                                               cell_max_mv)
+        except ValueError as e:
+            return {"error": str(e)}
+        lo = min_mv if min_mv is not None else sug.get("min_mv")
+        hi = max_mv if max_mv is not None else sug.get("max_mv")
+
+        if not developer_confirmed:
+            out = {"recorded": False, "battery_type": battery_type,
+                   "cells_series": int(cells_series)}
+            if lo is None or hi is None:
+                out["question_for_developer"] = (
+                    f"There is no standard range to propose for "
+                    f"'{battery_type}'. Ask the developer for the lowest and "
+                    f"highest voltage it presents across {int(cells_series)} "
+                    f"cell(s) in series -- full charge to flat -- in volts.")
+                return out
+            out.update(proposed_min_mv=lo, proposed_max_mv=hi)
+            if sug.get("known"):
+                out["per_cell_mv"] = [sug["cell_min_mv"], sug["cell_max_mv"]]
+            if sug.get("max_needs_choice") and max_mv is None:
+                out["question_for_developer"] = (
+                    f"Li-ion cells finish charging at 4.0, 4.1 or 4.2 V "
+                    f"depending on the charger. Which does this product use? "
+                    f"With {int(cells_series)} cell(s) in series that makes "
+                    f"the maximum {4.0 * cells_series:.1f}, "
+                    f"{4.1 * cells_series:.1f} or {4.2 * cells_series:.1f} V, and "
+                    f"the minimum {lo / 1000:.1f} V.")
+            elif sug.get("family") == "alkaline" and max_mv is None:
+                out["question_for_developer"] = (
+                    f"Are these alkaline cells? If so the battery spans "
+                    f"{lo / 1000:.1f}-{hi / 1000:.1f} V ({int(cells_series)} x "
+                    f"1.0-1.5 V). NiMH rechargeables or lithium AA/AAA cells "
+                    f"differ, and lithium ones go higher, ~1.8 V a cell.")
+            else:
+                out["question_for_developer"] = (
+                    f"Confirm the battery spans {lo / 1000:.2f}-{hi / 1000:.2f} V.")
+            out["next"] = ("Put the question to the developer. When they agree "
+                           "or correct it, call again with "
+                           "developer_confirmed=True (and min_mv/max_mv if "
+                           "they changed anything).")
+            return out
+
+        if lo is None or hi is None:
+            return {"error": f"No standard range for '{battery_type}'. Pass "
+                             f"min_mv and max_mv as the developer stated them."}
+        if sug.get("max_needs_choice") and max_mv is None:
+            return {"error": "A Li-ion maximum is never assumed. Ask the "
+                             "developer whether the cells charge to 4.0, 4.1 "
+                             "or 4.2 V and pass cell_max_mv, or pass max_mv."}
+        if not 0 < lo < hi:
+            return {"error": f"min_mv ({lo}) must be positive and below "
+                             f"max_mv ({hi})."}
+        cfg = config.set_voltage_range(battery_type, cells_series, lo, hi)
+        cfg["recorded"] = True
+        cfg["note"] = (f"p1150_power_on will refuse anything above {hi} mV. "
+                       f"Still confirm the specific voltage with the developer "
+                       f"before the first power-on of each session; nominal "
+                       f"or mid-range is the usual choice for battery life, "
+                       f"and the low end ({lo} mV) for inrush and brown-out.")
+        return cfg
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+def p1150_power_on(voltage_mv: int, ovc_ma: int = 500,
+                   battery_removed: bool = False) -> dict:
     """Power the target: set the supply voltage and current limit, then connect
     the probe.
 
@@ -1985,10 +2184,26 @@ def p1150_power_on(voltage_mv: int, ovc_ma: int = 500) -> dict:
     too high will destroy the target, and there is no undo. Ask rather than
     infer from context.
 
-    voltage_mv: what the battery would supply, in millivolts. Li-ion single cell
-        is 4200 (full) / 3700 (nominal) / 3300 (nearly flat); 2x alkaline is
-        ~3000; a coin cell is ~3000. Use the same value for every run that will
-        be compared -- current draw varies with supply voltage.
+    Two things are checked before anything is applied:
+
+      * The target's battery must be OUT. The P1150 replaces the battery; it
+        must never be connected to a system that also has a battery connected
+        -- the two sources fight over the same terminals. Before the first
+        power-on of a session, ask the developer to remove or disconnect the
+        battery and to confirm it is out, then pass battery_removed=True.
+        Ask again (and pass it again) if the board has been handled or taken
+        away from the bench since.
+      * The voltage must not exceed the battery range recorded with
+        p1150_set_voltage_range. With no range recorded, nothing is applied.
+
+    voltage_mv: what the battery would supply, in millivolts, within the range
+        confirmed with p1150_set_voltage_range. Li-ion single cell is 4200
+        (full) / 3700 (nominal) / 3300 (nearly flat); 2x alkaline is ~3000.
+        Use the same value for every run that will be compared -- current draw
+        varies with supply voltage.
+
+    battery_removed: True only once the developer has confirmed, in this
+        session, that no battery is connected to the target.
 
     ovc_ma: over-current limit. Must exceed the target's true PEAK current, not
         its average. A radio transmit or motor start can be 20x the average; an
@@ -2006,8 +2221,17 @@ def p1150_power_on(voltage_mv: int, ovc_ma: int = 500) -> dict:
     Power stays on until p1150_power_off or p1150_disconnect, so firmware can be
     re-flashed over JTAG between measurements without cycling power.
     """
+    global _BATTERY_ABSENT_CONFIRMED
     try:
-        return SESSION.power_on(voltage_mv, ovc_ma)
+        if battery_removed:
+            _BATTERY_ABSENT_CONFIRMED = True
+        err, warn = _supply_check(int(voltage_mv))
+        if err:
+            return err
+        out = SESSION.power_on(voltage_mv, ovc_ma)
+        if warn:
+            out["warning"] = warn
+        return out
     except Exception as e:
         return _fail(e)
 
@@ -2873,7 +3097,9 @@ def p1150_inrush_test(label: str = "inrush", voltage_mv: int = None,
 
     voltage_mv: supply voltage for the test. Defaults to whatever p1150_power_on
         last set. THIS GOES STRAIGHT TO THE TARGET'S BATTERY TERMINALS --
-        confirm it with the developer if it has not already been agreed. Test at
+        confirm it with the developer if it has not already been agreed. Must
+        not exceed the range recorded with p1150_set_voltage_range, and the
+        battery must be out (see p1150_power_on). Test at
         the LOW end of the battery's range as well as at nominal: inrush is
         worse where the battery is weakest, and that is the case that fails.
 
@@ -2904,6 +3130,11 @@ def p1150_inrush_test(label: str = "inrush", voltage_mv: int = None,
                              "(confirm it with the developer first -- it goes "
                              "directly to the target's battery terminals), or "
                              "call p1150_power_on first."}
+        # The same fence p1150_power_on applies: this test powers the target
+        # too, at a voltage that may never have been through p1150_power_on.
+        err, warn = _supply_check(int(v))
+        if err:
+            return err
         i, isnk, aux, marks, fs, info = SESSION.inrush_capture(
             v, ovc_ma, timebase, trigger_ma)
         stored = _store(label, i, dict(info, capture_type="inrush"),
@@ -2922,6 +3153,8 @@ def p1150_inrush_test(label: str = "inrush", voltage_mv: int = None,
         out["run_id"] = stored.get("run_id")
         out["label"] = label
         out["voltage_mv"] = v
+        if warn:
+            out["supply_warning"] = warn
         out["timebase"] = timebase
         out["settled_ma"] = stored.get("median_ma")
 
