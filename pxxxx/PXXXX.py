@@ -1071,6 +1071,12 @@ class PXXXX:
         src_i   = _TRIG_SRC_MAP.get(src, 0)
         pos_i   = _TRIG_POS_MAP.get(pos, 1)
         slope_i = _TRIG_SLOPE_MAP.get(slope, 0)
+        # D0S triggers on a character: the P1150 convention is level="A",
+        # and the DLL takes it as its code in the float level.
+        if isinstance(level, (str, bytes)):
+            if len(level) != 1:
+                return False, None
+            level = ord(level)
         with self._lock:
             rc = self._lib.pxxxx_set_trigger(
                 self._dev, src_i, pos_i, slope_i, ctypes.c_float(float(level)))

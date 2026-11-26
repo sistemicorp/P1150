@@ -1,10 +1,10 @@
 {
-  "version": "0.15",
-  "commit": "54836d23a347c6ef233a96d573fe53956db85791",
-  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.15",
+  "version": "0.16",
+  "commit": "45c7b07f49976e656ccdb4acde55de7cdf40f5e8",
+  "source": "https://github.com/sistemicorp/a72-PxDLL/releases/tag/0.16",
   "built_utc": {
-    "linux-x64": "2026-11-22T17:26:57Z",
-    "windows-x64": "2026-11-22T17:37:49Z"
+    "linux-x64": "2026-11-26T23:08:11Z",
+    "windows-x64": "2026-11-26T23:16:01Z"
   },
   "signed": {
     "linux-x64": false,
@@ -14,30 +14,30 @@
   "firmware": [
     {
       "file": "a4311_app.logdata",
-      "sha256": "1a9321b0ee0cf5427c4537ca4fe3cd43f3ff171f9b5a61d455d12cfb60c1c0c0",
+      "sha256": "e51b4862d22afda18aaf11b6075c3616e9d7e55ed3a536666e68ef2ee8188d94",
       "source": "a43-P1150",
       "what": []
     },
     {
       "file": "a4311_app.signed.bin",
-      "sha256": "ad761f8b148c5556819761dbb5fe6c39024a9b4aa7fc9d82665b349c49e60317",
+      "sha256": "9cfeada9b57af78004fa91c2c15a2147a4f987d4901729183c01815f7515df2d",
       "source": "a43-P1150",
       "what": [
-        "@(#)1.11-master"
+        "@(#)1.13-master"
       ]
     },
     {
       "file": "a4317d_app.logdata",
-      "sha256": "89f2a5abae2db31b36ec380d912fb1c90c6d3b1f0edeee4129e2ec8b6ee4a19e",
+      "sha256": "2afb4cb73c5227fb8bb217481d8ac04d19110846eda9a8369f7fb5a7acec4afe",
       "source": "a43-P1150",
       "what": []
     },
     {
       "file": "a4317d_app.signed.bin",
-      "sha256": "ea7861e36d323f20ddd1da0e3e3e6e79847b7bb52a2a49994b8de6f239f2c565",
+      "sha256": "c9bacd4f4dac098be0060cbb0f685a311c86bb992cd72ce5a80521b4e1ea8309",
       "source": "a43-P1150",
       "what": [
-        "@(#)1.11-master"
+        "@(#)1.13-master"
       ]
     },
     {
@@ -84,11 +84,11 @@
   ],
   "firmware_sources": {
     "a43-P1150": {
-      "ref": "1.11",
-      "commit": "49f3fba5682f6367ca96db4a2b8c8c45d935b2c9",
-      "source_commit": "678ebf87ff93d6d68d98becb388957fd4d71d0f3",
-      "source_describe": "1.10-2-g678ebf87",
-      "version_string": "@(#)1.11-master",
+      "ref": "1.13",
+      "commit": "9b2285bf2b555cc9cf1b933c68817ba982762daa",
+      "source_commit": "6526b1d43f796afedd584e9a415d951ba2e85aec",
+      "source_describe": "1.12-20-g6526b1d4",
+      "version_string": "@(#)1.13-master",
       "toolchain": "arm-none-eabi-gcc (GNU Tools for STM32 14.3.rel1.20251027-0700) 14.3.1 20250623"
     },
     "a61-P3260Z": {
@@ -103,20 +103,20 @@
     {
       "name": "libpxxxx.so",
       "leg": "linux-x64",
-      "sha256": "b59b44b76306b38fe4b06c8e139a0a00b4f0f832c295e1c1e5644945f15e6025",
-      "size": 1977720
+      "sha256": "450c6c1759feb35b580bdf9ca0dc96f6250d5e7f334de3dfcdf2ecfb083d7ed5",
+      "size": 2002312
     },
     {
       "name": "pxxxx.dll",
       "leg": "windows-x64",
-      "sha256": "3f7b8ede693400f1f8a1cf695c3cada46c5dae318e8c6466933f6ea7303a7d1e",
-      "size": 1938408
+      "sha256": "64bfca42c377d6af5ed73052b6d7733e95581e44a243454c8653b55c4c99e486",
+      "size": 1967080
     },
     {
       "name": "PXXXX.py",
       "leg": "linux-x64",
-      "sha256": "68a7ce8d37f018eba5608ca5a5a8297c0991f0cb1043a341bb1cc8ad2ce385fc",
-      "size": 61348
+      "sha256": "57ffcbaf80b99fc84d1afca586f29b2c1b5f6f5840091d5e1c142ff5f599b9ad",
+      "size": 61627
     },
     {
       "name": "__init__.py",
